@@ -23,4 +23,47 @@ Register 1 is special register as third argument if there are 3 arguments.
 
 There are instructions to read/write IP (instruction pointer) register.
 
-Instruction memory and data memory is separated but there are instructions to transfer data between them.
+Instruction memory and data memory is separated but there are instructions to load/store data.
+
+### Instructions
+
+Opcode is 5 bit width. Arg is 3 bit width.
+
+With 5 bit opcode, there are 32 instructions ( 2^5 == 32 ).
+
+#### Data process
+
+Signed integer instructions uses 2's complement representation.
+
+| Op  |
+|-----|
+| add |
+| sub |
+| neg |
+| mul |
+| div |
+| and |
+| or  |
+| not |
+| xor |
+
+#### Branch
+
+Branch condition compare argument with 0 (zero).
+
+| Op  |
+|-----|
+| b   |
+| bnz |
+| bz  |
+| blz |
+| bgz |
+
+#### Data transfer
+
+| Op  |
+|-----|
+| ld  |
+| st  |
+| ld_p|
+| st_p|
