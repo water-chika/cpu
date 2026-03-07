@@ -35,35 +35,48 @@ With 5 bit opcode, there are 32 instructions ( 2^5 == 32 ).
 
 Signed integer instructions uses 2's complement representation.
 
-| Op  |
-|-----|
-| add |
-| sub |
-| neg |
-| mul |
-| div |
-| and |
-| or  |
-| not |
-| xor |
+Instruction field arg encodes register will be written or immediate.
+
+| Op  | Opcode | Description |
+|-----|--------|-------------|
+| and |   0    | bitwise and |
+| or  |   1    | bitwise or  |
+| not |   2    | bitwise not |
+| xor |   3    | bitwise xor |
+| add |   4    | addition    |
+| sub |   5    | substract   |
+| neg |   6    | negate      |
+| mul |   7    | multiply    |
+| div |   8    | divide      |
+| mov |   9    | move reg to reg |
+| cnt |   10   | count of 1 |
+| imm |   11   | move imm to reg |
+| shl |   12   | shift left imm times|
+| shr |   13   | shift right imm times|
 
 #### Branch
 
 Branch condition compare argument with 0 (zero).
 
-| Op  |
-|-----|
-| b   |
-| bnz |
-| bz  |
-| blz |
-| bgz |
+Instruction field arg encodes register containing branch address.
+
+| Op  | Opcode | Description |
+|-----|--------|-------------|
+| bnz |   16   | branch if not zero |
+| bz  |   17   | branch if zero     |
+| b   |   18   | branch always      |
+| blz |   19   | branch if less than zero |
+| bgz |   20   | branch if greater than zero |
 
 #### Data transfer
 
-| Op  |
-|-----|
-| ld  |
-| st  |
-| ld_p|
-| st_p|
+Instruction field arg encodes register containing memory address.
+
+| Op  | Opcode | Description |
+|-----|--------|-------------|
+| ld  |   24   | load from data memory |
+| st  |   25   | store to data memory  |
+| cl  |   26   | clear data memory     |
+| swap|   26   | swap register and data memory |
+| ld_p|   27   | load from program memory |
+| st_p|   28   | store to program memory  |
