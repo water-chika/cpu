@@ -48,8 +48,8 @@ Instruction field arg encodes register written or immediate.
 | neg |   6    | negate      |
 | mul |   7    | multiply    |
 | div |   8    | divide      |
-| mov |   9    | move reg to reg |
-|     |   10   | |
+| mov |   9    | move reg0 to reg |
+| mov0|   10   | move reg to reg0|
 | imm |   11   | move imm to reg |
 | shl |   12   | shift left imm times|
 | shr |   13   | shift right imm times|
