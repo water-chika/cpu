@@ -35,7 +35,7 @@ With 5 bit opcode, there are 32 instructions ( 2^5 == 32 ).
 
 Signed integer instructions uses 2's complement representation.
 
-Instruction field arg encodes register will be written or immediate.
+Instruction field arg encodes register written or immediate.
 
 | Op  | Opcode | Description |
 |-----|--------|-------------|
