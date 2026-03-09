@@ -44,7 +44,7 @@ Instruction field arg encodes register written or immediate.
 | not |   2    | bitwise not |
 | xor |   3    | bitwise xor |
 | add |   4    | addition    |
-| sub |   5    | substract   |
+| sub |   5    | subtract    |
 | neg |   6    | negate      |
 | mul |   7    | multiply    |
 | div |   8    | divide      |
