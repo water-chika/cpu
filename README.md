@@ -49,7 +49,7 @@ Instruction field arg encodes register written or immediate.
 | mul |   7    | multiply    |
 | div |   8    | divide      |
 | mov |   9    | move reg to reg |
-| cnt |   10   | count of 1 |
+|     |   10   | |
 | imm |   11   | move imm to reg |
 | shl |   12   | shift left imm times|
 | shr |   13   | shift right imm times|
@@ -77,6 +77,6 @@ Instruction field arg encodes register containing memory address.
 | ld  |   24   | load from data memory |
 | st  |   25   | store to data memory  |
 | cl  |   26   | clear data memory     |
-| swap|   26   | swap register and data memory |
-| ld_p|   27   | load from program memory |
-| st_p|   28   | store to program memory  |
+| swap|   27   | swap register and data memory |
+| ld_p|   28   | load from program memory |
+| st_p|   29   | store to program memory  |

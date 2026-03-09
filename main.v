@@ -15,10 +15,11 @@ initial begin
     IP = 0;
 end
 
-reg [7:0] RAM[256];
+reg [7:0] program_memory[256];
+reg [7:0] data_memory[256];
 wire [7:0] Inst;
 
-assign Inst = RAM[IP];
+assign Inst = program_memory[IP];
 
 reg [7:0] registers[8];
 
@@ -35,35 +36,97 @@ wire [2:0] arg;
 assign opcode = Inst[7:3];
 assign arg = Inst[2:0];
 
-wire [7:0] src0_value;
-wire [7:0] src1_value;
-
-assign src0_value = registers[dst];
-assign src1_value = registers[src];
-
 always @(posedge clk) begin
     if (opcode == 0) begin
-        registers[dst] <= imm;
+        registers[arg] <= registers[arg] & registers[0];
     end
     else if (opcode == 1) begin
-        registers[dst] <= src0_value + src1_value;
+        registers[arg] <= registers[arg] | registers[0];
     end
     else if (opcode == 2) begin
-        registers[dst] <= src0_value - src1_value;
+        registers[arg] <= ~registers[arg];
+    end
+    else if (opcode == 3) begin
+        registers[arg] <= registers[arg] ^ registers[0];
+    end
+    else if (opcode == 4) begin
+        registers[arg] <= registers[arg] + registers[0];
+    end
+    else if (opcode == 5) begin
+        registers[arg] <= registers[arg] - registers[0];
+    end
+    else if (opcode == 6) begin
+        registers[arg] <= -registers[arg];
+    end
+    else if (opcode == 7) begin
+        registers[arg] <= registers[arg] * registers[0];
+    end
+    else if (opcode == 8) begin
+        registers[arg] <= registers[arg] / registers[0];
+    end
+    else if (opcode == 9) begin
+        registers[arg] <= registers[0];
+    end
+    else if (opcode == 11) begin
+        registers[0] <= arg;
+    end
+    else if (opcode == 12) begin
+        registers[0] <= registers[0] << arg;
+    end
+    else if (opcode == 13) begin
+        registers[0] <= registers[0] >> arg;
+    end
+    else if (opcode == 16) begin
+        if (registers[0] != 0) begin
+            IP = registers[arg];
+        end
+    end
+    else if (opcode == 17) begin
+        if (registers[0] == 0) begin
+            IP = registers[arg];
+        end
+    end
+    else if (opcode == 18) begin
+        IP = registers[arg];
+    end
+    else if (opcode == 19) begin
+        if (registers[0] < 0) begin
+            IP = registers[arg];
+        end
+    end
+    else if (opcode == 20) begin
+        if (registers[0] > 0) begin
+            IP = registers[arg];
+        end
+    end
+    else if (opcode == 24) begin
+        registers[0] <= data_memory[registers[arg]];
+    end
+    else if (opcode == 25) begin
+        data_memory[registers[arg]] <= registers[0];
+    end
+    else if (opcode == 26) begin
+        data_memory[registers[arg]] <= 0;
+    end
+    else if (opcode == 27) begin
+        registers[0] <= data_memory[registers[arg]];
+        data_memory[registers[arg]] <= registers[0];
+    end
+    else if (opcode == 28) begin
+        registers[0] <= program_memory[registers[arg]];
+    end
+    else if (opcode == 29) begin
+        program_memory[registers[arg]] <= registers[0];
     end
     else begin
-        if (opcode2 == 0) begin
-            IP <= src1_value;
-        end
-        else if (opcode2 == 1) begin
-        end
-        else if (opcode2 == 2) begin
-        end
-        else begin
-        end
+        $display("unknown opcode %b", opcode);
     end
 end
 
-assign write_ip = opcode == 3 && opcode2 == 0;
+assign write_ip = opcode == 16 && registers[0] != 0 ||
+    opcode == 17 && registers[0] == 0 ||
+    opcode == 18 ||
+    opcode == 19 && registers[0] < 0 ||
+    opcode == 20 && registers[0] > 0;
 
 endmodule
