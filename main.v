@@ -15,13 +15,13 @@ initial begin
     IP = 0;
 end
 
-reg [7:0] program_memory[256];
-reg [7:0] data_memory[256];
+reg [7:0] program_memory[256:0];
+reg [7:0] data_memory[256:0];
 wire [7:0] Inst;
 
 assign Inst = program_memory[IP];
 
-reg [7:0] registers[8];
+reg [7:0] registers[8:0];
 
 initial begin:INIT_REGS
     integer i;
