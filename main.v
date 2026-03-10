@@ -67,6 +67,9 @@ always @(posedge clk) begin
     else if (opcode == 9) begin
         registers[arg] <= registers[0];
     end
+    else if (opcode == 10) begin
+        registers[0] <= registers[arg];
+    end
     else if (opcode == 11) begin
         registers[0] <= arg;
     end

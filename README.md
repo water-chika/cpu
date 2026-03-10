@@ -37,22 +37,22 @@ Signed integer instructions uses 2's complement representation.
 
 Instruction field arg encodes register written or immediate.
 
-| Op  | Opcode | Description |
-|-----|--------|-------------|
-| and |   0    | bitwise and |
-| or  |   1    | bitwise or  |
-| not |   2    | bitwise not |
-| xor |   3    | bitwise xor |
-| add |   4    | addition    |
-| sub |   5    | subtract    |
-| neg |   6    | negate      |
-| mul |   7    | multiply    |
-| div |   8    | divide      |
-| mov |   9    | move reg0 to reg |
-| mov0|   10   | move reg to reg0|
-| imm |   11   | move imm to reg |
-| shl |   12   | shift left imm times|
-| shr |   13   | shift right imm times|
+| Op  | Opcode |binary| Description |
+|-----|--------|------|-------------|
+| and |   0    | 00000| bitwise and |
+| or  |   1    | 00001| bitwise or  |
+| not |   2    | 00010| bitwise not |
+| xor |   3    | 00011| bitwise xor |
+| add |   4    | 00100| addition    |
+| sub |   5    | 00101| subtract    |
+| neg |   6    | 00110| negate      |
+| mul |   7    | 00111| multiply    |
+| div |   8    | 01000| divide      |
+| mov |   9    | 01001| move reg0 to reg |
+| mov0|   10   | 01010| move reg to reg0|
+| imm |   11   | 01011| move imm to reg0 |
+| shl |   12   | 01100| shift left imm times|
+| shr |   13   | 01101| shift right imm times|
 
 #### Branch
 
