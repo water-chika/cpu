@@ -1,3 +1,5 @@
+`include "memory.v"
+
 module main(
     input clk
 );
@@ -15,13 +17,28 @@ initial begin
     IP = 0;
 end
 
-reg [7:0] program_memory[256:0];
-reg [7:0] data_memory[256:0];
+wire program_write_enable;
+wire program_read_enable;
+wire [7:0] program_address;
+wire [7:0] program_in_data;
+wire [7:0] program_out_data;
+
+memory program(
+.clk(clk),
+.write_enable(program_write_enable),
+.read_enable(program_read_enable),
+.address(program_address),
+.in_data(program_in_data),
+.out_data(program_out_data)
+);
+
 wire [7:0] Inst;
 
-assign Inst = program_memory[IP];
+assign program_address = IP;
+assign program_read_enable = 1'b1;
+assign Inst = program_out_data;
 
-reg [7:0] registers[8:0];
+reg [7:0] registers[7:0];
 
 initial begin:INIT_REGS
     integer i;
@@ -101,25 +118,6 @@ always @(posedge clk) begin
         if (registers[0] > 0) begin
             IP = registers[arg];
         end
-    end
-    else if (opcode == 24) begin
-        registers[0] <= data_memory[registers[arg]];
-    end
-    else if (opcode == 25) begin
-        data_memory[registers[arg]] <= registers[0];
-    end
-    else if (opcode == 26) begin
-        data_memory[registers[arg]] <= 0;
-    end
-    else if (opcode == 27) begin
-        registers[0] <= data_memory[registers[arg]];
-        data_memory[registers[arg]] <= registers[0];
-    end
-    else if (opcode == 28) begin
-        registers[0] <= program_memory[registers[arg]];
-    end
-    else if (opcode == 29) begin
-        program_memory[registers[arg]] <= registers[0];
     end
     else begin
         $display("unknown opcode %b", opcode);
