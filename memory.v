@@ -2,17 +2,10 @@ module memory(
    input clk,
    input write_enable,
    input read_enable,
-   input address,
-   input in_data,
-   output out_data
+   input [7:0] address,
+   input [7:0] in_data,
+   output [7:0] out_data
 );
-
-wire clk;
-wire write_enable;
-wire read_enable;
-wire [7:0] address;
-wire [7:0] in_data;
-wire [7:0] out_data;
 
 reg [7:0] mem[255:0];
 
