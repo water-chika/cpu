@@ -1,6 +1,7 @@
 #include <iostream>
 #include <unordered_map>
 #include <cstdint>
+#include <format>
 
 auto opcodes = std::unordered_map<std::string, uint8_t>{
     {"and", 0},
@@ -43,19 +44,38 @@ auto args = std::unordered_map<std::string, uint8_t>{
     {"r7", 7},
 };
 
-int main(void) {
+int main(int argc, const char* argv[]) {
+    bool output_hex = false;
+    bool enable_debug = false;
+    for (int i = 1; i < argc; i++) {
+        if (std::string(argv[i]) == "--hex") {
+            output_hex = true;
+        }
+        else if (std::string(argv[i]) == "--debug") {
+            enable_debug = true;
+        }
+    }
     while (true) {
         std::string opcode, arg;
         std::cin >> opcode >> arg;
         if (!std::cin.good()) {
            break;
         }
-        //std::cerr << opcode << ',' << arg;
+        if (enable_debug) {
+            std::cerr << opcode << ',' << arg << std::endl;
+        }
         uint8_t opcode_b = opcodes[opcode];
         uint8_t arg_b= args[arg];
         uint8_t code = (opcodes[opcode] << 3) | args[arg];
-        //std::cerr << (int)opcode_b << ',' << (int)arg_b;
-        std::cout.write(reinterpret_cast<char*>(&code), sizeof(code));
+        if (enable_debug) {
+            std::cerr << (int)opcode_b << ',' << (int)arg_b << std::endl;
+        }
+        if (output_hex) {
+            std::cout << std::format("{:02x}", code);
+        }
+        else {
+            std::cout.write(reinterpret_cast<char*>(&code), sizeof(code));
+        }
     }
     return 0;
 }
