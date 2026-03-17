@@ -6,9 +6,31 @@ module main(
 
 reg [7:0] IP;
 wire write_ip;
+reg stall;
+reg [7:0] stall_counter;
+
+initial begin
+    stall = 1'b1;
+    stall_counter = 3;
+end
 
 always @(posedge clk) begin
-    if (~write_ip) begin
+    if (stall == 1'b1) begin
+        if (stall_counter == 0) begin
+            stall = 1'b0;
+        end
+        else begin
+            stall_counter = stall_counter-1;
+        end
+    end
+    else begin
+        stall = 1'b1;
+        stall_counter = 1;
+    end
+end
+
+always @(posedge clk) begin
+    if (~write_ip && ~stall) begin
         IP = IP + 1;
     end
 end
@@ -36,7 +58,9 @@ wire [7:0] Inst;
 
 assign program_address = IP;
 assign program_read_enable = 1'b1;
-assign Inst = program_out_data;
+assign program_write_enable = 1'b0;
+assign program_in_data = 8'b00000000;
+assign Inst = stall ? 8'b00000000 : program_out_data;
 
 reg [7:0] registers[7:0];
 
