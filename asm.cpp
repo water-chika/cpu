@@ -2,6 +2,7 @@
 #include <unordered_map>
 #include <cstdint>
 #include <format>
+#include <string>
 
 auto opcodes = std::unordered_map<std::string, uint8_t>{
     {"and", 0},
@@ -44,6 +45,15 @@ auto args = std::unordered_map<std::string, uint8_t>{
     {"r7", 7},
 };
 
+uint8_t parse_arg(const std::string& str) {
+    if (args.contains(str)) {
+        return args[str];
+    }
+    else {
+        return stoi(str);
+    }
+}
+
 int main(int argc, const char* argv[]) {
     bool output_hex = false;
     bool enable_debug = false;
@@ -65,13 +75,13 @@ int main(int argc, const char* argv[]) {
             std::cerr << opcode << ',' << arg << std::endl;
         }
         uint8_t opcode_b = opcodes[opcode];
-        uint8_t arg_b= args[arg];
-        uint8_t code = (opcodes[opcode] << 3) | args[arg];
+        uint8_t arg_b = parse_arg(arg);
+        uint8_t code = (opcode_b << 3) | arg_b;
         if (enable_debug) {
             std::cerr << (int)opcode_b << ',' << (int)arg_b << std::endl;
         }
         if (output_hex) {
-            std::cout << std::format("{:02x}", code);
+            std::cout << std::format("{:02x},", code);
         }
         else {
             std::cout.write(reinterpret_cast<char*>(&code), sizeof(code));
