@@ -77,74 +77,40 @@ always @(posedge clk) begin
         IP = IP + 1;
     end
 
-    if (opcode == 0) begin
-        registers[arg] <= registers[arg] & registers[0];
-    end
-    else if (opcode == 1) begin
-        registers[arg] <= registers[arg] | registers[0];
-    end
-    else if (opcode == 2) begin
-        registers[arg] <= ~registers[arg];
-    end
-    else if (opcode == 3) begin
-        registers[arg] <= registers[arg] ^ registers[0];
-    end
-    else if (opcode == 4) begin
-        registers[arg] <= registers[arg] + registers[0];
-    end
-    else if (opcode == 5) begin
-        registers[arg] <= registers[arg] - registers[0];
-    end
-    else if (opcode == 6) begin
-        registers[arg] <= -registers[arg];
-    end
-    else if (opcode == 7) begin
-        registers[arg] <= registers[arg] * registers[0];
-    end
-    else if (opcode == 8) begin
-        registers[arg] <= registers[arg] / registers[0];
-    end
-    else if (opcode == 9) begin
-        registers[arg] <= registers[0];
-    end
-    else if (opcode == 10) begin
-        registers[0] <= registers[arg];
-    end
-    else if (opcode == 11) begin
-        registers[0] <= arg;
-    end
-    else if (opcode == 12) begin
-        registers[0] <= registers[0] << arg;
-    end
-    else if (opcode == 13) begin
-        registers[0] <= registers[0] >> arg;
-    end
-    else if (opcode == 16) begin
-        if (registers[0] != 0) begin
-            IP = registers[arg];
-        end
-    end
-    else if (opcode == 17) begin
-        if (registers[0] == 0) begin
-            IP = registers[arg];
-        end
-    end
-    else if (opcode == 18) begin
-        IP = registers[arg];
-    end
-    else if (opcode == 19) begin
-        if (registers[0] < 0) begin
-            IP = registers[arg];
-        end
-    end
-    else if (opcode == 20) begin
-        if (registers[0] > 0) begin
-            IP = registers[arg];
-        end
-    end
-    else begin
-        $display("unknown opcode %b", opcode);
-    end
+    case (opcode)
+        0: registers[arg] <= registers[arg] & registers[0];
+        1: registers[arg] <= registers[arg] | registers[0];
+        2: registers[arg] <= ~registers[arg];
+        3: registers[arg] <= registers[arg] ^ registers[0];
+        4: registers[arg] <= registers[arg] + registers[0];
+        5: registers[arg] <= registers[arg] - registers[0];
+        6: registers[arg] <= -registers[arg];
+        7: registers[arg] <= registers[arg] * registers[0];
+        8: registers[arg] <= registers[arg] / registers[0];
+        9: registers[arg] <= registers[0];
+        10: registers[0] <= registers[arg];
+        11: registers[0] <= arg;
+        12: registers[0] <= registers[0] << arg;
+        13: registers[0] <= registers[0] >> arg;
+        16:
+            if (registers[0] != 0) begin
+                IP = registers[arg];
+            end
+        17:
+            if (registers[0] == 0) begin
+                IP = registers[arg];
+            end
+        18: IP = registers[arg];
+        19:
+            if (registers[0] < 0) begin
+                IP = registers[arg];
+            end
+        20:
+            if (registers[0] > 0) begin
+                IP = registers[arg];
+            end
+        default: $display("unknown opcode %b", opcode);
+    endcase
 end
 
 endmodule
