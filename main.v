@@ -5,7 +5,6 @@ module main(
 );
 
 reg [7:0] IP;
-wire write_ip;
 reg stall;
 reg [7:0] stall_counter;
 
@@ -26,12 +25,6 @@ always @(posedge clk) begin
     else begin
         stall = 1'b1;
         stall_counter = 1;
-    end
-end
-
-always @(posedge clk) begin
-    if (~write_ip && ~stall) begin
-        IP = IP + 1;
     end
 end
 
@@ -78,6 +71,12 @@ assign opcode = Inst[7:3];
 assign arg = Inst[2:0];
 
 always @(posedge clk) begin
+    IP = IP;
+
+    if (~stall) begin
+        IP = IP + 1;
+    end
+
     if (opcode == 0) begin
         registers[arg] <= registers[arg] & registers[0];
     end
@@ -147,11 +146,5 @@ always @(posedge clk) begin
         $display("unknown opcode %b", opcode);
     end
 end
-
-assign write_ip = opcode == 16 && registers[0] != 0 ||
-    opcode == 17 && registers[0] == 0 ||
-    opcode == 18 ||
-    opcode == 19 && registers[0] < 0 ||
-    opcode == 20 && registers[0] > 0;
 
 endmodule
