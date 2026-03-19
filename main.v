@@ -4,28 +4,14 @@ module main(
     input clk
 );
 
-reg [7:0] IP;
+reg [7:0] IP; // Because program memory has latency,
+              // IP point to next instruction address.
 reg stall;
-reg [7:0] stall_counter;
+reg [7:0] stall_counter; // If it needs more than 1 stall clock
 
 initial begin
     stall = 1'b1;
     stall_counter = 3;
-end
-
-always @(posedge clk) begin
-    if (stall == 1'b1) begin
-        if (stall_counter == 0) begin
-            stall = 1'b0;
-        end
-        else begin
-            stall_counter = stall_counter-1;
-        end
-    end
-    else begin
-        stall = 1'b1;
-        stall_counter = 1;
-    end
 end
 
 initial begin
@@ -71,6 +57,15 @@ assign opcode = Inst[7:3];
 assign arg = Inst[2:0];
 
 always @(posedge clk) begin
+    if (stall == 1'b1) begin
+        if (stall_counter == 0) begin
+            stall = 1'b0;
+        end
+        else begin
+            stall_counter = stall_counter-1;
+        end
+    end
+
     IP = IP;
 
     if (~stall) begin
@@ -95,19 +90,27 @@ always @(posedge clk) begin
         16:
             if (registers[0] != 0) begin
                 IP = registers[arg];
+                stall = 1'b1;
             end
         17:
             if (registers[0] == 0) begin
                 IP = registers[arg];
+                stall = 1'b1;
             end
-        18: IP = registers[arg];
+        18:
+            begin
+            IP = registers[arg];
+            stall = 1'b1;
+            end
         19:
             if (registers[0] < 0) begin
                 IP = registers[arg];
+                stall = 1'b1;
             end
         20:
             if (registers[0] > 0) begin
                 IP = registers[arg];
+                stall = 1'b1;
             end
         default: $display("unknown opcode %b", opcode);
     endcase
