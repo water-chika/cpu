@@ -41,7 +41,7 @@ wire [7:0] program_out_data;
 memory program(
 .clk(clk),
 .write_enable(program_write_enable),
-.read_enable(program_read_enable),
+.enable(program_read_enable),
 .address(program_address),
 .in_data(program_in_data),
 .out_data(program_out_data)
