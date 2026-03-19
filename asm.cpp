@@ -57,12 +57,25 @@ uint8_t parse_arg(const std::string& str) {
 int main(int argc, const char* argv[]) {
     bool output_hex = false;
     bool enable_debug = false;
+    bool sep_with_line = true;
     for (int i = 1; i < argc; i++) {
         if (std::string(argv[i]) == "--hex") {
             output_hex = true;
         }
         else if (std::string(argv[i]) == "--debug") {
             enable_debug = true;
+        }
+        else if (std::string(argv[i]) == "--sep_with_line") {
+            sep_with_line = true;
+        }
+        else if (std::string(argv[i]) == "--help") {
+            std::cout << "Usage: asm [options]\n"
+                         "Options:\n"
+                         "  --hex             Output in hexadecimal format\n"
+                         "  --debug           Enable debug output\n"
+                         "  --sep_with_line   Separate output with new lines instead of commas\n"
+                         "  --help            Show this help message\n";
+            return 0;
         }
     }
     while (true) {
@@ -81,7 +94,12 @@ int main(int argc, const char* argv[]) {
             std::cerr << (int)opcode_b << ',' << (int)arg_b << std::endl;
         }
         if (output_hex) {
-            std::cout << std::format("{:02x},", code);
+            std::cout << std::format("{:02x}", code);
+            if (sep_with_line) {
+                std::cout << std::endl;
+            } else {
+                std::cout << ',';
+            }
         }
         else {
             std::cout.write(reinterpret_cast<char*>(&code), sizeof(code));
