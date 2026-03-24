@@ -118,3 +118,13 @@ add v0 v1 v2
 
 Last component is result variable.
 
+Branches opcode is below:
+
+```
+be
+bne
+b
+bg
+bl
+```
+
