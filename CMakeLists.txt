@@ -5,3 +5,6 @@ project(asm)
 add_executable(asm asm.cpp)
 
 target_compile_features(asm PUBLIC cxx_std_20)
+
+add_executable(variables_to_registers variables_to_registers.cpp)
+target_compile_features(variables_to_registers PUBLIC cxx_std_20)
