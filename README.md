@@ -110,3 +110,11 @@ Not implemented.
 
 This library or executable will translate variables to registers or memories.
 
+Its statement contain 4 components seperated with space, like below:
+
+```
+add v0 v1 v2
+```
+
+Last component is result variable.
+
