@@ -104,6 +104,12 @@ mov0 r2
 bnz r3
 ```
 
+### Label Parse
+
+Not implemented.
+
+This library or executable will translate labels to memory address of instruction.
+
 ### Variables To Register
 
 Not implemented.
