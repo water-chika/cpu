@@ -80,3 +80,33 @@ Instruction field arg encodes register containing memory address.
 | swap|   27   | swap register and data memory |
 | ld_p|   28   | load from program memory |
 | st_p|   29   | store to program memory  |
+
+## Assembler
+
+There is also a simple assembler that implemented by simple string map and a shift operation.
+
+It read an op and an arg seperated by space, like below:
+
+```
+imm 1
+mov r1
+shl 5
+mov r7
+imm 1
+add r1
+mov0 r7
+mov r2
+mov0 r1
+sub r2
+imm 4
+mov r3
+mov0 r2
+bnz r3
+```
+
+### Variables To Register
+
+Not implemented.
+
+This library or executable will translate variables to registers or memories.
+
