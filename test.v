@@ -12,6 +12,7 @@ initial begin
         U0.registers[4], U0.registers[5], U0.registers[6], U0.registers[7], U0.IP);
     clk = 0;
     $readmemh("test.list", U0.program.mem);
+    $readmemh("data.list", U0.data.mem);
     #640 $finish;
 end
 
