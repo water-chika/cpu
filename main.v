@@ -10,8 +10,8 @@ reg stall;
 reg [7:0] stall_counter; // If it needs more than 1 stall clock
 
 initial begin
-    stall = 1'b1;
-    stall_counter = 3;
+    stall = 1'b0;
+    stall_counter = 0;
 end
 
 initial begin
@@ -33,6 +33,7 @@ memory program(
     .out_data(program_out_data)
 );
 
+wire data_enable;
 reg data_write_enable;
 reg data_read_enable;
 reg [7:0] data_address;
@@ -41,15 +42,16 @@ wire [7:0] data_out_data;
 memory data(
     .clk(clk),
     .write_enable(data_write_enable),
-    .enable(data_read_enable),
+    .enable(data_enable),
     .address(data_address),
     .in_data(data_in_data),
     .out_data(data_out_data)
 );
 
+assign data_enable = 1'b1;
+
 initial begin
     data_write_enable = 1'b0;
-    data_read_enable = 1'b0;
 end
 
 wire [7:0] Inst;
@@ -77,7 +79,8 @@ assign arg = Inst[2:0];
 
 always @(posedge clk) begin
 
-    if (data_write_enable) begin
+    // delay to wait memory operation
+    #1 if (data_write_enable) begin
         data_write_enable = 1'b0;
     end
     if (data_read_enable) begin
@@ -100,7 +103,8 @@ always @(posedge clk) begin
         IP = IP + 1;
     end
 
-    case (opcode)
+    // delay to wait memory operation
+    #1 case (opcode)
         0: registers[arg] <= registers[arg] & registers[0];
         1: registers[arg] <= registers[arg] | registers[0];
         2: registers[arg] <= ~registers[arg];

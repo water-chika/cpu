@@ -1,5 +1,4 @@
 imm 1
-mov r1
 shl 5
 mov r7
 ld r1
@@ -10,7 +9,7 @@ mov0 r7
 mov r2
 mov0 r1
 sub r2
-imm 4
+imm 3
 mov r3
 mov0 r2
 bnz r3
