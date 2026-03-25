@@ -25,13 +25,32 @@ wire [7:0] program_in_data;
 wire [7:0] program_out_data;
 
 memory program(
-.clk(clk),
-.write_enable(program_write_enable),
-.enable(program_read_enable),
-.address(program_address),
-.in_data(program_in_data),
-.out_data(program_out_data)
+    .clk(clk),
+    .write_enable(program_write_enable),
+    .enable(program_read_enable),
+    .address(program_address),
+    .in_data(program_in_data),
+    .out_data(program_out_data)
 );
+
+reg data_write_enable;
+reg data_read_enable;
+reg [7:0] data_address;
+reg [7:0] data_in_data;
+wire [7:0] data_out_data;
+memory data(
+    .clk(clk),
+    .write_enable(data_write_enable),
+    .enable(data_read_enable),
+    .address(data_address),
+    .in_data(data_in_data),
+    .out_data(data_out_data)
+);
+
+initial begin
+    data_write_enable = 1'b0;
+    data_read_enable = 1'b0;
+end
 
 wire [7:0] Inst;
 
@@ -57,6 +76,15 @@ assign opcode = Inst[7:3];
 assign arg = Inst[2:0];
 
 always @(posedge clk) begin
+
+    if (data_write_enable) begin
+        data_write_enable = 1'b0;
+    end
+    if (data_read_enable) begin
+        registers[0] = data_out_data;
+        data_read_enable = 1'b0;
+    end
+
     if (stall == 1'b1) begin
         if (stall_counter == 0) begin
             stall = 1'b0;
@@ -112,6 +140,30 @@ always @(posedge clk) begin
                 IP = registers[arg];
                 stall = 1'b1;
             end
+        24:
+        begin
+            data_address = registers[arg];
+            data_read_enable = 1'b1;
+        end
+        25:
+        begin
+            data_address = registers[arg];
+            data_write_enable = 1'b1;
+            data_in_data = registers[0];
+        end
+        26:
+        begin
+            data_address = registers[arg];
+            data_write_enable = 1'b1;
+            data_in_data = 8'b00000000;
+        end
+        27:
+        begin
+            data_address = registers[arg];
+            data_write_enable = 1'b1;
+            data_read_enable = 1'b1;
+            data_in_data = registers[0];
+        end
         default: $display("unknown opcode %b", opcode);
     endcase
 end
