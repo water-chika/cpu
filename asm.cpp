@@ -57,7 +57,7 @@ uint8_t parse_arg(const std::string& str) {
 int main(int argc, const char* argv[]) {
     bool output_hex = false;
     bool enable_debug = false;
-    bool sep_with_line = true;
+    bool sep_with_line = false;
     for (int i = 1; i < argc; i++) {
         if (std::string(argv[i]) == "--hex") {
             output_hex = true;
