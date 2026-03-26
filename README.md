@@ -216,6 +216,20 @@ Instruction field arg encodes register containing branch address.
 | b   |   34   | branch always      |
 | blz |   35   | branch if less than zero |
 | bgz |   36   | branch if greater than zero |
+| bnz_r|   38   | branch if not zero(relative to ip)|
+| bz  |   39   | branch if zero(relative to ip)|
+| b   |   40   | branch always(relative to ip)|
+| blz |   41   | branch if less than zero(relative to ip)|
+| bgz |   42   | branch if greater than zero(relative to ip)|
+
+branch relative to ip with imm offset use below encoding.
+
+```
+|f e d c b a 9 8 7 6 5 4 3 2 1 0|
+| Opcode      | imm | Src | imm |
+```
+
+imm is combination of [8:6] and [2:0].
 
 #### Data transfer
 
