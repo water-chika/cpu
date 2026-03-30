@@ -7,7 +7,11 @@ module memory(
    output reg [7:0] out_data
 );
 
-reg [7:0] mem[255:0];
+parameter DATA_WIDTH = 8;
+parameter ADDR_WIDTH = 8;
+parameter RAM_DEPTH = 1 << ADDR_WIDTH;
+
+reg [DATA_WIDTH-1:0] mem[RAM_DEPTH-1:0];
 
 always @(posedge clk) begin
     if (enable) begin
