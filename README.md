@@ -201,7 +201,8 @@ Signed integer instructions uses 2's complement representation.
 | shr |   15   | 0001111| shift right imm times|
 | srl |   16   | 0010000| shift rotate left imm times|
 | srr |   17   | 0010001| shift rotate right imm times|
-| sar |   18   | 0001111| shift arithmetic right imm times|
+| sar |   18   | 0010010| shift arithmetic right imm times|
+| add_ip| 19   | 0010011| add (ip+1) with imm to reg |
 
 #### Branch
 
@@ -216,11 +217,6 @@ Instruction field arg encodes register containing branch address.
 | b   |   34   | branch always      |
 | blz |   35   | branch if less than zero |
 | bgz |   36   | branch if greater than zero |
-| bnz_r|   38   | branch if not zero(relative to ip)|
-| bz  |   39   | branch if zero(relative to ip)|
-| b   |   40   | branch always(relative to ip)|
-| blz |   41   | branch if less than zero(relative to ip)|
-| bgz |   42   | branch if greater than zero(relative to ip)|
 
 branch relative to ip with imm offset use below encoding.
 
