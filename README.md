@@ -175,7 +175,7 @@ Instruction memory and data memory is separated but there are instructions to lo
 
 Opcode is 7 bit width. Arg is 3 bit width.
 
-With 7 bit opcode, there are 128 instructions ( 2^5 == 128 ).
+With 7 bit opcode, there are 128 instructions ( 2^7 == 128 ).
 
 #### Data process
 
