@@ -145,17 +145,17 @@ Instruction is 16 bit width.
 Src0 op Src1 -> Dst
 
 |f e d c b a 9 8 7 6 5 4 3 2 1 0|
-| Opcode      | Op  | Src | Dst |
+| Opcode      | Op0 | Src1| Dst |
 
 op Src -> Dst
 
 |f e d c b a 9 8 7 6 5 4 3 2 1 0|
-| Opcode      | Op  | Op2 | Dst |
+| Opcode      | Op0 | Op1 | Dst |
 
 op result-> Dst
 
 |f e d c b a 9 8 7 6 5 4 3 2 1 0|
-| Opcode      | Op  | Src | Op2 |
+| Opcode      | Op0 | Src1| Op2 |
 
 op Src
 
