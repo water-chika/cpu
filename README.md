@@ -218,14 +218,7 @@ Instruction field arg encodes register containing branch address.
 | blz |   35   | branch if less than zero |
 | bgz |   36   | branch if greater than zero |
 
-branch relative to ip with imm offset use below encoding.
-
-```
-|f e d c b a 9 8 7 6 5 4 3 2 1 0|
-| Opcode      | imm | Src | imm |
-```
-
-imm is combination of [8:6] and [2:0].
+branch relative to ip is implemented by add_ip instruction and branch instructions.
 
 #### Data transfer
 
