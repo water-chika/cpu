@@ -126,54 +126,58 @@ always @(posedge clk) begin
         13: registers[dst] <= registers[src0] << shift_imm;
         14: registers[dst] <= registers[src0] >> shift_imm;
         32:
-            if (registers[0] != 0) begin
-                IP = registers[arg];
+            if (registers[src0] != 0) begin
+                IP = registers[src1];
                 stall = 1'b1;
             end
         33:
-            if (registers[0] == 0) begin
-                IP = registers[arg];
+            if (registers[src0] == 0) begin
+                IP = registers[src1];
                 stall = 1'b1;
             end
         34:
             begin
-            IP = registers[arg];
+            IP = registers[src1];
             stall = 1'b1;
             end
         35:
-            if (registers[0] < 0) begin
-                IP = registers[arg];
+            if (registers[src0] < 0) begin
+                IP = registers[src1];
                 stall = 1'b1;
             end
         36:
-            if (registers[0] > 0) begin
-                IP = registers[arg];
+            if (registers[src0] > 0) begin
+                IP = registers[src1];
                 stall = 1'b1;
             end
 
         64:
         begin
-            data_address = registers[arg];
+            data_address = registers[src1];
+            data_dst = dst;
             data_read_enable = 1'b1;
         end
         65:
         begin
-            data_address = registers[arg];
+            data_address = registers[src1];
+            data_dst = dst;
             data_write_enable = 1'b1;
             data_in_data = registers[0];
         end
         66:
         begin
-            data_address = registers[arg];
+            data_address = registers[src1];
+            data_dst = dst;
             data_write_enable = 1'b1;
             data_in_data = 8'b00000000;
         end
         67:
         begin
-            data_address = registers[arg];
+            data_address = registers[src1];
+            data_dst = dst;
             data_write_enable = 1'b1;
             data_read_enable = 1'b1;
-            data_in_data = registers[0];
+            data_in_data = registers[dst];
         end
         default: $display("unknown opcode %b", opcode);
     endcase
