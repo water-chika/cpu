@@ -1,8 +1,10 @@
 `include "memory.v"
 
-module main(
+module cpu_inst8_data8(
     input clk
 );
+
+parameter INST_WIDTH = 8;
 
 reg [7:0] IP; // Because program memory has latency,
               // IP point to next instruction address.
@@ -21,10 +23,10 @@ end
 wire program_write_enable;
 wire program_read_enable;
 wire [7:0] program_address;
-wire [7:0] program_in_data;
-wire [7:0] program_out_data;
+wire [INST_WIDTH-1:0] program_in_data;
+wire [INST_WIDTH-1:0] program_out_data;
 
-memory program(
+memory #(.DATA_WIDTH(INST_WIDTH)) program(
     .clk(clk),
     .write_enable(program_write_enable),
     .enable(program_read_enable),
@@ -54,7 +56,7 @@ initial begin
     data_write_enable = 1'b0;
 end
 
-wire [7:0] Inst;
+wire [INST_WIDTH:0] Inst;
 
 assign program_address = IP;
 assign program_read_enable = 1'b1;
@@ -72,10 +74,19 @@ initial begin:INIT_REGS
 end
 
 wire [4:0] opcode;
-wire [2:0] arg;
-
+wire [2:0] src0;
+wire [2:0] src1;
+wire [2:0] dst;
+wire [7:0] imm;
+wire [2:0] shift_imm;
 assign opcode = Inst[7:3];
-assign arg = Inst[2:0];
+assign src0 = Inst[2:0];
+assign src1 = 0;
+assign dst = src0;
+assign imm = Inst[2:0];
+assign shift_imm = Inst[2:0];
+
+reg [2:0] data_dst;
 
 always @(posedge clk) begin
 
@@ -84,7 +95,7 @@ always @(posedge clk) begin
         data_write_enable = 1'b0;
     end
     if (data_read_enable) begin
-        registers[0] = data_out_data;
+        registers[data_dst] = data_out_data;
         data_read_enable = 1'b0;
     end
 
@@ -105,68 +116,73 @@ always @(posedge clk) begin
 
     // delay to wait memory operation
     #1 case (opcode)
-        0: registers[arg] <= registers[arg] & registers[0];
-        1: registers[arg] <= registers[arg] | registers[0];
-        2: registers[arg] <= ~registers[arg];
-        3: registers[arg] <= registers[arg] ^ registers[0];
-        4: registers[arg] <= registers[arg] + registers[0];
-        5: registers[arg] <= registers[arg] - registers[0];
-        6: registers[arg] <= -registers[arg];
-        7: registers[arg] <= registers[arg] * registers[0];
-        8: registers[arg] <= registers[arg] / registers[0];
-        9: registers[arg] <= registers[0];
-        10: registers[0] <= registers[arg];
-        11: registers[0] <= arg;
-        12: registers[0] <= registers[0] << arg;
-        13: registers[0] <= registers[0] >> arg;
+        0: registers[dst] <= registers[src0] & registers[src1];
+        1: registers[dst] <= registers[src0] | registers[src1];
+        2: registers[dst] <= ~registers[src0];
+        3: registers[dst] <= registers[src0] ^ registers[src1];
+        4: registers[dst] <= registers[src0] + registers[src1];
+        5: registers[dst] <= registers[src0] - registers[src1];
+        6: registers[dst] <= -registers[src0];
+        7: registers[dst] <= registers[src0] * registers[src1];
+        8: registers[dst] <= registers[src0] / registers[src1];
+        9: registers[dst] <= registers[src0];
+        10: registers[0] <= registers[src0];
+        11: registers[0] <= imm;
+        12: registers[0] <= registers[0] << shift_imm;
+        13: registers[0] <= registers[0] >> shift_imm;
+
         16:
-            if (registers[0] != 0) begin
-                IP = registers[arg];
+            if (registers[src1] != 0) begin
+                IP = registers[src0];
                 stall = 1'b1;
             end
         17:
-            if (registers[0] == 0) begin
-                IP = registers[arg];
+            if (registers[src1] == 0) begin
+                IP = registers[src0];
                 stall = 1'b1;
             end
         18:
             begin
-            IP = registers[arg];
+            IP = registers[src0];
             stall = 1'b1;
             end
         19:
-            if (registers[0] < 0) begin
-                IP = registers[arg];
+            if (registers[src1] < 0) begin
+                IP = registers[src0];
                 stall = 1'b1;
             end
         20:
-            if (registers[0] > 0) begin
-                IP = registers[arg];
+            if (registers[src1] > 0) begin
+                IP = registers[src0];
                 stall = 1'b1;
             end
         24:
         begin
-            data_address = registers[arg];
+            data_address = registers[src0];
+            data_dst = dst;
             data_read_enable = 1'b1;
         end
         25:
         begin
-            data_address = registers[arg];
+            data_address = registers[src0];
+            data_dst = dst;
             data_write_enable = 1'b1;
-            data_in_data = registers[0];
+            data_in_data = registers[dst];
         end
         26:
         begin
-            data_address = registers[arg];
+            data_address = registers[src0];
+            data_dst = dst;
             data_write_enable = 1'b1;
             data_in_data = 8'b00000000;
         end
         27:
         begin
-            data_address = registers[arg];
+            data_address = registers[src0];
+            data_dst = dst;
             data_write_enable = 1'b1;
             data_read_enable = 1'b1;
-            data_in_data = registers[0];
+            data_in_data = registers[dst];
         end
         default: $display("unknown opcode %b", opcode);
     endcase

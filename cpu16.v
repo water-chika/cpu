@@ -1,3 +1,4 @@
+`include "memory.v"
 
 module cpu_inst16_data8(
     input clk
@@ -25,7 +26,7 @@ wire [7:0] program_address;
 wire [INST_WIDTH-1:0] program_in_data;
 wire [INST_WIDTH-1:0] program_out_data;
 
-memory #(.DATA_WIDTH=INST_WIDTH) program(
+memory #(.DATA_WIDTH(INST_WIDTH)) program(
     .clk(clk),
     .write_enable(program_write_enable),
     .enable(program_read_enable),
@@ -72,16 +73,17 @@ initial begin:INIT_REGS
     end
 end
 
-wire [4:0] opcode;
-wire [2:0] arg;
-
 assign opcode = Inst[15:15-(7-1)];
 assign src0 = Inst[8:6];
 assign src1 = Inst[5:3];
 assign dst = Inst[2:0];
 assign imm4 = Inst[6:3];
 assign imm_shift = Inst[8:7];
+wire [7:0] imm;
+assign imm = imm4 << imm_shift;
 assign shift_imm = Inst[5:3];
+
+reg [2:0] data_dst;
 
 always @(posedge clk) begin
 
@@ -90,7 +92,7 @@ always @(posedge clk) begin
         data_write_enable = 1'b0;
     end
     if (data_read_enable) begin
-        registers[0] = data_out_data;
+        registers[data_dst] = data_out_data;
         data_read_enable = 1'b0;
     end
 
@@ -116,15 +118,15 @@ always @(posedge clk) begin
         2: registers[dst] <= ~registers[src0];
         3: registers[dst] <= registers[src0] ^ registers[src1];
         4: registers[dst] <= registers[src0] + registers[src1];
+        5: registers[dst] <= registers[src0] - registers[src1];
+        6: registers[dst] <= -registers[src0];
+        7: registers[dst] <= registers[src0] * registers[src1];
+        8: registers[dst] <= registers[src0] / registers[src1];
+        9: registers[dst] <= registers[src0];
+        10: registers[dst] <= imm;
+        11: registers[dst] <= registers[src0] << shift_imm;
+        12: registers[dst] <= registers[src0] >> shift_imm;
 
-        6: registers[dst] <= registers[src0] - registers[src1];
-        8: registers[dst] <= -registers[src0];
-        9: registers[dst] <= registers[src0] * registers[src1];
-        10: registers[dst] <= registers[src0] / registers[src1];
-        11: registers[dst] <= registers[src0];
-        12: registers[dst] <= imm4 << imm_shift;
-        13: registers[dst] <= registers[src0] << shift_imm;
-        14: registers[dst] <= registers[src0] >> shift_imm;
         32:
             if (registers[src0] != 0) begin
                 IP = registers[src1];
@@ -162,7 +164,7 @@ always @(posedge clk) begin
             data_address = registers[src1];
             data_dst = dst;
             data_write_enable = 1'b1;
-            data_in_data = registers[0];
+            data_in_data = registers[src0];
         end
         66:
         begin

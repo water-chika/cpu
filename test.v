@@ -1,10 +1,10 @@
-`include "main.v"
+`include "cpu8.v"
 
 module test();
 
 reg clk;
 
-main U0(.clk(clk));
+cpu_inst8_data8 U0(.clk(clk));
 
 initial begin
     $monitor("%g\tstall=%b, inst=%8b, reg0=%8b, reg1=%8b, reg2=%8b, reg3=%8b, reg4=%8b, reg5=%8b, reg6=%8b, reg7=%8b, IP=%8b",
