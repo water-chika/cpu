@@ -125,7 +125,7 @@ always @(posedge clk) begin
         6: registers[dst] <= -registers[src0];
         7: registers[dst] <= registers[src0] * registers[src1];
         8: registers[dst] <= registers[src0] / registers[src1];
-        9: registers[dst] <= registers[src0];
+        9: registers[dst] <= registers[0];
         10: registers[0] <= registers[src0];
         11: registers[0] <= imm;
         12: registers[0] <= registers[0] << shift_imm;
