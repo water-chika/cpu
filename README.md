@@ -18,7 +18,6 @@ Instruction is 8 bit width.
 There are 8 registers that is 8 bit width.
 
 There is a 3 bit register src1/dst1.
-...
 
 There are instructions to read/write IP (instruction pointer) register.
 
