@@ -238,3 +238,7 @@ Instruction field arg encodes register containing memory address.
 | swap|   67   | swap register and data memory |
 | ld_p|   68   | load from program memory |
 | st_p|   69   | store to program memory  |
+
+## Instruction Set Architecture - 8 Bit Instruction/Register SIMD32
+
+Not implemeted
