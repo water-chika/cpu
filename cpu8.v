@@ -74,19 +74,28 @@ initial begin:INIT_REGS
 end
 
 wire [4:0] opcode;
+wire [2:0] arg;
 wire [2:0] src0;
-wire [2:0] src1;
+reg [2:0] src1;
 wire [2:0] dst;
+wire dst1;
 wire [7:0] imm;
 wire [2:0] shift_imm;
 assign opcode = Inst[7:3];
 assign src0 = Inst[2:0];
-assign src1 = 0;
 assign dst = src0;
+assign dst1 = src1;
 assign imm = Inst[2:0];
 assign shift_imm = Inst[2:0];
+assign arg = Inst[2:0];
 
 reg [2:0] data_dst;
+
+
+initial begin
+    data_dst = 0;
+    src1 = 0;
+end
 
 always @(posedge clk) begin
 
@@ -116,20 +125,20 @@ always @(posedge clk) begin
 
     // delay to wait memory operation
     #1 case (opcode)
-        0: registers[dst] <= registers[src0] & registers[src1];
-        1: registers[dst] <= registers[src0] | registers[src1];
-        2: registers[dst] <= ~registers[src0];
-        3: registers[dst] <= registers[src0] ^ registers[src1];
-        4: registers[dst] <= registers[src0] + registers[src1];
-        5: registers[dst] <= registers[src0] - registers[src1];
-        6: registers[dst] <= -registers[src0];
-        7: registers[dst] <= registers[src0] * registers[src1];
-        8: registers[dst] <= registers[src0] / registers[src1];
-        9: registers[dst] <= registers[0];
-        10: registers[0] <= registers[src0];
-        11: registers[0] <= imm;
-        12: registers[0] <= registers[0] << shift_imm;
-        13: registers[0] <= registers[0] >> shift_imm;
+        0: registers[dst]     <= registers[src0] & registers[src1];
+        1: registers[dst]     <= registers[src0] | registers[src1];
+        2: registers[dst]     <= 8'b11111111     ^ registers[src1];
+        3: registers[dst]     <= registers[src0] ^ registers[src1];
+        4: registers[dst]     <= registers[src0] + registers[src1];
+        5: registers[dst]     <= registers[src0] - registers[src1];
+        6: registers[dst]     <= 8'b00000000     - registers[src1];
+        7: registers[dst]     <= registers[src0] * registers[src1];
+        8: registers[dst]     <= registers[src0] / registers[src1];
+        9: registers[dst]     <= 8'b00000000     | registers[src1];
+        10: registers[dst1]   <= registers[src0] | 8'b00000000;
+        11: registers[dst1]   <=           imm   | (src1 << 3);
+        12: registers[dst1]   <= registers[src1] << shift_imm;
+        13: registers[dst1]   <= registers[src1] >> shift_imm;
 
         16:
             if (registers[src1] != 0) begin
@@ -183,6 +192,10 @@ always @(posedge clk) begin
             data_write_enable = 1'b1;
             data_read_enable = 1'b1;
             data_in_data = registers[dst];
+        end
+
+        31:begin
+            src1 <= arg;
         end
         default: $display("unknown opcode %b", opcode);
     endcase

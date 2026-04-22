@@ -17,8 +17,7 @@ Instruction is 8 bit width.
 
 There are 8 registers that is 8 bit width.
 
-Register 0 is special register as second argument if there are 2 arguments.
-Register 1 is special register as third argument if there are 3 arguments.
+There is a 3 bit register src1/dst1.
 ...
 
 There are instructions to read/write IP (instruction pointer) register.
@@ -35,7 +34,7 @@ With 5 bit opcode, there are 32 instructions ( 2^5 == 32 ).
 
 Signed integer instructions uses 2's complement representation.
 
-Instruction field arg encodes register written or immediate.
+Instruction field arg encodes src0/dst0 or imm or shift_imm.
 
 | Op  | Opcode |binary| Description |
 |-----|--------|------|-------------|
@@ -48,9 +47,9 @@ Instruction field arg encodes register written or immediate.
 | neg |   6    | 00110| negate      |
 | mul |   7    | 00111| multiply    |
 | div |   8    | 01000| divide      |
-| mov |   9    | 01001| move reg0 to reg |
-| mov0|   10   | 01010| move reg to reg0|
-| imm |   11   | 01011| move imm to reg0 |
+| mov |   9    | 01001| move src1 to dst0 |
+| mov0|   10   | 01010| move src0 to dst1 |
+| imm |   11   | 01011| move imm to dst1  |
 | shl |   12   | 01100| shift left imm times|
 | shr |   13   | 01101| shift right imm times|
 
@@ -80,6 +79,14 @@ Instruction field arg encodes register containing memory address.
 | swap|   27   | swap register and data memory |
 | ld_p|   28   | load from program memory |
 | st_p|   29   | store to program memory  |
+
+#### State control
+
+Set processor state
+
+| Op            | Opcode | Description |
+|---------------|--------|-------------|
+| set_src1_dst1 |   31   | set src1 and dst1 |
 
 ## Assembler
 
