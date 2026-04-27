@@ -35,7 +35,7 @@ auto opcodes = std::unordered_map<std::string, uint8_t>{
     {"ld_p", 28},
     {"st_p", 29},
 
-    {"set_arg1_dst1", 31},
+    {"set_src1_dst1", 31},
 };
 
 auto args = std::unordered_map<std::string, uint8_t>{

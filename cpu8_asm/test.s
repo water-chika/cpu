@@ -9,6 +9,5 @@ mov r2
 mov0 r1
 sub r2
 imm 4
-mov r3
-mov0 r2
-bnz r3
+condition_nz r2
+b r0
