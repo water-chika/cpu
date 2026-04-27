@@ -24,9 +24,11 @@ auto opcodes = std::unordered_map<std::string, uint8_t>{
     {"condition_z", 15},
     {"condition_lz", 16},
     {"condition_gz", 17},
-    {"condition_1", 18},
 
-    {"b", 19},
+    {"condition_1", 18},
+    {"b", 18},
+    {"set_b_target", 19},
+    {"set_data_address", 20},
 
     {"ld", 24},
     {"st", 25},
@@ -47,6 +49,8 @@ auto args = std::unordered_map<std::string, uint8_t>{
     {"r5", 5},
     {"r6", 6},
     {"r7", 7},
+    {"condition_1", 0},
+    {"b", 1},
 };
 
 uint8_t parse_arg(const std::string& str) {

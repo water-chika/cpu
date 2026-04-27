@@ -8,16 +8,15 @@ parameter INST_WIDTH = 8;
 
 reg [7:0] IP; // Because program memory has latency,
               // IP point to next instruction address.
+reg [7:0] instruction_pointer_1;
 reg stall;
 reg [7:0] stall_counter; // If it needs more than 1 stall clock
 
 initial begin
+    IP = 0;
+    instruction_pointer_1 = 0;
     stall = 1'b0;
     stall_counter = 0;
-end
-
-initial begin
-    IP = 0;
 end
 
 wire program_write_enable;
@@ -80,7 +79,7 @@ wire [2:0] arg;
 wire [2:0] src0;
 reg [2:0] src1;
 wire [2:0] dst;
-wire dst1;
+wire [2:0] dst1;
 wire [7:0] imm;
 wire [2:0] shift_imm;
 assign opcode = Inst[7:3];
@@ -139,7 +138,7 @@ always @(posedge clk) begin
         8: registers[dst]     <= registers[src0] / registers[src1];
         9: registers[dst]     <= 8'b00000000     | registers[src1];
         10: registers[dst1]   <= registers[src0] | 8'b00000000;
-        11: registers[dst1]   <=           imm   | (src1 << 3);
+        11: registers[dst1]   <=           imm;
         12: registers[dst1]   <= registers[src1] << shift_imm;
         13: registers[dst1]   <= registers[src1] >> shift_imm;
 
@@ -147,46 +146,45 @@ always @(posedge clk) begin
         15: condition = registers[src0] == 0;
         16: condition = registers[src0] < 0;
         17: condition = registers[src0] > 0;
-        18: condition = 1;
-
-        19:
+        18:
             begin
-            IP = registers[src0];
-            stall = 1'b1;
+                case (arg)
+                    0: condition = 1;
+                    1:
+                        begin
+                            IP = instruction_pointer_1;
+                            stall = 1'b1;
+                        end
+                endcase
             end
+
+        19: instruction_pointer_1 = registers[src0];
+        20: data_address = registers[src0];
 
         24:
         begin
-            data_address = registers[src0];
             data_dst = dst;
             data_read_enable = 1'b1;
         end
         25:
         begin
-            data_address = registers[src0];
-            data_dst = dst;
             data_write_enable = 1'b1;
-            data_in_data = registers[dst];
+            data_in_data = registers[src0];
         end
         26:
         begin
-            data_address = registers[src0];
-            data_dst = dst;
             data_write_enable = 1'b1;
             data_in_data = 8'b00000000;
         end
         27:
         begin
-            data_address = registers[src0];
             data_dst = dst;
             data_write_enable = 1'b1;
             data_read_enable = 1'b1;
-            data_in_data = registers[dst];
+            data_in_data = registers[src0];
         end
 
-        31:begin
-            src1 <= arg;
-        end
+        31: src1 = arg;
         default: $display("unknown opcode %b", opcode);
     endcase
     end

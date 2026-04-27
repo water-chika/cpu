@@ -10,4 +10,6 @@ mov0 r1
 sub r2
 imm 4
 condition_nz r2
-b r0
+set_b_target r0
+b b
+condition_1 condition_1

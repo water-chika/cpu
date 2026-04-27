@@ -62,7 +62,7 @@ Condition determine if instruction run. Instruction do not run if condition is 0
 | condition_z   |   15   | sot condition to src0 is zero     |
 | condition_lz  |   16   | set condition to src0 less than zero |
 | condition_gz  |   17   | set condition to src0 greater than zero |
-| condition_1   |   18   | set condition to 1 |
+| condition_1   |   18(0)| set condition to 1 |
 
 #### Branch
 
@@ -72,7 +72,7 @@ Instruction field arg encodes register containing branch address.
 
 | Op  | Opcode | Description |
 |-----|--------|-------------|
-| b   |   19   | branch always      |
+| b   |   18(1)| branch      |
 
 #### Data transfer
 
@@ -93,6 +93,8 @@ Set processor state
 
 | Op            | Opcode | Description |
 |---------------|--------|-------------|
+| set_b_target  |   19   | set branch target |
+| set_data_address | 20  | set data address  |
 | set_src1_dst1 |   31   | set src1 and dst1 |
 
 ## Assembler
