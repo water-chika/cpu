@@ -56,6 +56,8 @@ Instruction field arg encodes src0/dst0 or imm or shift_imm.
 
 Condition determine if instruction run. Instruction do not run if condition is 0 (except set conditon with 1).
 
+| Op            | Opcode | Description |
+|---------------|--------|-------------|
 | condition_nz  |   14   | set condition to src0 not zero |
 | condition_z   |   15   | sot condition to src0 is zero     |
 | condition_lz  |   16   | set condition to src0 less than zero |
