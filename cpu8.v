@@ -65,12 +65,14 @@ assign program_in_data = 8'b00000000;
 assign Inst = stall ? 8'b00000000 : program_out_data;
 
 reg [7:0] registers[7:0];
+reg [0:0] condition;
 
 initial begin:INIT_REGS
     integer i;
     for (i = 0; i < 8; i=i+1) begin
         registers[i] <= 0;
     end
+    condition <= 1'b1;
 end
 
 wire [4:0] opcode;
@@ -123,6 +125,7 @@ always @(posedge clk) begin
         IP = IP + 1;
     end
 
+    if (condition) begin
     // delay to wait memory operation
     #1 case (opcode)
         0: registers[dst]     <= registers[src0] & registers[src1];
@@ -140,31 +143,18 @@ always @(posedge clk) begin
         12: registers[dst1]   <= registers[src1] << shift_imm;
         13: registers[dst1]   <= registers[src1] >> shift_imm;
 
-        16:
-            if (registers[src1] != 0) begin
-                IP = registers[src0];
-                stall = 1'b1;
-            end
-        17:
-            if (registers[src1] == 0) begin
-                IP = registers[src0];
-                stall = 1'b1;
-            end
-        18:
+        14: condition = registers[src0] != 0;
+        15: condition = registers[src0] == 0;
+        16: condition = registers[src0] < 0;
+        17: condition = registers[src0] > 0;
+        18: condition = 1;
+
+        19:
             begin
             IP = registers[src0];
             stall = 1'b1;
             end
-        19:
-            if (registers[src1] < 0) begin
-                IP = registers[src0];
-                stall = 1'b1;
-            end
-        20:
-            if (registers[src1] > 0) begin
-                IP = registers[src0];
-                stall = 1'b1;
-            end
+
         24:
         begin
             data_address = registers[src0];
@@ -199,6 +189,8 @@ always @(posedge clk) begin
         end
         default: $display("unknown opcode %b", opcode);
     endcase
+    end
+    if (opcode == 18) condition = 1;
 end
 
 endmodule

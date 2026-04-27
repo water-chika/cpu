@@ -52,6 +52,16 @@ Instruction field arg encodes src0/dst0 or imm or shift_imm.
 | shl |   12   | 01100| shift left imm times|
 | shr |   13   | 01101| shift right imm times|
 
+#### Condition
+
+Condition determine if instruction run. Instruction do not run if condition is 0 (except set conditon with 1).
+
+| condition_nz  |   14   | set condition to src0 not zero |
+| condition_z   |   15   | sot condition to src0 is zero     |
+| condition_lz  |   16   | set condition to src0 less than zero |
+| condition_gz  |   17   | set condition to src0 greater than zero |
+| condition_1   |   18   | set condition to 1 |
+
 #### Branch
 
 Branch condition compare argument with 0 (zero).
@@ -60,11 +70,7 @@ Instruction field arg encodes register containing branch address.
 
 | Op  | Opcode | Description |
 |-----|--------|-------------|
-| bnz |   16   | branch if not zero |
-| bz  |   17   | branch if zero     |
 | b   |   18   | branch always      |
-| blz |   19   | branch if less than zero |
-| bgz |   20   | branch if greater than zero |
 
 #### Data transfer
 
