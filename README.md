@@ -70,7 +70,7 @@ Instruction field arg encodes register containing branch address.
 
 | Op  | Opcode | Description |
 |-----|--------|-------------|
-| b   |   18   | branch always      |
+| b   |   19   | branch always      |
 
 #### Data transfer
 

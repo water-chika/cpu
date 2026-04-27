@@ -20,11 +20,13 @@ auto opcodes = std::unordered_map<std::string, uint8_t>{
     {"shl", 12},
     {"shr", 13},
 
-    {"bnz", 16},
-    {"bz", 17},
-    {"b", 18},
-    {"blz", 19},
-    {"bgz", 20},
+    {"condition_nz", 14},
+    {"condition_z", 15},
+    {"condition_lz", 16},
+    {"condition_gz", 17},
+    {"condition_1", 18},
+
+    {"b", 19},
 
     {"ld", 24},
     {"st", 25},
@@ -32,6 +34,8 @@ auto opcodes = std::unordered_map<std::string, uint8_t>{
     {"swap", 27},
     {"ld_p", 28},
     {"st_p", 29},
+
+    {"set_arg1_dst1", 31},
 };
 
 auto args = std::unordered_map<std::string, uint8_t>{
