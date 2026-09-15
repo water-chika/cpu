@@ -549,8 +549,8 @@ design in [```docs/gpu_isa.md```](docs/gpu_isa.md) supersedes it - see
 ## Instruction Set Architecture - 32 Bit Instruction SIMT GPU
 
 See [```docs/gpu_isa.md```](docs/gpu_isa.md).  The scalar unit exists in
-```gpu16.v```; the vector unit, the exec mask, the LDS, the matrix unit and
-```asm32``` do not yet.
+```gpu16.v``` and the assembler in ```asm_gpu16```; the vector unit, the exec
+mask, the LDS and the matrix unit do not yet.
 
 ```gpu16``` is a SIMT sibling of cpu16 aimed at tiled integer GEMM: 16 lanes
 per wavefront with a software-managed exec mask, 16 scalar and 16 vector
@@ -585,13 +585,38 @@ the two exec-mask branches, ```s_ld_g```, and ```s_waitcnt_g```,
 ```s_endpgm``` and ```s_nop```.  Every vector, LDS and matrix opcode reports
 ```unknown opcode``` rather than guessing.
 
+```asm_gpu16``` is the assembler, and it is the whole ISA rather than the
+part that runs: all 97 documented instructions assemble, scalar and vector
+alike.  It is the same tool as ```asm``` and ```asm16``` - the same command
+line, the same five passes, the same per line kernel in ```asm_kernel.hpp```,
+so the same serial, threaded and HIP backends - with three things the ISA
+needed and the other two did not.  Its operands are typed, because section
+4.2 fixes which register file each field names, so ```v_add v1, s2, v3``` is
+an error and not a different instruction.  Their number is per instruction,
+from none for ```s_endpgm``` to four for ```v_mad```.  And a label may stand
+in for an address anywhere the ISA takes one, not only after ```la``` -
+```s_bnz_i s3, loop``` for a word offset from the next instruction,
+```s_imm s7, target``` for a plain word address.  ```la s10, target``` is one
+```s_addpc```, because unlike cpu8 this machine can add to its own PC.
+
 ```testgpu.v``` is its testbench, modelled on ```test16.v```, and the five
-```gpu_*``` CTests run hand encoded programs on it and check all sixteen
-scalar registers.  A gpu16 program must reach ```s_endpgm```: unlike cpu16,
-running off the end is a failure even if the registers look right.  There is
-no ```asm32``` yet, so the programs in ```tests/*.hex32``` are hex words
-carrying their own disassembly in ```//``` comments, which ```$readmemh```
-ignores.
+```gpu_*``` CTests assemble a program with ```asm_gpu16```, run it on
+```gpu16.v``` and check all sixteen scalar registers.  A gpu16 program must
+reach ```s_endpgm```: unlike cpu16, running off the end is a failure even if
+the registers look right.  Their ```.expect``` files were written when the
+programs were hand encoded hex and have not been touched since, so a pass now
+says the assembler and the RTL read section 4.1 the same way.
+
+Simulation can only reach the third of the ISA that ```gpu16.v``` implements,
+so ```gpu_encoding``` covers the rest: it assembles all 97 instructions and
+compares the words against ```tests/gpu_encoding.expect32```, which needs no
+hardware at all.  That expectation was not produced by running the assembler
+- it came from a script that read section 4.2's field table and sections 4.3
+to 4.10's opcode tables out of the markdown - and it ends with section 4.11's
+twelve worked encodings copied out of the document's prose.  ```gpu_reject```
+is the other half: the rules the document states and no hardware enforces, so
+that source which is not gpu16 fails to assemble instead of assembling into
+something.
 
 Revision 4 adds section 8, which answers a follow-up question: should the
 instruction word be enlarged to carry 5-bit register fields and a 32-entry
@@ -638,8 +663,10 @@ compiles every ```*.v``` on its own with ```-Wall``` and fails on any message.
   memory port they need.
 * ```variables_to_registers``` is not implemented.
 * ```gpu16_scalar``` is scalar only.  There is no vector unit, no exec mask,
-  no LDS and no matrix unit, and therefore no ```asm32``` and none of section
-  7.4's kernels yet.  Its global loads complete in one cycle, so
+  no LDS and no matrix unit, and therefore none of section 7.4's kernels yet.
+  ```asm_gpu16``` assembles the instructions they would need, but nothing can
+  execute them, so those are held down by ```gpu_encoding``` rather than by
+  simulation.  Its global loads complete in one cycle, so
   ```s_waitcnt_g``` is architecturally required but does nothing; there is
   deliberately no forwarding from a load into the next instruction, so a
   program that omits the wait does not accidentally work.

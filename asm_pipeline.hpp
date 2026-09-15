@@ -972,8 +972,8 @@ inline int asm_main(int argc, const char* argv[]) {
             opt.sep_with_line = true;
         }
         else if (a == "--help") {
-            std::fputs("Usage: asm [options]\n"
-                       "Options:\n"
+            std::printf("Usage: %s [options]\n", ISA::tool);
+            std::fputs("Options:\n"
                        "  --hex             Output in hexadecimal format\n"
                        "  --debug           Enable debug output\n"
                        "  --sep_with_line   Separate output with new lines instead of commas\n"
