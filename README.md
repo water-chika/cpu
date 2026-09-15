@@ -17,6 +17,11 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
+If ```hipcc``` is on the system, a GPU backend for the assembler is built as
+well; if it is not, configuring prints ```HIP not found, building without the
+GPU assembler backend``` and everything else builds and tests exactly the
+same.  ROCm is never required.
+
 Each test assembles a program from source, runs it on the verilog CPU under
 ```iverilog```, and compares the final register values against a checked in
 ```tests/*.expect``` file (```xx``` means "do not care").  A test fails if the
@@ -27,6 +32,7 @@ straight away.
 
 | Test | Program | Checks |
 |------|---------|--------|
+| backends_cpu8_hex, backends_cpu8_bin, backends_cpu16_hex, backends_cpu16_bin | generated | the serial, multi core and GPU backends assemble the same program into identical bytes |
 | verilog_lint | every ```*.v``` | each verilog source compiles on its own under ```iverilog -Wall``` without a single message |
 | cpu8_sum | tests/cpu8_sum.s | 8 bit CPU sums 1..8 out of data memory into r2 |
 | cpu8_sum_list | cpu8_asm/sum.s | 8 bit CPU sums the whole of data.list (1..16) into r2 |
@@ -242,6 +248,95 @@ b
 bg
 bl
 ```
+
+### How the assembler runs
+
+Assembling a file is a pipeline of five passes.  Four of them treat lines as
+independent work, and only the small middle part has to look at the program in
+order:
+
+| Pass | Work | Order |
+|------|------|-------|
+| split | find where every line starts and ends | independent per byte block |
+| classify | lex one line, parse it, decide its opcode and arguments | **independent per line** |
+| scan | give every statement an address and collect the labels | chunked prefix sum, then an ordered insert per label |
+| resolve | check each statement and look its label up | independent per line, with the scratch register carried between chunks by a prefix scan |
+| encode | turn a statement into its words and write them out | **independent per line** |
+
+Nothing in the pipeline appends to a shared buffer.  A statement's output
+offset follows from its address alone, so every line writes into a slice of
+the output that no other line touches - which is what makes the last pass
+runnable anywhere, including on a GPU.
+
+All of the per line work lives in ```asm_kernel.hpp```, which is written so
+that it compiles both as ordinary host C++ and as HIP device code.  The three
+backends run the *same* source for the per line stages, so agreeing on the
+output bytes is a property of the structure rather than something the backends
+are trusted to do; ```asm_bench --check``` asserts it anyway, and CTest runs
+that.
+
+Backend choice is made through the environment rather than the command line,
+so the tools' interface and output are exactly what they always were:
+
+```
+ASM_BACKEND=serial|threads|hip|auto    # default auto
+ASM_THREADS=N                          # default: hardware concurrency
+```
+
+```auto``` picks the threaded backend only once the input is at least two
+megabytes.  That is not caution, it is measured: see below.
+
+### Benchmark
+
+```
+cmake --build build --target bench     # cpu16, 2M lines
+cmake --build build --target bench8     # cpu8
+./build/asm_bench --isa 16 --lines 2000000 --repeat 5 [--format hex|bin] [--threads N] [--seed S]
+```
+
+It generates a synthetic program from a seeded xorshift, so a run is
+reproducible and two runs are comparable, then assembles it with each backend
+and reports lines/sec, MB/sec and the speedup over serial, plus where the time
+went.  It also compares the output bytes of all three backends and fails if
+they differ.
+
+The generated program is larger than the CPU's 256 word program memory, so the
+benchmark - and only the benchmark - raises that one limit.  Everything else
+about the assembly is what the real tools do.
+
+Measured on a 24 thread host with a Radeon RX 9070 XT (gfx1201, 32 CUs), cpu16,
+hex output, best of five:
+
+| lines | source | serial | threads (24) | HIP | 
+|-------|--------|--------|--------------|-----|
+| 1 000 | 18 KiB | 0.03 ms | 1.14 ms (0.03x) | 0.19 ms (0.17x) |
+| 10 000 | 176 KiB | 0.42 ms | 2.54 ms (0.16x) | 1.79 ms (0.23x) |
+| 100 000 | 1.7 MiB | 4.56 ms | 4.32 ms (1.06x) | 4.33 ms (1.05x) |
+| 1 000 000 | 17.6 MiB | 49.8 ms | 9.33 ms (5.34x) | 8.98 ms (5.55x) |
+| 2 000 000 | 35.2 MiB | 111.5 ms | 20.5 ms (5.44x) | 22.4 ms (4.99x) |
+
+Three things worth saying plainly about those numbers:
+
+* **Parallelism does not pay on small inputs.** At a thousand lines the
+  threaded backend is thirty times *slower* than the serial one, because each
+  parallel pass starts and joins its threads and the whole file is assembled
+  in less time than that takes.  Break even is around a hundred thousand
+  lines.  Real programs for this CPU are at most 256 instructions, so the
+  tools stay serial in practice, and ```auto``` is what makes that happen.
+* **The GPU is not the win.** With the host stages given the same cores in
+  both columns, the only difference between the ```threads``` and ```hip```
+  rows is where the per line work happens, and the two are within noise of
+  each other - the GPU classify is about 7.5 ms against the CPU's 6.0 ms at
+  two million lines.  Copying the source over PCIe and the results back costs
+  about as much as the work is worth, because the work per line is a few dozen
+  bytes of comparisons.  This is a real answer, not a tuning failure: the
+  problem is memory bound, and the GPU's advantage is arithmetic.
+* **The ceiling is the ordered part.** Inserting labels is the one thing that
+  must happen in program order.  Moving the re-lexing and hashing of the label
+  names into the parallel pass, and replacing ```std::unordered_map``` with a
+  table sized up front, took that pass from 11.5 ms to about 2 ms and the
+  overall speedup from 3.5x to 5.4x.  What is left of it, plus the serial
+  fix up of the chunked prefix sums, is what stops 24 cores reaching 24x.
 
 ## Instruction Set Architecture - 16 Bit Instruction & 8 Bit Registers
 
