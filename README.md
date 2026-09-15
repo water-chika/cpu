@@ -33,6 +33,7 @@ straight away.
 | cpu16_sum | tests/cpu16_sum.s | 16 bit CPU sums 1..8 out of data memory into r2 |
 | cpu16_count | cpu16_asm/test.s | 16 bit CPU counts to 4 and branches |
 | cpu16_label | tests/cpu16_label.s | 16 bit assembler resolves a label at address 75 and the CPU branches there |
+| cpu16_adc | tests/cpu16_adc.s | 16 bit CPU carries between bytes through adc and sbb |
 
 To watch a program execute, run the simulation by hand and add ```+trace```:
 
@@ -297,9 +298,9 @@ Signed integer instructions uses 2's complement representation.
 | not |   2    | 0000010| bitwise not |
 | xor |   3    | 0000011| bitwise xor |
 | add |   4    | 0000100| addition    |
-| adc |   5    | 0000101| addition    |
+| adc |   5    | 0000101| addition with carry in |
 | sub |   6    | 0000110| subtract    |
-| sbb |   7    | 0000111| subtract    |
+| sbb |   7    | 0000111| subtract with borrow in |
 | neg |   8    | 0001000| negate      |
 | mul |   9    | 0001001| multiply    |
 | div |   10   | 0001010| divide      |
@@ -312,6 +313,32 @@ Signed integer instructions uses 2's complement representation.
 | srr |   17   | 0010001| shift rotate right imm times|
 | sar |   18   | 0010010| shift arithmetic right imm times|
 | add_ip| 19   | 0010011| add (ip+1) with imm to reg |
+
+#### Carry flag
+
+There is one bit of processor state outside the register file: the **carry
+flag**.  It is a single bit, it is 0 at reset, and it behaves like this:
+
+| Instruction | What it does to the carry flag |
+|-------------|--------------------------------|
+| ```add``` ```adc``` | writes the carry out of bit 7 of the addition |
+| ```sub``` ```sbb``` | writes the borrow out of bit 7 of the subtraction |
+| every other instruction | leaves it alone |
+
+and like this:
+
+| Instruction | What it does with the carry flag |
+|-------------|----------------------------------|
+| ```adc``` | adds it in: ```dst = src0 + src1 + carry``` |
+| ```sbb``` | takes it out: ```dst = src0 - src1 - carry``` |
+| every other instruction | ignores it |
+
+Nothing else disturbs the flag, so a multi byte add is one ```add``` on the
+lowest byte followed by one ```adc``` per byte above it, and a multi byte
+subtract is one ```sub``` followed by one ```sbb``` per byte.  There is no
+instruction that reads or writes the flag directly; a program that wants to
+know whether an addition carried adds the carry into a zeroed register with
+```adc```.
 
 #### Branch
 
@@ -344,10 +371,9 @@ Instruction field arg encodes register containing memory address.
 
 #### Not implemented in cpu16.v yet
 
-```adc``` and ```sbb``` need a carry flag, which the ISA does not define a
-place for yet, and ```ld_p```/```st_p``` need a second port on the program
-memory.  The assembler will happily encode all four, but the CPU reports
-```unknown opcode``` when it decodes one, which fails the tests.
+```ld_p```/```st_p``` need a second port on the program memory.  The
+assembler will happily encode both, but the CPU reports ```unknown opcode```
+when it decodes one, which fails the tests.
 
 ## Instruction Set Architecture - 8 Bit Instruction/Register SIMD32
 

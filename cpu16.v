@@ -101,9 +101,20 @@ assign shift_imm = Inst[5:3];
 
 reg [2:0] data_dst;
 
+// The carry flag.  It is a single bit of processor state that lives outside
+// the register file, written only by add, adc, sub and sbb, and read only by
+// adc and sbb.  For add and adc it is the carry out of bit 7; for sub and sbb
+// it is the borrow out of bit 7.  Nothing else disturbs it, so a multi byte
+// add or subtract can be written as one add/sub followed by as many adc/sbb
+// as it needs.
+reg carry;
+reg [8:0] alu; // 9 bits: [7:0] is the result, [8] is the carry or borrow out
+
 initial begin
     data_dst = 0;
     data_read_enable = 1'b0;
+    carry = 1'b0;
+    alu = 9'b0;
 end
 
 always @(posedge clk) begin
@@ -138,8 +149,30 @@ always @(posedge clk) begin
         1: registers[dst] <= registers[src0] | registers[src1];
         2: registers[dst] <= ~registers[src0];
         3: registers[dst] <= registers[src0] ^ registers[src1];
-        4: registers[dst] <= registers[src0] + registers[src1];
-        6: registers[dst] <= registers[src0] - registers[src1];
+        4:
+        begin
+            alu = registers[src0] + registers[src1];
+            registers[dst] <= alu[7:0];
+            carry <= alu[8];
+        end
+        5:
+        begin
+            alu = registers[src0] + registers[src1] + carry;
+            registers[dst] <= alu[7:0];
+            carry <= alu[8];
+        end
+        6:
+        begin
+            alu = registers[src0] - registers[src1];
+            registers[dst] <= alu[7:0];
+            carry <= alu[8];
+        end
+        7:
+        begin
+            alu = registers[src0] - registers[src1] - carry;
+            registers[dst] <= alu[7:0];
+            carry <= alu[8];
+        end
         8: registers[dst] <= -registers[src0];
         9: registers[dst] <= registers[src0] * registers[src1];
         10: registers[dst] <= registers[src0] / registers[src1];
