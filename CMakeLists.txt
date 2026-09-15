@@ -62,6 +62,19 @@ target_link_libraries(asm_bench PRIVATE asm_core)
 add_executable(c16 c16.cpp)
 target_link_libraries(c16 PRIVATE c16_core)
 
+# An independent implementation of the cpu16 instruction set, used to check
+# the verilog and the compiler against each other rather than against a
+# hand written expectation.
+add_executable(cpu16_sim cpu16_sim.cpp)
+target_compile_features(cpu16_sim PRIVATE cxx_std_20)
+target_compile_options(cpu16_sim PRIVATE -Wall -Wextra)
+target_include_directories(cpu16_sim PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(c16_verify c16_verify.cpp)
+target_link_libraries(c16_verify PRIVATE c16_core)
+target_compile_features(c16_verify PRIVATE cxx_std_20)
+target_compile_options(c16_verify PRIVATE -Wall -Wextra)
+
 add_executable(c16_bench c16_bench.cpp)
 target_link_libraries(c16_bench PRIVATE c16_core)
 
@@ -127,6 +140,34 @@ endforeach()
 # program far larger than any that fits on the real cpu16.
 add_test(NAME backends_c16 COMMAND c16_bench --functions 4000 --body 24 --repeat 1 --check)
 set_tests_properties(backends_c16 PROPERTIES FAIL_REGULAR_EXPRESSION "TEST FAIL")
+
+# Differential testing.  These need no verilog: they compare the compiler
+# against a reference interpreter for the same language, and the encoder
+# against itself down both output paths, using an independent model of the
+# CPU to run the result.  A .expect file can only say that the whole stack
+# agrees with its author; these say that three implementations that share no
+# code agree with each other, which is a far stronger statement.
+add_test(NAME c16_differential
+         COMMAND c16_verify --fuzz 400 --seed 20260915 --functions 1 --statements 2)
+set_tests_properties(c16_differential PROPERTIES FAIL_REGULAR_EXPRESSION "TEST FAIL")
+
+# The same idea applied to programs with no calls at all, where almost every
+# generated program fits the hardware, so the coverage per second is highest.
+add_test(NAME c16_differential_flat
+         COMMAND c16_verify --fuzz 400 --seed 31415926 --functions 0 --statements 3)
+set_tests_properties(c16_differential_flat PROPERTIES FAIL_REGULAR_EXPRESSION "TEST FAIL")
+
+# And over the checked in programs, so that the hand written .expect files
+# are themselves confirmed by an implementation that never saw them.
+foreach(prog c16_arith c16_compare c16_control c16_functions c16_spill c16_collatz)
+    add_test(NAME oracle_${prog}
+             COMMAND c16_verify ${CMAKE_CURRENT_SOURCE_DIR}/tests/${prog}.c16)
+    set_tests_properties(oracle_${prog} PROPERTIES FAIL_REGULAR_EXPRESSION "TEST FAIL")
+endforeach()
+add_test(NAME oracle_c16_memory
+         COMMAND c16_verify --data ${CMAKE_CURRENT_SOURCE_DIR}/tests/sum.data
+                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/c16_memory.c16)
+set_tests_properties(oracle_c16_memory PROPERTIES FAIL_REGULAR_EXPRESSION "TEST FAIL")
 
 if(IVERILOG_EXECUTABLE AND VVP_EXECUTABLE)
     function(add_cpu_test name assembler testbench program data expect cycles)
@@ -196,6 +237,60 @@ if(IVERILOG_EXECUTABLE AND VVP_EXECUTABLE)
     add_c16_test(c16_spill     tests/c16_spill.c16     -              c16_spill.expect      2000)
     add_c16_test(c16_memory    tests/c16_memory.c16    tests/sum.data c16_memory.expect     4000)
     add_c16_test(c16_collatz   tests/c16_collatz.c16   -              c16_collatz.expect   40000)
+
+    # Cross check the independent ISA simulator against the RTL.  Instead of
+    # comparing the hardware with a number a human wrote down, this runs the
+    # same program through cpu16_sim and makes its prediction for all eight
+    # registers the expectation cpu16.v has to meet.  It covers every program
+    # in the repository, assembly and compiled alike, so an ISA
+    # misunderstanding on either side shows up as a disagreement rather than
+    # as a test nobody wrote.
+    function(add_cross_check name program data cycles)
+        if(data STREQUAL "-")
+            set(data_arg "-")
+        else()
+            set(data_arg ${CMAKE_CURRENT_SOURCE_DIR}/${data})
+        endif()
+        add_test(
+            NAME xcheck_${name}
+            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_cross_check.sh
+                    $<TARGET_FILE:asm16>
+                    $<TARGET_FILE:c16>
+                    $<TARGET_FILE:cpu16_sim>
+                    ${CMAKE_CURRENT_SOURCE_DIR}
+                    test16.v
+                    ${CMAKE_CURRENT_SOURCE_DIR}/${program}
+                    ${data_arg}
+                    ${cycles}
+        )
+        set_tests_properties(xcheck_${name} PROPERTIES FAIL_REGULAR_EXPRESSION "TEST FAIL")
+    endfunction()
+
+    add_cross_check(cpu16_sum   tests/cpu16_sum.s       tests/sum.data   300)
+    add_cross_check(cpu16_label tests/cpu16_label.s     -                200)
+    add_cross_check(cpu16_adc   tests/cpu16_adc.s       -                100)
+    add_cross_check(cpu16_ldp   tests/cpu16_ldp.s       -                100)
+    add_cross_check(cpu16_count cpu16_asm/test.s        -                300)
+    add_cross_check(c16_arith   tests/c16_arith.c16     -                400)
+    add_cross_check(c16_control tests/c16_control.c16   -               6000)
+    add_cross_check(c16_memory  tests/c16_memory.c16    tests/sum.data  4000)
+    add_cross_check(c16_collatz tests/c16_collatz.c16   -              40000)
+
+    # The strongest check in the repository: random programs, compiled, run
+    # on the actual verilog, and compared against what a reference
+    # interpreter says the source language means.  No human wrote the
+    # expectation and no human chose the program.
+    add_test(
+        NAME c16_fuzz_rtl
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fuzz_rtl.sh
+                $<TARGET_FILE:c16_verify>
+                $<TARGET_FILE:c16>
+                ${CMAKE_CURRENT_SOURCE_DIR}
+                test16.v
+                24
+                20260915
+    )
+    set_tests_properties(c16_fuzz_rtl PROPERTIES FAIL_REGULAR_EXPRESSION "TEST FAIL")
 else()
     message(WARNING "iverilog/vvp not found, the simulation tests are disabled")
 endif()
