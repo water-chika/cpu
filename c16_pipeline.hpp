@@ -643,6 +643,116 @@ inline c16_result c16_compile(const std::vector<char>& source, const c16_options
     return result;
 }
 
+// ------------------------------------------------- many files at a time
+
+// One 15 MiB source file is not what a compiler usually faces, and it is not
+// what cpu16 can run: a real program for this machine is a few dozen lines,
+// because 256 instruction words do not hold more.  A realistic large job is
+// therefore not one enormous translation unit but thousands of small ones.
+//
+// That is a different and much better shaped kind of parallelism.  Two
+// programs share nothing at all - not a symbol table, not a label space, not
+// an address - so compiling them concurrently needs no communication and has
+// no serial section.  Inside one file, "split" is a sequential brace scan and
+// the prefix sums are sequential; across files there is nothing sequential
+// whatsoever.
+struct c16_unit {
+    std::string name;
+    std::vector<char> source;
+};
+
+struct c16_unit_result {
+    bool ok = false;
+    c16_error error;
+    asm_array<uint8_t> output;
+    c16_stats stats;
+};
+
+struct c16_project_stats {
+    size_t units = 0;
+    size_t failed = 0;
+    size_t input_bytes = 0;
+    size_t output_bytes = 0;
+    size_t lines = 0;
+    size_t words = 0;
+    unsigned threads = 1;
+};
+
+struct c16_project_result {
+    bool ok = false;
+    size_t first_failure = 0;    // only meaningful when ok is false
+    std::vector<c16_unit_result> units;
+    c16_project_stats stats;
+};
+
+// Compile every unit independently.
+//
+// The backend means something different here than it does for a single file,
+// and it is worth being precise about it:
+//
+//   serial   one file at a time, each compiled serially.
+//   threads  files in parallel, each compiled serially inside.  Nesting a
+//            thread pool inside a thread pool would only fight itself, and
+//            the outer level is the one with no serial section, so that is
+//            where the threads go.
+//   hip      one file at a time, each compiled on the GPU.  This is the
+//            honest shape of what the current GPU backend can do, and it is
+//            the wrong shape for the job: a few dozen lines is far too little
+//            work for a kernel launch.  It is measured rather than hidden.
+inline c16_project_result c16_compile_all(const std::vector<c16_unit>& units,
+                                          const c16_options& opt) {
+    c16_project_result result;
+    result.units.resize(units.size());
+    result.stats.units = units.size();
+
+    const bool across_files = opt.backend == c16_backend::threads;
+    unsigned threads = across_files ? opt.threads : 1u;
+    result.stats.threads = threads;
+
+    c16_options per_unit = opt;
+    per_unit.threads = 1;
+    if (across_files) {
+        per_unit.backend = c16_backend::serial;
+    }
+
+    if (across_files && units.size() > 1) {
+        c16_parallel_dynamic(units.size(), threads, [&](size_t i) {
+            c16_result r = c16_compile(units[i].source, per_unit);
+            result.units[i].ok = r.ok;
+            result.units[i].error = std::move(r.error);
+            result.units[i].output = std::move(r.output);
+            result.units[i].stats = r.stats;
+        });
+    }
+    else {
+        for (size_t i = 0; i < units.size(); i++) {
+            c16_result r = c16_compile(units[i].source, per_unit);
+            result.units[i].ok = r.ok;
+            result.units[i].error = std::move(r.error);
+            result.units[i].output = std::move(r.output);
+            result.units[i].stats = r.stats;
+        }
+    }
+
+    result.ok = true;
+    for (size_t i = 0; i < units.size(); i++) {
+        const c16_unit_result& u = result.units[i];
+        result.stats.input_bytes += units[i].source.size();
+        if (!u.ok) {
+            if (result.ok) {
+                result.first_failure = i;
+            }
+            result.ok = false;
+            result.stats.failed++;
+            continue;
+        }
+        result.stats.output_bytes += u.output.size();
+        result.stats.lines += u.stats.lines;
+        result.stats.words += u.stats.words;
+    }
+    return result;
+}
+
 // ------------------------------------------------------------- front door
 
 inline unsigned c16_default_threads() {

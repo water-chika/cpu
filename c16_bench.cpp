@@ -171,6 +171,51 @@ std::vector<char> generate(size_t functions, size_t body, uint64_t seed) {
     return std::vector<char>(text.begin(), text.end());
 }
 
+// A whole small program of the size cpu16 can actually run.  Nothing here
+// lifts any limit: every unit this produces fits inside the real 256
+// instruction words and the real 96 bytes of frame space, which is the
+// entire point of measuring this way.
+std::vector<char> generate_unit(rng& r, size_t index) {
+    const char* const binop[] = {"+", "-", "*", "&", "|", "^"};
+    const char* const relop[] = {"<", ">", "<=", ">=", "==", "!="};
+    std::string t;
+    t += "// unit ";
+    t += std::to_string(index);
+    t += ", one program for a machine with 256 instruction words\n";
+    t += "int base = ";
+    t += std::to_string(1 + r.below(60));
+    t += ";\n\nint step(int v) {\n    int s = v ";
+    t += binop[r.below(6)];
+    t += " base;\n    if (s ";
+    t += relop[r.below(6)];
+    t += " ";
+    t += std::to_string(1 + r.below(90));
+    t += ") { s = s - 1; } else { s = s + 2; }\n    return s;\n}\n\n";
+    t += "int main() {\n    int x = ";
+    t += std::to_string(r.below(40));
+    t += ";\n    int i = 0;\n    while (i < ";
+    t += std::to_string(3 + r.below(12));
+    t += ") {\n        x = step(x);\n";
+    if (r.below(2) == 0) {
+        t += "        if (x & 1) { x = x + 3; }\n";
+    }
+    t += "        i = i + 1;\n    }\n";
+    t += "    out(0, x);\n    out(1, x ";
+    t += binop[r.below(6)];
+    t += " base);\n    return 0;\n}\n";
+    return std::vector<char>(t.begin(), t.end());
+}
+
+std::vector<c16_unit> generate_units(size_t count, uint64_t seed) {
+    rng r(seed);
+    std::vector<c16_unit> units(count);
+    for (size_t i = 0; i < count; i++) {
+        units[i].name = "unit" + std::to_string(i) + ".c16";
+        units[i].source = generate_unit(r, i);
+    }
+    return units;
+}
+
 struct measurement {
     bool ran = false;
     std::string note;
@@ -250,6 +295,182 @@ bool assembles_to(const measurement& text, const measurement& binary, std::strin
         return false;
     }
     return true;
+}
+
+struct project_measurement {
+    bool ran = false;
+    std::string note;
+    double seconds = 0;
+    c16_project_stats stats;
+    std::vector<std::vector<uint8_t>> outputs;
+};
+
+project_measurement run_project(const std::vector<c16_unit>& units, c16_backend backend,
+                                unsigned threads, bool text, int repeat) {
+    project_measurement m;
+    c16_options opt;
+    opt.backend = backend;
+    opt.threads = threads;
+    opt.text = text;
+    opt.hex = true;
+    opt.sep_with_line = true;
+    opt.relaxed_limits = false;   // these programs really do fit on the hardware
+    for (int i = 0; i < repeat; i++) {
+        double t0 = asm_now();
+        c16_project_result r = c16_compile_all(units, opt);
+        double t1 = asm_now();
+        if (!r.ok) {
+            const c16_error& e = r.units[r.first_failure].error;
+            m.note = units[r.first_failure].name + ": " + e.message;
+            return m;
+        }
+        if (!m.ran || t1 - t0 < m.seconds) {
+            m.seconds = t1 - t0;
+            m.stats = r.stats;
+        }
+        m.ran = true;
+        if (m.outputs.empty()) {
+            m.outputs.resize(units.size());
+            for (size_t u = 0; u < units.size(); u++) {
+                const asm_array<uint8_t>& o = r.units[u].output;
+                m.outputs[u].assign(o.data(), o.data() + o.size());
+            }
+        }
+    }
+    return m;
+}
+
+bool same_project(const project_measurement& a, const project_measurement& b) {
+    if (!a.ran || !b.ran) {
+        return true;
+    }
+    return a.outputs == b.outputs;
+}
+
+// Same cross path question as for one file: does the assembly the text path
+// wrote assemble, unit by unit, to exactly the words the binary path emitted?
+bool project_paths_agree(const project_measurement& text, const project_measurement& binary,
+                         const std::vector<c16_unit>& units, std::string* why) {
+    if (!text.ran || !binary.ran) {
+        return true;
+    }
+    asm_options opt;
+    opt.hex = true;
+    opt.sep_with_line = true;
+    for (size_t i = 0; i < units.size(); i++) {
+        std::vector<char> src(text.outputs[i].begin(), text.outputs[i].end());
+        asm_result r = asm_assemble<asm_cpu16>(src, opt);
+        if (!r.ok) {
+            *why = units[i].name + ": asm16 rejected the compiler's assembly: " +
+                   asm_error_text<asm_cpu16>(r.error);
+            return false;
+        }
+        if (r.output.size() != binary.outputs[i].size() ||
+            std::memcmp(r.output.data(), binary.outputs[i].data(), r.output.size()) != 0) {
+            *why = units[i].name + ": the two paths produced different machine words";
+            return false;
+        }
+    }
+    return true;
+}
+
+void print_project_row(const char* name, const project_measurement& m, double serial_seconds,
+                       size_t files, size_t input_bytes, size_t lines) {
+    if (!m.ran) {
+        std::printf("    %-10s unavailable: %s\n", name, m.note.c_str());
+        return;
+    }
+    std::printf("    %-10s %9.2f ms %10.0f file/s %10.3f Mline/s %8.1f MB/s %7.2fx\n",
+                name, m.seconds * 1e3, static_cast<double>(files) / m.seconds,
+                static_cast<double>(lines) / m.seconds / 1e6,
+                static_cast<double>(input_bytes) / (1024.0 * 1024.0) / m.seconds,
+                serial_seconds > 0 ? serial_seconds / m.seconds : 0.0);
+}
+
+// The measurement the single file benchmark cannot make.  Separate programs
+// share nothing, so this is the one place in the compiler with no serial
+// section at all, and it is also the only shape that matches what cpu16 can
+// really run.
+int project(size_t files, uint64_t seed, int repeat, unsigned threads, bool check_only) {
+    std::vector<c16_unit> units = generate_units(files, seed);
+    size_t input_bytes = 0;
+    for (const c16_unit& u : units) {
+        input_bytes += u.source.size();
+    }
+
+    project_measurement ts = run_project(units, c16_backend::serial, 1, true, repeat);
+    if (!ts.ran) {
+        std::fprintf(stderr, "TEST FAIL: the serial text path failed: %s\n", ts.note.c_str());
+        return 1;
+    }
+    project_measurement tt = run_project(units, c16_backend::threads, threads, true, repeat);
+    project_measurement bs = run_project(units, c16_backend::serial, 1, false, repeat);
+    if (!bs.ran) {
+        std::fprintf(stderr, "TEST FAIL: the serial binary path failed: %s\n", bs.note.c_str());
+        return 1;
+    }
+    project_measurement bt = run_project(units, c16_backend::threads, threads, false, repeat);
+    project_measurement th;
+    project_measurement bh;
+    if (c16_hip_available()) {
+        th = run_project(units, c16_backend::hip, threads, true, repeat);
+        bh = run_project(units, c16_backend::hip, threads, false, repeat);
+    }
+    else {
+        th.note = "no HIP device";
+        bh.note = "no HIP device";
+    }
+
+    std::string why;
+    bool identical = same_project(ts, tt) && same_project(ts, th) &&
+                     same_project(bs, bt) && same_project(bs, bh);
+    bool agree = project_paths_agree(ts, bs, units, &why);
+
+    if (check_only) {
+        std::printf("c16: %zu separate programs, %zu lines, %zu instruction words, "
+                    "all within the real cpu16 limits\n",
+                    ts.stats.units, ts.stats.lines, ts.stats.words);
+        if (!identical) {
+            std::printf("TEST FAIL: the backends disagree about the bytes of some unit\n");
+            return 1;
+        }
+        if (!agree) {
+            std::printf("TEST FAIL: %s\n", why.c_str());
+            return 1;
+        }
+        std::printf("TEST PASS: %zu programs, every backend agreed, and every text path "
+                    "output assembles to exactly its binary path words\n", files);
+        return 0;
+    }
+
+    std::printf("\nc16 across separate files: %zu programs, %zu source lines, %.2f MiB, "
+                "%zu instruction words\n",
+                ts.stats.units, ts.stats.lines,
+                static_cast<double>(input_bytes) / (1024.0 * 1024.0), ts.stats.words);
+    std::printf("every program fits the real cpu16: 256 instruction words, 96 bytes of "
+                "frames, no limits lifted\n");
+    std::printf("best of %d run(s); seed %" PRIu64 "; %u threads; gpu: %s\n\n", repeat, seed,
+                threads, c16_hip_available() ? c16_hip_device_name().c_str() : "none detected");
+
+    std::printf("  text path\n");
+    print_project_row("serial", ts, ts.seconds, files, input_bytes, ts.stats.lines);
+    print_project_row("threads", tt, ts.seconds, files, input_bytes, ts.stats.lines);
+    print_project_row("hip", th, ts.seconds, files, input_bytes, ts.stats.lines);
+    std::printf("  binary path\n");
+    print_project_row("serial", bs, bs.seconds, files, input_bytes, bs.stats.lines);
+    print_project_row("threads", bt, bs.seconds, files, input_bytes, bs.stats.lines);
+    print_project_row("hip", bh, bs.seconds, files, input_bytes, bs.stats.lines);
+
+    if (tt.ran) {
+        std::printf("\n  parallel efficiency across files: %.0f%% of %u threads (text), ",
+                    100.0 * (ts.seconds / tt.seconds) / threads, threads);
+        std::printf("%.0f%% (binary)\n",
+                    100.0 * (bs.seconds / bt.seconds) / threads);
+    }
+    std::printf("  identical bytes across the backends: %s\n", identical ? "yes" : "NO");
+    std::printf("  every text path output assembles to its binary path words: %s\n",
+                agree ? "yes" : ("NO - " + why).c_str());
+    return identical && agree ? 0 : 1;
 }
 
 // The text path is not finished when the compiler stops: something still has
@@ -334,6 +555,33 @@ int sweep(size_t body, uint64_t seed, int repeat, unsigned threads) {
                       static_cast<double>(source.size()) / (1024.0 * 1024.0));
         std::printf("  %10zu %10s %9.3f ms %9.3f ms %8.2fx %9.3f ms %9.3f ms %8.2fx\n",
                     f, size, ts.seconds * 1e3, tt.seconds * 1e3, ts.seconds / tt.seconds,
+                    bs.seconds * 1e3, bt.seconds * 1e3, bs.seconds / bt.seconds);
+    }
+    return 0;
+}
+
+// Where compiling files concurrently starts to pay.
+int file_sweep(uint64_t seed, int repeat, unsigned threads) {
+    std::printf("\nbreak even across files, %u threads, best of %d\n", threads, repeat);
+    std::printf("  %8s %10s %13s %13s %9s\n", "files", "source", "serial", "threads",
+                "speedup");
+    for (size_t f = 1; f <= 65536; f *= 4) {
+        std::vector<c16_unit> units = generate_units(f, seed);
+        size_t bytes = 0;
+        for (const c16_unit& u : units) {
+            bytes += u.source.size();
+        }
+        project_measurement bs = run_project(units, c16_backend::serial, 1, false, repeat);
+        project_measurement bt = run_project(units, c16_backend::threads, threads, false,
+                                             repeat);
+        if (!bs.ran || !bt.ran) {
+            std::fprintf(stderr, "TEST FAIL: file sweep failed at %zu files\n", f);
+            return 1;
+        }
+        char size[32];
+        std::snprintf(size, sizeof(size), "%.3f MiB",
+                      static_cast<double>(bytes) / (1024.0 * 1024.0));
+        std::printf("  %8zu %10s %10.3f ms %10.3f ms %8.2fx\n", f, size,
                     bs.seconds * 1e3, bt.seconds * 1e3, bs.seconds / bt.seconds);
     }
     return 0;
@@ -479,6 +727,7 @@ int main(int argc, char* argv[]) {
     int repeat = 3;
     bool check_only = false;
     bool sweep_only = false;
+    size_t files = 0;
     unsigned threads = c16_default_threads();
 
     for (int i = 1; i < argc; i++) {
@@ -505,9 +754,18 @@ int main(int argc, char* argv[]) {
         else if (a == "--sweep") {
             sweep_only = true;
         }
+        else if (a == "--files") {
+            files = static_cast<size_t>(std::atoll(value()));
+        }
+        else if (a == "--file-sweep") {
+            files = SIZE_MAX;
+        }
         else if (a == "--help") {
             std::printf("Usage: c16_bench [--functions N] [--body M] [--seed S]\n"
-                        "                 [--repeat R] [--threads N] [--check] [--sweep]\n");
+                        "                 [--repeat R] [--threads N] [--check] [--sweep]\n"
+                        "                 [--files N] [--file-sweep]\n"
+                        "\n--files N compiles N separate small programs, each one small\n"
+                        "enough to run on the real cpu16, instead of one huge file.\n");
             return 0;
         }
         else {
@@ -523,6 +781,12 @@ int main(int argc, char* argv[]) {
     }
     if (threads < 1) {
         threads = 1;
+    }
+    if (files == SIZE_MAX) {
+        return file_sweep(seed, repeat, threads);
+    }
+    if (files > 0) {
+        return project(files, seed, repeat, threads, check_only);
     }
     if (sweep_only) {
         return sweep(body, seed, repeat, threads);
