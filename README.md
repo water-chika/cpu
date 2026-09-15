@@ -576,14 +576,28 @@ before a tapeout.  ```s_waitcnt``` is split into ```s_waitcnt_g``` and
 
 ### What is built
 
-```gpu16.v``` implements ```gpu16_scalar```, the widened ```cpu16.v``` that
-section 4.13 calls for: 16 x 32 bit scalar registers, 4 bit register select
-fields, a 16 bit word addressed PC, a 24 bit data address, sign extended 16
-bit immediates and a 32 bit instruction word with an 8 bit opcode.  It decodes
-the whole of section 4.3's scalar ALU, section 4.4's control flow apart from
-the two exec-mask branches, ```s_ld_g```, and ```s_waitcnt_g```,
-```s_endpgm``` and ```s_nop```.  Every vector, LDS and matrix opcode reports
-```unknown opcode``` rather than guessing.
+```gpu16.v``` implements ```gpu16```: the widened ```cpu16.v``` that section
+4.13 calls for - 16 x 32 bit scalar registers, 4 bit register select fields, a
+16 bit word addressed PC, a 24 bit data address, sign extended 16 bit
+immediates and a 32 bit instruction word with an 8 bit opcode - with section
+1.1's sixteen lanes hanging off the same fetch and the same decode.  It
+decodes the whole of section 4.3's scalar ALU, all of section 4.4's control
+flow including the two exec-mask branches, section 4.5's exec mask
+instructions, ```s_ld_g```, and ```s_waitcnt_g```, ```s_endpgm``` and
+```s_nop```.
+
+```gpu16_vector.v``` is the lane datapath: the 16 x 16 x 32 bit register file
+and the whole of section 4.6's vector ALU, one cycle per instruction.  There
+is no reconvergence stack and no per-lane PC anywhere in either file, because
+section 1.3 puts divergence in software: a wave narrows ```exec``` with
+```s_and_saveexec```, skips an empty side with ```s_cbr_execz```, and
+reconverges by restoring the mask it saved in an SGPR.  Section 1.2's rule
+that a disabled lane still *reads* its operands is what makes ```v_bpermute```
+and ```v_readlane``` well defined while the wave is divergent.
+
+The matrix unit (4.7), the per lane memory accesses (the rest of 4.8) and LDS
+(4.9) are still absent, and their opcodes still report ```unknown opcode```
+rather than guessing.
 
 ```asm_gpu16``` is the assembler, and it is the whole ISA rather than the
 part that runs: all 97 documented instructions assemble, scalar and vector
@@ -599,15 +613,31 @@ in for an address anywhere the ISA takes one, not only after ```la``` -
 ```s_imm s7, target``` for a plain word address.  ```la s10, target``` is one
 ```s_addpc```, because unlike cpu8 this machine can add to its own PC.
 
-```testgpu.v``` is its testbench, modelled on ```test16.v```, and the five
+```testgpu.v``` is its testbench, modelled on ```test16.v```, and the nine
 ```gpu_*``` CTests assemble a program with ```asm_gpu16```, run it on
 ```gpu16.v``` and check all sixteen scalar registers.  A gpu16 program must
 reach ```s_endpgm```: unlike cpu16, running off the end is a failure even if
-the registers look right.  Their ```.expect``` files were written when the
-programs were hand encoded hex and have not been touched since, so a pass now
-says the assembler and the RTL read section 4.1 the same way.
+the registers look right.  The five scalar programs' ```.expect``` files were
+written when the programs were hand encoded hex and have not been touched
+since, so a pass now says the assembler and the RTL read section 4.1 the same
+way.
 
-Simulation can only reach the third of the ISA that ```gpu16.v``` implements,
+The four vector programs pass a second expectation file, ```+vexpect```,
+holding all 256 VGPRs - sixteen lanes of ```v0```, then sixteen of ```v1```,
+and so on - so what is checked is every lane and not the wave as a whole.
+```gpu_vector``` makes every result a function of the lane index, because a
+value that is the same in all sixteen lanes proves nothing about a sixteen
+lane machine.  ```gpu_divergent``` is section 1.3's worked if/else, with the
+two halves of the wave computing different answers and reconverging on the
+saved mask.  ```gpu_exec``` is the one that would be missing if these had been
+written by someone used to a scalar machine: every mask in it has bit 0 set
+and every value written is the value lane 0 should hold, so lane 0 alone
+cannot tell this machine from one with no exec mask at all, and the whole
+difference is in lanes 1..15 keeping what they had.  Deleting the exec term
+from the vector write, or the exec AND from ```v_cmp```, or the lane select
+from ```v_writelane```, each fails at least one of them.
+
+Simulation can only reach the part of the ISA that ```gpu16.v``` implements,
 so ```gpu_encoding``` covers the rest: it assembles all 97 instructions and
 compares the words against ```tests/gpu_encoding.expect32```, which needs no
 hardware at all.  That expectation was not produced by running the assembler
@@ -662,11 +692,12 @@ compiles every ```*.v``` on its own with ```-Wall``` and fails on any message.
   ```unknown opcode``` for them.  Only ```cpu16.v``` has the second program
   memory port they need.
 * ```variables_to_registers``` is not implemented.
-* ```gpu16_scalar``` is scalar only.  There is no vector unit, no exec mask,
-  no LDS and no matrix unit, and therefore none of section 7.4's kernels yet.
-  ```asm_gpu16``` assembles the instructions they would need, but nothing can
-  execute them, so those are held down by ```gpu_encoding``` rather than by
-  simulation.  Its global loads complete in one cycle, so
+* ```gpu16``` has no matrix unit, no LDS and no per lane memory access, and
+  therefore none of section 7.4's kernels yet - a kernel that computes needs
+  a way to get its data in.  ```asm_gpu16``` assembles the instructions they
+  would need, but nothing can execute them, so those are held down by
+  ```gpu_encoding``` rather than by simulation.  Its global loads complete in
+  one cycle, so
   ```s_waitcnt_g``` is architecturally required but does nothing; there is
   deliberately no forwarding from a load into the next instruction, so a
   program that omits the wait does not accidentally work.

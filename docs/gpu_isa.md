@@ -847,7 +847,7 @@ passing cpu16 CTests to hold it in place.  Fixing `cpu16.v` is derisked work
 that improves the existing machine whether or not the GPU is ever built.
 
 **Done.**  All three defects are gone from `cpu8.v`, `cpu16.v`, `memory.v` and
-`digital_tube.v`, and `gpu16_scalar` in `gpu16.v` is written in the same
+`digital_tube.v`, and `gpu16` in `gpu16.v` is written in the same
 style.  The clean-up needed two things written down that statement order used
 to imply: a forwarding mux, so the instruction after a load still sees the
 loaded value on the edge the load writes it, and `stall_active`, which is
