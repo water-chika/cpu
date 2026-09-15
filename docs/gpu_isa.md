@@ -10,9 +10,26 @@ The machine is called **gpu16**: 16 lanes, 16 scalar registers, 16 vector
 registers.
 
 The whole design is driven by one workload: **tiled integer GEMM**,
-`C[M][N] += A[M][K] * B[K][N]` with `int8` inputs and `int32` accumulation.
-Every choice below is justified by the kernel in section 5, and section 7
-measures the result against a scalar cpu16 baseline.
+`C[M][N] += A[M][K] * Bt[N][K]` with `int8` inputs, `int32` accumulation and
+`B` supplied pre-transposed.  Every choice below is justified by the kernel in
+section 5, and section 7 measures the result against a scalar cpu16 baseline.
+
+**Revision 2.**  The first draft ended with six open questions (section 6.3).
+Four have since been decided and folded in, and this revision is the result:
+
+* `B` pre-transposed is a **precondition**, not an option (5.6).
+* Wave width is **16 for the first implementation**, with the cost of a later
+  widening spelled out (1.1).
+* **`v_ld16_g` and `v_st16_g` were added** at 0x86/0x87 (4.8), the GEMM fill
+  and the memory-bound benchmark were rewritten around them, and a dedicated
+  correctness test plus an A/B performance control were added (7.4).
+* **32 accumulators per lane** is confirmed (2.3).
+* The accumulator file's **16-lane 32-bit read-modify-write per cycle** is
+  promoted from the document's least-confident assumption to **architectural
+  requirement A1** (2.3), with the consequences of failing it recorded
+  explicitly (6.2).
+
+Two questions remain open and are flagged for the reviewer in section 6.3.
 
 ## Contents
 
@@ -47,6 +64,14 @@ per-lane addresses, but there is exactly one PC.
 * the matrix unit walks one accumulator row per cycle, so the cross-lane read
   of the A operand (section 4.7) degenerates to a 16:1 multiplexer rather
   than a 16x16 crossbar.
+
+`W = 16` is settled **for the first implementation** (section 6.3, decision
+2), not settled forever.  A later 32-lane revision is a coherent extension of
+everything here, with one specific casualty: at `W = 32` the exec mask no
+longer fits in half a scalar register, and the next section's most convenient
+property - that masks *are* ordinary SGPRs and every scalar bitwise
+instruction is also a mask instruction - stops being free.  Anyone widening
+this machine should treat that, not the datapath, as the expensive part.
 
 A **workgroup** is 4 waves (64 lanes) that share one scratchpad and can
 synchronise with `s_barrier`.  Up to 4 waves are resident on the compute unit
@@ -190,6 +215,20 @@ reasons, one architectural and one physical:
   at one row per cycle, which is a much cheaper structure than the 2R1W VGPR
   file.
 
+**Architectural requirement A1 (decided, not assumed).**  The accumulator file
+**shall** sustain one **16-lane x 32-bit read-modify-write per cycle**: 64 B
+read and 64 B written every cycle, for one accumulator row across all 16
+lanes, concurrently with the VGPR file supplying the A and B fragments.  This
+is what makes `mma_i8` a 16-cycle instruction rather than a 32-cycle one, and
+every throughput number in section 7 rests on it.  It is stated here as a
+requirement the implementation must meet, not as a hope: an accumulator file
+that cannot do this is a failed implementation of this ISA, not a slower one.
+The practical consequence is that the accumulator file is **flip-flops or a
+true 1R1W macro** - a single-ported SRAM will not do - and that the write-back
+must be pipelined behind the multiply.  Section 7.5 prices this at 0.95 mm^2
+on sky130, the single largest area item in the design, and that is the price
+of the requirement.
+
 Access is only through:
 
 * `mma_i8` / `mma_i8_z` - the matrix multiply-accumulate,
@@ -233,17 +272,39 @@ aligned 64-byte blocks and issues **one transaction per distinct block**.
   **16 transactions**, 1/16 rate.
 
 This single rule is what forces the GEMM kernel's global-to-LDS staging to map
-*two whole rows* onto each wave access rather than one row per lane
-(section 5.3).  It is the ISA's only concession to the memory system, and it
-is a rule the programmer can reason about with a ruler.
+*whole panel rows* onto each wave access rather than one matrix column per
+lane (section 5.3).  It is the ISA's only concession to the memory system, and
+it is a rule the programmer can reason about with a ruler.
+
+**An honest consequence, stated here because it is easy to get wrong.**  A
+`KT = 32` panel row is 32 bytes, i.e. *half* a transaction, and consecutive
+panel rows are `K` bytes apart in memory, not adjacent.  So every access in
+the GEMM fill touches one 64-byte block per panel row and uses only 32 bytes
+of it: the fill runs at **50% transaction efficiency**, independent of the
+access width.  This costs nothing at tier 1 or 2 (section 5.5 shows the fill
+needs 7.3 B/cycle of transaction bandwidth out of 64) and it is not an
+off-chip effect - a narrow external memory has fine granularity and moves only
+the bytes asked for (section 7.5).  `KT = 64` would make a panel row exactly
+one transaction and take the fill to 100%, but needs 13 KiB of LDS
+(section 5.4).  The efficiency is a property of `KT`, not of the ISA.
 
 Access widths:
 
 * `v_ld_g` / `v_ld_gs` / `v_st_g` - one byte per lane (zero / sign extended).
 * `v_ld4_g` / `v_st4_g` - four bytes per lane, address truncated to a multiple
-  of 4.  This is the workhorse: 16 lanes x 4 B = exactly one 64-byte
-  transaction when contiguous.
+  of 4.  16 lanes x 4 B = 64 B per access, exactly one transaction when
+  contiguous.
+* `v_ld16_g` / `v_st16_g` - **sixteen** bytes per lane into or out of a
+  4-aligned VGPR quad, address truncated to a multiple of 16.  16 lanes x
+  16 B = **256 B per access**, four transactions when contiguous.  This is the
+  workhorse for any kernel that is not feeding the matrix unit, and for the
+  GEMM fill; see section 4.8 for why it needs no extra register-file port.
 * `s_ld_g` - one 32-bit scalar word, for kernel arguments.
+
+There are deliberately **no** 16-byte LDS accesses.  256 bytes out of a 16-way
+banked LDS takes four bank cycles however it is issued, so a `v_ld16_l` would
+save issue slots but buy no bandwidth, and it would collide with the
+conflict-free 36-byte-stride addressing that section 3.2 depends on.
 
 There is no cache.  Reuse is the scratchpad's job, explicitly, in software.
 
@@ -353,6 +414,8 @@ meanings.  `mma_i8`'s Arg0 names an accumulator *block* (`A0` = 0, `A1` = 1);
 | `acc_wr` | - | v src | - | - | acc idx |
 | `v_ld_g v_ld_gs v_ld4_g` | v dst | v addr | s base | - | byte offset |
 | `v_st_g v_st4_g` | v src | v addr | s base | - | byte offset |
+| `v_ld16_g` | v dst quad (must be 0, 4, 8 or 12) | v addr | s base | - | byte offset |
+| `v_st16_g` | v src quad (must be 0, 4, 8 or 12) | v addr | s base | - | byte offset |
 | `s_ld_g` | s dst | - | s base | - | byte offset |
 | `v_ld_l v_ld4_l` | v dst | v addr | s base | - | byte offset |
 | `v_st_l v_st4_l` | v src | v addr | s base | - | byte offset |
@@ -556,6 +619,34 @@ Data type is `int8 x int8 -> int32` only.  `int8` is what the underlying
 | `v_st_g`  | 0x83 | 10000011 | store low byte of `v[Arg0]` |
 | `v_st4_g` | 0x84 | 10000100 | store 4 bytes per lane |
 | `s_ld_g`  | 0x85 | 10000101 | load one 32-bit scalar word |
+| `v_ld16_g`| 0x86 | 10000110 | load 16 bytes per lane into a VGPR quad |
+| `v_st16_g`| 0x87 | 10000111 | store 16 bytes per lane from a VGPR quad |
+
+**`v_ld16_g vdst, vaddr, sbase, mod`** loads 16 bytes per lane, little-endian,
+into the four consecutive VGPRs `v[Arg0 + j]`, `j = 0..3`, where `v[Arg0+j]`
+receives the bytes at lane-address `+4j`.  `Arg0` **must be a multiple of 4**;
+any other value is an encoding error the assembler rejects, in the same spirit
+as `asm16.cpp` hard-erroring on an oversized argument.  The effective address
+is the usual `v[Arg1] + s[Arg2] + zext(Mod)`, truncated down to a multiple of
+16.  `v_st16_g` is the mirror image and writes only from enabled lanes.
+Disabled lanes neither read nor write, and their destination quad is left
+unmodified.
+
+**Why this costs no new register-file port.**  256 bytes at the 64 B/cycle
+global port take four cycles to arrive whatever instruction asked for them, so
+the return path writes one VGPR per cycle into the existing single write port
+over four consecutive cycles.  A wide access is therefore a *scheduling* win -
+one issue slot instead of four - not a bandwidth win.  That is exactly the
+problem it was added to solve: section 7.3's memory-bound kernel was issue-
+bound, not port-bound.
+
+**The quad rule has a real cost, worth knowing before writing kernels.**  With
+16 VGPRs there are exactly four aligned quads.  A kernel that keeps one live
+VGPR for a per-lane address (almost all of them do) has only **three** quads
+left, which is enough to hold one 64-element chunk of two operands but not
+enough to double-buffer two chunks.  This is the binding constraint on the
+`axpy` kernel in section 7.3 and is the strongest argument in the document for
+a 32-entry VGPR file in a second revision.
 
 ### 4.9 LDS
 
@@ -582,7 +673,9 @@ Data type is `int8 x int8 -> int32` only.  `int8` is what the underlying
 | `mma_i8 A1, v1, v3` | 0x70 | 1 | 1 | 3 | 0 | 0x00 | `70113000` |
 | `mma_i8 A0, v1, v3` | 0x70 | 0 | 1 | 3 | 0 | 0x00 | `70013000` |
 | `s_imm s9, 32` | 0x10 | 9 | 0 | imm16 = 0x0020 | | | `10900020` |
-| `v_ld4_l v1, v11, s9, 12` | 0xa1 | 1 | 11 | 9 | 0 | 0x0c | `a1b9000c` |
+| `v_ld4_l v1, v7, s9, 12` | 0xa1 | 1 | 7 | 9 | 0 | 0x0c | `a179000c` |
+| `v_ld16_g v12, v9, s1, 0` | 0x86 | 12 | 9 | 1 | 0 | 0x00 | `86c91000` |
+| `v_st16_g v4, v8, s2, 0` | 0x87 | 4 | 8 | 2 | 0 | 0x00 | `87482000` |
 | `v_add_s v13, v13, s6` | 0x4f | 13 | 13 | 6 | 0 | 0x00 | `4fdd6000` |
 | `acc_rd v15, 17` | 0x72 | 15 | 0 | 0 | 0 | 0x11 | `72f00011` |
 | `s_cbr_execz +6` | 0x29 | 0 | 0 | imm16 = 0x0006 | | | `29000006` |
@@ -654,7 +747,7 @@ Scalar, after setup:
 | `s5` | `&C` |
 | `s6` | `K` (row stride of A and Bt, in bytes) |
 | `s7` | `N` |
-| `s8` | `2*K`, the row-pair stride used by the fill |
+| `s8` | `8*K`, the 8-row group stride used by the fill |
 | `s9` | `As` read base: `buffer \| m_w*36` |
 | `s10` | `Bs` read base: `buffer \| 2304 + n_w*36` |
 | `s11` | LDS fill base for the *other* buffer |
@@ -668,15 +761,17 @@ Vector:
 | `v0` | lane id |
 | `v1` `v2` `v3` | A fragment block 0, A fragment block 1, B fragment (even k step) |
 | `v4` `v5` `v6` | the same for the odd k step, so LDS latency overlaps `mma` |
-| `v7`-`v10` | global load staging, 4 outstanding fills |
-| `v11` | `lane*36` - the mma read offset for rows `m_w + lane` and for `Bs` |
-| `v12` | `lane*36 + 576` - the mma read offset for rows `m_w + 16 + lane` |
-| `v13` | global fill lane offset, `(lane>>3)*K + (lane&7)*4` |
-| `v14` | LDS fill lane offset for `As` |
-| `v15` | LDS fill lane offset for `Bs`, and C address in the epilogue |
+| `v7` | `lane*36` - the mma read offset for rows `m_w + lane` and for `Bs` |
+| `v8` | `lane*36 + 576` - the mma read offset for rows `m_w + 16 + lane` |
+| `v9` | global fill lane offset, `(lane>>1)*K + (lane&1)*16` |
+| `v10` | LDS fill lane offset for `As`, and the C address in the epilogue |
+| `v11` | LDS fill lane offset for `Bs` |
+| `v12`-`v15` | the `v_ld16_g` staging quad (4-aligned, as section 4.8 requires) |
 
 All 16 scalar and all 16 vector registers are live in the main loop.  That is
-the intended calibration of both file sizes.
+the intended calibration of both file sizes, and the staging quad is placed at
+`v12` precisely because it is the only alignment that leaves the other twelve
+registers usable.
 
 ### 5.3 The kernel
 
@@ -700,7 +795,7 @@ gemm_i8:
 
         s_shli   s14, s2,  6           # M0 = 64 * group_id_y
         s_shli   s15, s1,  5           # N0 = 32 * group_id_x
-        s_add    s8,  s6,  s6          # s8 = 2*K
+        s_muli   s8,  s6,  8           # s8 = 8*K, the 8-row group stride
 
         s_shli   s13, s12, 4           # 16 * wave_id
         s_add    s13, s14, s13         # M0 + 16w
@@ -713,33 +808,28 @@ gemm_i8:
         s_add    s4,  s4,  s13         # s4 = &Bt[N0 + 8w][0]
 
         # ---------------- per-lane fill offsets ----------------
-        # lane l covers row (l>>3) of a row pair, bytes (l&7)*4 .. +3
-        s_imm    s13, 7
-        v_shri   v14, v0,  3           # r = l>>3
-        v_and    v15, v0,  s13         # (this v_and takes a VGPR; see note)
-        v_shli   v15, v15, 2           # c = (l&7)*4
-        v_mul_s  v13, v14, s6          # r*K
-        v_add    v13, v13, v15         # v13 = r*K + c          (global)
+        # v_ld16_g moves 16 B per lane, so one access covers EIGHT panel rows:
+        # lane l covers row (l>>1) of the group, bytes (l&1)*16 .. +15
+        s_imm    s13, 1
+        v_and    v10, v0,  s13         # (this v_and takes a VGPR; see note)
+        v_shli   v10, v10, 4           # c = (l&1)*16
+        v_shri   v9,  v0,  1           # r = l>>1
+        v_mul_s  v11, v9,  s6          # r*K
+        v_add    v9,  v11, v10         # v9  = r*K + c          (global)
         s_imm    s13, 36
-        v_mul_s  v14, v14, s13         # r*36
-        v_add    v14, v14, v15         # v14 = r*36 + c         (LDS, As)
+        v_shri   v11, v0,  1
+        v_mul_s  v11, v11, s13         # r*36
+        v_add    v11, v11, v10         # r*36 + c
         s_muli   s14, s12, 576         # wave's As row base = 16w * 36
-        v_add_s  v14, v14, s14
+        v_add_s  v10, v11, s14         # v10 = r*36 + c + 576w   (LDS, As)
         s_muli   s14, s12, 288         # wave's Bs row base = 8w * 36
         s_addi   s14, s14, 2304
-        v_sub    v15, v14, v14         # (clear)
-        v_shri   v15, v0,  3
-        v_mul_s  v15, v15, s13         # r*36
-        v_add_s  v15, v15, s14         # v15 = r*36 + 2304 + 288w
-        s_imm    s13, 7
-        v_and    v11, v0,  s13
-        v_shli   v11, v11, 2
-        v_add    v15, v15, v11         # + c
+        v_add_s  v11, v11, s14         # v11 = r*36 + c + 2304 + 288w (LDS, Bs)
 
         # ---------------- per-lane mma read offsets ----------------
         s_imm    s13, 36
-        v_mul_s  v11, v0,  s13         # v11 = lane*36
-        v_addi   v12, v11, 576         # v12 = lane*36 + 576
+        v_mul_s  v7,  v0,  s13         # v7 = lane*36
+        v_addi   v8,  v7,  576         # v8 = lane*36 + 576
 
         # ---------------- compute-side tile bases ----------------
         s_shri   s13, s12, 1
@@ -770,54 +860,54 @@ kloop:
         # ---------------- compute on the current buffer ----------------
         # 8 k steps of 4, fully unrolled; Mod carries k*4 so there is no
         # address arithmetic at all in this block.
-        v_ld4_l  v1, v11, s9,  0
-        v_ld4_l  v2, v12, s9,  0
-        v_ld4_l  v3, v11, s10, 0
-        v_ld4_l  v4, v11, s9,  4
-        v_ld4_l  v5, v12, s9,  4
-        v_ld4_l  v6, v11, s10, 4
+        v_ld4_l  v1, v7, s9,  0
+        v_ld4_l  v2, v8, s9,  0
+        v_ld4_l  v3, v7, s10, 0
+        v_ld4_l  v4, v7, s9,  4
+        v_ld4_l  v5, v8, s9,  4
+        v_ld4_l  v6, v7, s10, 4
         s_waitcnt 48                   # wait for the first triple only
         mma_i8   A0, v1, v3
         mma_i8   A1, v2, v3
 
-        v_ld4_l  v1, v11, s9,  8
-        v_ld4_l  v2, v12, s9,  8
-        v_ld4_l  v3, v11, s10, 8
+        v_ld4_l  v1, v7, s9,  8
+        v_ld4_l  v2, v8, s9,  8
+        v_ld4_l  v3, v7, s10, 8
         s_waitcnt 48
         mma_i8   A0, v4, v6
         mma_i8   A1, v5, v6
 
-        v_ld4_l  v4, v11, s9,  12
-        v_ld4_l  v5, v12, s9,  12
-        v_ld4_l  v6, v11, s10, 12
+        v_ld4_l  v4, v7, s9,  12
+        v_ld4_l  v5, v8, s9,  12
+        v_ld4_l  v6, v7, s10, 12
         s_waitcnt 48
         mma_i8   A0, v1, v3
         mma_i8   A1, v2, v3
 
-        v_ld4_l  v1, v11, s9,  16
-        v_ld4_l  v2, v12, s9,  16
-        v_ld4_l  v3, v11, s10, 16
+        v_ld4_l  v1, v7, s9,  16
+        v_ld4_l  v2, v8, s9,  16
+        v_ld4_l  v3, v7, s10, 16
         s_waitcnt 48
         mma_i8   A0, v4, v6
         mma_i8   A1, v5, v6
 
-        v_ld4_l  v4, v11, s9,  20
-        v_ld4_l  v5, v12, s9,  20
-        v_ld4_l  v6, v11, s10, 20
+        v_ld4_l  v4, v7, s9,  20
+        v_ld4_l  v5, v8, s9,  20
+        v_ld4_l  v6, v7, s10, 20
         s_waitcnt 48
         mma_i8   A0, v1, v3
         mma_i8   A1, v2, v3
 
-        v_ld4_l  v1, v11, s9,  24
-        v_ld4_l  v2, v12, s9,  24
-        v_ld4_l  v3, v11, s10, 24
+        v_ld4_l  v1, v7, s9,  24
+        v_ld4_l  v2, v8, s9,  24
+        v_ld4_l  v3, v7, s10, 24
         s_waitcnt 48
         mma_i8   A0, v4, v6
         mma_i8   A1, v5, v6
 
-        v_ld4_l  v4, v11, s9,  28
-        v_ld4_l  v5, v12, s9,  28
-        v_ld4_l  v6, v11, s10, 28
+        v_ld4_l  v4, v7, s9,  28
+        v_ld4_l  v5, v8, s9,  28
+        v_ld4_l  v6, v7, s10, 28
         s_waitcnt 48
         mma_i8   A0, v1, v3
         mma_i8   A1, v2, v3
@@ -853,71 +943,53 @@ kloop:
         s_add    s13, s15, s13         # N0 + n_w
         s_shli   s13, s13, 2
         s_add    s5,  s5,  s13         # &C[M0+m_w][N0+n_w]
-        v_shli   v15, v0,  2           # lane*4
+        v_shli   v10, v0,  2           # lane*4 (v10 is free after the last fill)
         s_imm    s0,  32               # 32 accumulator rows
         s_imm    s13, 0                # acc index, incremented by the encoder
 wb_loop:
         # unrolled 32 times in practice; Mod names the accumulator directly
         acc_rd   v1, 0
-        v_st4_g  v1, v15, s5, 0
+        v_st4_g  v1, v10, s5, 0
         s_add    s5, s5, s14
         ...                            # repeated for acc 1..31
         s_endpgm
 
 # ================================================================= fill_tile
 # Stage one 64x32 A panel and one 32x32 Bt panel into LDS buffer s11.
-# Each wave moves 16 A rows and 8 Bt rows; each instruction moves two whole
-# rows (16 lanes x 4 B = 64 B = 2 x 32 B), which is ONE global transaction
-# when the two rows are adjacent - see section 3.1.
+# Each wave moves 16 A rows and 8 Bt rows.  One v_ld16_g moves 16 lanes x 16 B
+# = 256 B = EIGHT whole 32-byte panel rows, so the A panel is two accesses and
+# the Bt panel is one.  Each access is 8 global transactions (one 64-byte
+# block per panel row, half of it used) - see section 3.1.
 fill_tile:
         s_mov    s1, s3
-        v_ld4_g  v7,  v13, s1, 0
-        s_add    s1, s1, s8
-        v_ld4_g  v8,  v13, s1, 0
-        s_add    s1, s1, s8
-        v_ld4_g  v9,  v13, s1, 0
-        s_add    s1, s1, s8
-        v_ld4_g  v10, v13, s1, 0
-        s_add    s1, s1, s8
+        v_ld16_g v12, v9, s1, 0        # A rows 0..7
+        s_add    s1, s1, s8            # += 8*K
         s_waitcnt 0
-        v_st4_l  v7,  v14, s11, 0
-        v_st4_l  v8,  v14, s11, 72
-        v_st4_l  v9,  v14, s11, 144
-        v_st4_l  v10, v14, s11, 216
-        v_ld4_g  v7,  v13, s1, 0
-        s_add    s1, s1, s8
-        v_ld4_g  v8,  v13, s1, 0
-        s_add    s1, s1, s8
-        v_ld4_g  v9,  v13, s1, 0
-        s_add    s1, s1, s8
-        v_ld4_g  v10, v13, s1, 0
-        s_addi   s11, s11, 288
+        v_st4_l  v12, v10, s11, 0
+        v_st4_l  v13, v10, s11, 4
+        v_st4_l  v14, v10, s11, 8
+        v_st4_l  v15, v10, s11, 12
+        v_ld16_g v12, v9, s1, 0        # A rows 8..15
+        s_addi   s11, s11, 288         # 8 rows * 36
         s_waitcnt 0
-        v_st4_l  v7,  v14, s11, 0
-        v_st4_l  v8,  v14, s11, 72
-        v_st4_l  v9,  v14, s11, 144
-        v_st4_l  v10, v14, s11, 216
+        v_st4_l  v12, v10, s11, 0
+        v_st4_l  v13, v10, s11, 4
+        v_st4_l  v14, v10, s11, 8
+        v_st4_l  v15, v10, s11, 12
         s_addi   s11, s11, -288
-        # ---- Bt: 8 rows = 4 row pairs ----
-        s_mov    s2, s4
-        v_ld4_g  v7,  v13, s2, 0
-        s_add    s2, s2, s8
-        v_ld4_g  v8,  v13, s2, 0
-        s_add    s2, s2, s8
-        v_ld4_g  v9,  v13, s2, 0
-        s_add    s2, s2, s8
-        v_ld4_g  v10, v13, s2, 0
+        # ---- Bt: 8 rows = exactly one access ----
+        v_ld16_g v12, v9, s4, 0
         s_waitcnt 0
-        v_st4_l  v7,  v15, s11, 0
-        v_st4_l  v8,  v15, s11, 72
-        v_st4_l  v9,  v15, s11, 144
-        v_st4_l  v10, v15, s11, 216
+        v_st4_l  v12, v11, s11, 0
+        v_st4_l  v13, v11, s11, 4
+        v_st4_l  v14, v11, s11, 8
+        v_st4_l  v15, v11, s11, 12
         s_b      s15                   # return
 ```
 
 Notes on the listing:
 
-* `v_and v15, v0, s13` is written with a scalar operand for readability; the
+* `v_and v10, v0, s13` is written with a scalar operand for readability; the
   encoding is `v_and` with both sources vector, so a real assembler needs
   `v_mov_s` into a scratch VGPR first.  This costs one extra instruction in
   setup only, outside the loop, and is left visible rather than silently
@@ -928,6 +1000,17 @@ Notes on the listing:
   sequence has no indexing logic.
 * `s_waitcnt 48` means "at most 3 outstanding LDS operations", i.e. wait for
   the older triple while the newer triple is still in flight.
+* The fill has **one** staging quad, so its three `v_ld16_g` accesses cannot
+  overlap each other: each one's global latency is exposed behind only four
+  store instructions.  With four resident waves this is invisible - the loop
+  has 1024 matrix cycles to hide it in and issues only 324 instructions - but
+  on a one-wave configuration (`gpu4-tiny`, section 7.5) it is the dominant
+  stall, and a second staging quad would cost a second live VGPR quad the
+  file does not have.  This is the clearest place where the 16-entry VGPR file
+  is too small.
+* The epilogue cannot use `v_st16_g`.  Lane *n* holds `C[m][n]`, so `C` is
+  contiguous *across* lanes and not *within* a lane; a wide store wants the
+  opposite layout.  The 32 `acc_rd` / `v_st4_g` pairs stand.
 
 ### 5.4 Register blocking analysis
 
@@ -965,12 +1048,15 @@ the VGPR file exactly full at 16.
 
 Tile size in the K direction, `KT`:
 
-| `KT` | LDS per buffer | Double buffered | MACs per workgroup iteration | Global B per iteration | AI (MAC/B) | Fill instructions per wave |
-|------|----------------|-----------------|------------------------------|------------------------|-----------|---------------------------|
-| 8  | 64*12 + 32*12 = 1152 | 2304 | 16384 | 768 | 21.3 | 6 |
-| 16 | 64*20 + 32*20 = 1920 | 3840 | 32768 | 1536 | 21.3 | 12 |
-| **32** | **64*36 + 32*36 = 3456** | **6912** | **65536** | **3072** | **21.3** | **24** |
-| 64 | 64*68 + 32*68 = 6528 | 13056 | 131072 | 6144 | 21.3 | 48 |
+| `KT` | LDS per buffer | Double buffered | MACs per workgroup iteration | Global B per iteration | AI (MAC/B) | Fill instructions per wave | Transaction efficiency |
+|------|----------------|-----------------|------------------------------|------------------------|-----------|---------------------------|------------------------|
+| 8  | 64*12 + 32*12 = 1152 | 2304 | 16384 | 768 | 21.3 | 10 | 12.5% |
+| 16 | 64*20 + 32*20 = 1920 | 3840 | 32768 | 1536 | 21.3 | 10 | 25% |
+| **32** | **64*36 + 32*36 = 3456** | **6912** | **65536** | **3072** | **21.3** | **15** | **50%** |
+| 64 | 64*68 + 32*68 = 6528 | 13056 | 131072 | 6144 | 21.3 | 30 | 100% |
+
+("Fill instructions" counts the `v_ld16_g` accesses and their four `v_st4_l`
+stores each, not the call, return and pointer arithmetic.)
 
 Arithmetic intensity is independent of `KT` - it is set by the M x N tile
 shape, not by K.  What `KT` buys is **amortisation of the barrier and the
@@ -978,6 +1064,14 @@ loop overhead** against a longer run of `mma`, and what it costs is LDS.
 `KT = 32` puts 6912 B into an 8 KiB scratchpad, giving 256 matrix-unit cycles
 per wave between barriers.  `KT = 64` would need 13 KiB, and the extra 5 KiB
 of SRAM buys only a further halving of an overhead that is already 12%.
+
+The last column is the one argument for `KT = 64` that is not about overhead:
+a 64-byte panel row is exactly one global transaction, so the fill would stop
+wasting half of every block it touches (section 3.1).  It is not taken,
+because at four resident waves the fill needs 7.3 B/cycle out of 64 and the
+waste is free.  It would become the right call on a machine whose global port
+was narrow enough for the fill to matter - which, section 7.5 notes, is
+exactly what real silicon is.
 
 ### 5.5 Arithmetic intensity and where it bottlenecks
 
@@ -1004,18 +1098,22 @@ Where it runs out of road, in the order the limits bite:
    262,144 cycles of matrix time; section 7.2 predicts 288,896 total, so 91%
    of all cycles are matrix cycles.  This is the intended bottleneck.
 2. **Issue bandwidth at small tiles.** One instruction per cycle across four
-   waves is fine here (400 issue slots against 1024 matrix cycles per
-   workgroup iteration) but it collapses for any kernel without `mma` -
-   section 7.1's `axpy` becomes issue-bound rather than memory-bound.
+   waves is fine here (324 issue slots against 1024 matrix cycles per
+   workgroup iteration) but it is the first thing to bite for any kernel
+   without `mma`.  `v_ld16_g` exists because of this: it took section 7.3's
+   memory-bound kernel from 52% to 95% of the global port without widening
+   anything.
 3. **Global bandwidth for `A`, if `Bt` is not pre-transposed.** With the
-   transpose precondition, both fills are two-adjacent-rows-per-access and
-   coalesce into one transaction.  Without it, the `Bt` fill becomes a
+   transpose precondition - now a fixed requirement, section 5.6 - both fills
+   are whole-panel-rows-per-access.  Without it, the `Bt` fill becomes a
    16-transaction column walk plus an in-wave transpose, roughly tripling the
-   fill cost (section 5.6).
-4. **Off-chip pin bandwidth, on real silicon.** 1 MiB in 288,896 cycles is
-   3.63 B/cycle, trivially inside the 64 B/cycle on-chip port but *outside*
-   what a hobby tapeout's pin count can deliver.  Section 7.5 shows this, not
-   the ISA, is what actually limits the silicon tier.
+   fill cost.
+4. **Off-chip pin bandwidth, on real silicon.** 1 MiB of useful data in
+   288,896 cycles is 3.63 B/cycle, and 7.26 B/cycle of *transaction*
+   bandwidth once section 3.1's 50% panel-row efficiency is counted - both
+   trivially inside the 64 B/cycle on-chip port, and both *outside* what a
+   hobby tapeout's pin count can deliver.  Section 7.5 shows this, not the
+   ISA, is what actually limits the silicon tier.
 5. **LDS bank conflicts, if the 36-byte pad is dropped.** A natural 32-byte
    stride turns the 24 conflict-free mma operand reads per iteration into 96
    port cycles, taking LDS from 19% to 56% utilised and adding ~7% to
@@ -1023,8 +1121,10 @@ Where it runs out of road, in the order the limits bite:
 
 Prologue and epilogue are the reason utilisation falls off at small sizes:
 the 32 `acc_rd` + `v_st4_g` pairs per wave are a fixed 384 issue slots per
-workgroup regardless of `K`, which is 4% of a `K = 256` run and 14% of a
-`K = 64` run.
+workgroup regardless of `K`, which is 5% of a `K = 256` run and 17% of a
+`K = 64` run - and, per section 5.3, they are the one part of the kernel
+`v_st16_g` cannot help, because the accumulator layout is transposed relative
+to what a wide store wants.
 
 ### 5.6 What the transpose precondition costs
 
@@ -1039,8 +1139,15 @@ the 1024 matrix cycles, so **runtime barely moves** on the 4-wave machine.
 
 The real argument for pre-transposing is therefore not speed but simplicity
 and the single-wave case.  A host-side transpose is `O(KN)` once and is
-amortised over `M/64` workgroup rows.  **This is an open question for review**
-(section 6.3).
+amortised over `M/64` workgroup rows.
+
+**Decided: pre-transposed `B` is a precondition of the ISA's GEMM kernel, not
+an option.**  The kernel is specified against `Bt[N][K]` and is permitted to
+produce garbage if handed `B[K][N]`.  The consequences are taken deliberately:
+no `v_bpermute`-based transpose path is specified, the single-wave
+`gpu4-tiny` configuration in section 7.5 stays viable, and the caller owns the
+one-off `O(KN)` transpose.  If a future revision wants row-major `B`, it
+should add a transposing *fill* helper rather than change the kernel.
 
 ---
 
@@ -1058,83 +1165,121 @@ amortised over `M/64` workgroup rows.  **This is an open question for review**
 | Atomics | No reduction kernel in the target set needs them.  They would be needed for split-K GEMM. |
 | `div` on either the scalar or vector side | cpu16 has it and it is the most expensive gate in that datapath.  GEMM does not divide. |
 | Dynamic / ragged tile handling (`M`, `N`, `K` not multiples of the tile) | The `exec` mask plus `v_cmp_*` can do it, but the kernel would roughly double in length.  Padding the matrices host-side is the intended answer. |
-| A DMA engine for global-to-LDS staging | A real accelerator would have one and it would remove 24 of the 100 instructions in the main loop.  It is a memory-system feature, not an ISA feature, and can be added later as one instruction. |
+| A DMA engine for global-to-LDS staging | A real accelerator would have one and it would remove 24 of the 81 instructions in the main loop.  It is a memory-system feature, not an ISA feature, and can be added later as one instruction. |
 | Instruction cache, virtual memory, exceptions, traps, multi-CU dispatch | All out of scope for a machine that is one compute unit with a 64 Ki-word program memory. |
 | `ld_p` / `st_p` (cpu16 has them) | Self-modifying code needs a second program memory port; four resident waves make it meaningless. |
-| Wider vector loads (`v_ld16_g`) | Section 7.1 shows this is the single biggest missed opportunity - the memory-bound kernel is *issue*-bound because one instruction only moves 64 B.  Deliberately left out to keep the encoding uniform, but see 6.3. |
+| ~~Wider vector loads~~ | **No longer omitted.**  `v_ld16_g` / `v_st16_g` were added at 0x86 / 0x87 (section 4.8) after the first draft showed the memory-bound kernel was *issue*-bound rather than port-bound.  They cost one bit of opcode space and a 4-alignment rule on one register field, and they buy 1.8x on `axpy` and 19 instructions per GEMM loop iteration. |
+| 16-byte **LDS** accesses (`v_ld16_l`) | 256 B out of a 16-way banked scratchpad is four bank cycles however it is issued, so this saves issue slots and buys no bandwidth, and it fights the 36-byte-stride conflict-free addressing of section 3.2. |
+| A `v_ld16_g` with a non-aligned destination register | Allowing any `Arg0` would need a 4-way rotate on the VGPR write port for no benefit; the assembler rejects it instead. |
 | Saturating `int32 -> int8` conversion and packed byte stores | The GEMM epilogue writes `int32` `C`.  A quantised pipeline would want `v_cvt_pk_sat`. |
 | Occupancy control, `s_setprio`, wave scheduling hints | Fixed at 4 resident waves. |
 
 ### 6.2 What I am least confident about
 
+The accumulator port structure headed this list in the first draft.  It has
+since been **decided** rather than assumed - requirement A1 in section 2.3 -
+so it is no longer an uncertainty but a constraint the RTL must meet.  The
+residual risk is recorded at the end of this section rather than in the
+ranking.
+
 In descending order of how likely it is to be wrong:
 
-1. **The 16-cycle `mma_i8` and the accumulator file's port structure.**  The
-   design assumes the accumulator file supports one 16-lane x 32-bit
-   read-modify-write per cycle while the VGPR file simultaneously supplies the
-   A and B fragments.  That is 64 B read + 64 B written per cycle on the
-   accumulator file alone.  As flip-flops it is fine; as an SRAM macro it
-   needs a genuine 1R1W port and the write-back has to be pipelined behind the
-   multiply.  If it turns out to need two cycles per accumulator row, the
-   whole machine halves in throughput and every number in section 7 is 2x
-   optimistic.
-2. **The LDS bank-conflict analysis for the fill path.** Section 3.2's rule is
+1. **The LDS bank-conflict analysis for the fill path.** Section 3.2's rule is
    worked out for the mma read (lane *m* reads row *m*, provably
-   conflict-free with a 36-byte stride).  The *fill* store maps lane *l* to
-   row `l>>3` and byte column `(l&7)*4`, giving bank `((l>>3)*9 + (l&7)) & 15`
-   = `{0..7} u {9..15, 0}` - a 2-way conflict on bank 0 only, so 2 port cycles
-   instead of 1.  I am fairly confident in the arithmetic and much less
+   conflict-free with a 36-byte stride).  The *fill* store now maps lane *l*
+   to row `l>>1` and byte column `(l&1)*16`, so store *j* of the quad hits
+   bank `((l>>1)*9 + (l&1)*4 + j) & 15`.  Over the 16 lanes that is 12
+   distinct banks with four of them twice, i.e. a **2-way conflict and 2 port
+   cycles** instead of 1 - the same cost as the narrow fill it replaced, from
+   a different pattern.  I am fairly confident in the arithmetic and much less
    confident that a real LDS implementation will actually resolve a 2-way
    conflict in exactly 2 cycles rather than 4.
-3. **Whether 4 resident waves are enough to hide global latency.**  The
+2. **Whether 4 resident waves are enough to hide global latency.**  The
    double-buffered fill issues its loads one whole `KT` panel ahead, which
    gives roughly 1024 cycles of slack against an assumed 40-cycle global
    latency.  That is generous.  But the `s_waitcnt 0` before the barrier
    serialises the whole workgroup on the slowest wave, and I have not modelled
    barrier skew properly - the flat 32-cycle bubble in section 7.2 is a guess.
-4. **The cross-lane A-fragment read.**  I claim it is a 16:1 multiplexer
+3. **The cross-lane A-fragment read.**  I claim it is a 16:1 multiplexer
    because the unit walks one `m` per cycle.  That is true if the VGPR file
    can deliver an *arbitrary* lane's 32 bits to the shared multiplier array
    each cycle, which means the VGPR file needs a read path that is not
    lane-local.  On an FPGA this is a wide mux and fine; in a small ASIC tile
    the wiring may be the thing that sets the clock period.
-5. **`exec` semantics for `mma_i8`.**  Reading `vA` from disabled lanes is
+4. **`exec` semantics for `mma_i8`.**  Reading `vA` from disabled lanes is
    defensible but sharp.  The alternative - forcing `exec = 0xFFFF` and making
    anything else undefined - is simpler to implement and simpler to reason
    about.  I chose the more permissive rule and I am not sure it earns its
    keep.
-6. **The global memory port width.** 64 B/cycle is asserted, not derived.  The
+5. **The global memory port width.** 64 B/cycle is asserted, not derived.  The
    existing `memory.v` has an 8-bit data port.  Everything in section 7 that
    is not explicitly pin-limited assumes a memory system roughly 8x wider than
    anything in this repo today, and section 7.5 is where that assumption
    collapses.
-7. **The `int32` accumulator being enough.**  `K <= 65536` for full-range
+6. **The `int32` accumulator being enough.**  `K <= 65536` for full-range
    `int8` is the bound, which is comfortable.  Low confidence only in that I
    have not checked the `C += ` path where `C` already holds a large value.
+7. **The exposed global latency in `fill_tile`.**  One staging quad means the
+   three fill accesses serialise (section 5.3).  I claim four waves hide it;
+   at one wave they certainly do not, and I have not modelled the
+   intermediate case.
 
-### 6.3 Open questions for review
+**Residual risk on requirement A1.**  Deciding the accumulator port structure
+does not make it free.  If the implementation cannot meet one 16-lane x 32-bit
+read-modify-write per cycle, `mma_i8` becomes a 32-cycle instruction, peak
+throughput halves to 32 MAC/cycle, and every cycle count and GMAC/s figure in
+section 7 is **2x optimistic** - while every *instruction* count, byte count
+and arithmetic intensity stays exactly right, because those are properties of
+the listing.  The fallback is not a redesign: it is the same ISA at half
+speed, with `s_waitcnt`-visible timing unchanged.  Tier 2 measures this
+directly through `perf_mma_busy`, and it is the single most valuable number
+the RTL will produce.
 
-These are decisions I made one way and would change if told to:
+### 6.3 Decisions taken, and what is still open
 
-1. **Pre-transposed `B`.**  Precondition, or should the kernel transpose?
-   Section 5.6 says the cost is small on a 4-wave machine and large on one
-   wave.
-2. **Wave width 16 vs 32.**  32 lanes would double peak MACs and halve the
-   divergence efficiency in section 7.1's `escape` kernel.  Section 7.5 says
-   32 lanes does not fit the silicon area budget, which is why it is 16.
-3. **A wider vector load (`v_ld16_g`, 16 B per lane = 256 B per access).**  It
-   would make the memory-bound kernel 4x faster and costs one opcode plus a
-   4-register-aligned destination quad.  I left it out for encoding uniformity
-   and now think that was probably wrong.
-4. **32 accumulators per lane (2 KiB per wave) vs 16.**  Section 5.4 argues
-   for 32; section 7.5 says the accumulator file is the single biggest area
-   item on a small ASIC tile and 16 might be forced.
-5. **Whether the scalar unit should be a cpu16 core verbatim.**  Reusing
+The first draft of this document ended with six open questions.  Four have
+been answered and are now part of the specification; they are recorded here
+rather than deleted, because the reasoning matters more than the outcome.
+
+| # | Question | Decision | Where it lands |
+|---|----------|----------|----------------|
+| 1 | Pre-transposed `B`: precondition, or in-kernel transpose? | **Precondition.**  The kernel takes `Bt[N][K]` and no transposing path is specified. | 5.6 |
+| 2 | Wave width 16 or 32? | **16, for the first implementation.**  32 stays on the table as a later widening, not as a competing design. | 1.1, 7.5 |
+| 3 | Add a wider vector load? | **Added**, as `v_ld16_g` *and* `v_st16_g`, with a test at tier 2. | 4.8, 7.4 |
+| 4 | 32 accumulators per lane, or 16? | **32.** | 2.3, 5.4 |
+| 5 | Should the scalar unit be a widened `cpu16.v`? | *still open* | - |
+| 6 | Should `s_waitcnt` split into two counters? | *still open* | - |
+
+Three notes on the decisions, since none of them is free:
+
+* **Wave width 16 "firstly" is a sequencing decision, not a closed one.**  The
+  ISA is written so that widening to 32 changes the `exec` mask from 16 to 32
+  bits - at which point a mask no longer fits half an SGPR and section 1.2's
+  "masks *are* scalar registers" property is lost.  That property is worth
+  more than it looks, and a 32-lane revision should expect to pay for it.
+* **`v_st16_g` was added alongside `v_ld16_g` because a load-only widening
+  does not solve the problem it was added for.**  Section 7.3 works this out:
+  with `v_ld16_g` alone the memory-bound kernel lands at 4,018 cycles and is
+  still issue-bound; with both it lands at 3,250 and is finally limited by the
+  memory port.  The store is the difference between fixing the problem and
+  halving it.
+* **32 accumulators per lane is confirmed at the ISA level and still cannot be
+  built on the smallest silicon target.**  Section 7.5's `gpu4-tiny` shrinks
+  to 8 accumulators per lane to fit a TinyTapeout die.  That is a
+  configuration of this ISA, not a different ISA, and the tension is real and
+  unresolved: the spec says 32 and the cheapest tapeout says 8.
+
+**Still open, for the reviewer:**
+
+1. **Whether the scalar unit should be a cpu16 core verbatim.**  Reusing
    `cpu16.v` as the scalar unit with a widened register file would save a lot
    of implementation effort and would make the two ISAs genuinely siblings,
    at the cost of the 32-bit scalar registers and the imm16 encoding.
-6. **Whether `s_waitcnt` should be split into separate global and LDS
-   counters** rather than two nibbles of one immediate.
+2. **Whether `s_waitcnt` should be split into separate global and LDS
+   counters** rather than two nibbles of one immediate.  The GEMM kernel uses
+   `s_waitcnt 48` to wait on LDS while global loads are in flight, which
+   already relies on the two counters being independent; the question is only
+   whether they deserve separate opcodes.
 
 ---
 
@@ -1151,19 +1296,24 @@ It is not the goal.
 
 ### 7.1 The benchmark kernels
 
-Five kernels.  Three are GEMM at different sizes, and two exist specifically
-so the ISA is not evaluated only on the workload it was designed for.
+Six kernels.  Three are GEMM at different sizes, two exist specifically so
+the ISA is not evaluated only on the workload it was designed for, and one is
+a deliberate A/B control.
 
 | Id | Kernel | Shape | Why it is here |
 |----|--------|-------|----------------|
 | `gemm64`  | `C[64][64] += A[64][64] * Bt[64][64]`, int8 -> int32 | 262,144 MACs | smallest size that fills one workgroup grid; exposes prologue/epilogue overhead |
 | `gemm128` | 128-cube | 2,097,152 MACs | mid size |
 | `gemm256` | 256-cube | 16,777,216 MACs | the headline number |
-| `axpy16k` | `y[i] += a * x[i]`, int32, `n = 16384` | 16,384 MACs | **memory-bound**; AI = 0.083 MAC/B.  Tests the load/store path and issue bandwidth with the matrix unit idle. |
+| `axpy16k` | `y[i] += a * x[i]`, int32, `n = 16384`, narrow `v_ld4_g` / `v_st4_g` | 16,384 MACs | **memory-bound**; AI = 0.083 MAC/B.  Tests the load/store path and issue bandwidth with the matrix unit idle.  Retained as the *control*: this is the version without wide accesses. |
+| `axpy16k_w` | the same kernel using `v_ld16_g` / `v_st16_g` | 16,384 MACs | the **test of the decision in 6.3** to add wide accesses.  Identical inputs and identical expected output to `axpy16k`, so it is simultaneously a correctness test of the two new opcodes and the measurement that justifies them.  If it does not beat `axpy16k`, the opcodes should be removed. |
 | `escape4k` | per-point iterate `z = z*z + c` in Q12 fixed point until `\|z\|^2 > 4` or 64 iterations; `n = 4096` points, mean trip count 24 | ~196,608 MACs | **divergence-heavy**; every lane exits at a different iteration.  Tests `exec`, `v_cmp_*`, `s_and_saveexec`, `s_cbr_execz` and measures lane efficiency. |
 
-All five have a deterministic reference output that can be checked against a
+All six have a deterministic reference output that can be checked against a
 `tests/*.expect` file, exactly as the existing cpu8/cpu16 tests do.
+`axpy16k` and `axpy16k_w` share one `.expect` file, which is the point of the
+pair: a wide access that computes a different answer than the narrow one is a
+bug in the wide access.
 
 Input data is generated by a fixed linear congruential sequence so that every
 tier produces bit-identical results and a mismatch is a bug, not a tolerance
@@ -1235,42 +1385,70 @@ and the kernel listings, not measured.
 
 #### GEMM, gpu16
 
-Per wave per main-loop iteration the kernel in section 5.3 issues **100
-instructions** (29 A fill, 14 Bt fill, 2 barrier/wait, 48 compute, 7 loop
-tail) and **16 `mma_i8`**, i.e. 256 matrix-unit cycles.  Four waves give 400
-issue slots against 1024 matrix cycles per workgroup iteration, so the matrix
-unit is the limiter and a workgroup iteration costs **1024 + 32 = 1056
-cycles**.  Epilogue is 96 instructions per wave (384 per workgroup) plus a
-~100-cycle store drain; prologue is ~24 per wave.
+Per wave per main-loop iteration the kernel in section 5.3 issues **81
+instructions** (17 A fill, 7 Bt fill, 2 barrier/wait, 48 compute, 7 loop tail)
+and **16 `mma_i8`**, i.e. 256 matrix-unit cycles.  Four waves give 324 issue
+slots against 1024 matrix cycles per workgroup iteration, so the matrix unit
+is the limiter and a workgroup iteration costs **1024 + 32 = 1056 cycles**.
+Epilogue is 96 instructions per wave (384 per workgroup) plus a ~100-cycle
+store drain; prologue is ~24 per wave.
 
 | Kernel | Workgroups | Iterations each | Instructions | Cycles | Bytes | AI (MAC/B) | Matrix util |
 |--------|-----------|-----------------|--------------|--------|-------|------------|-------------|
-| `gemm64`  | 2  | 2 | **2,560**   | **5,384**   | 28,672    | 9.14 | **76.1%** |
-| `gemm128` | 8  | 4 | **16,640**  | **38,432**  | 163,840   | 12.8 | **85.3%** |
-| `gemm256` | 32 | 8 | **117,760** | **288,896** | 1,048,576 | 16.0 | **90.7%** |
+| `gemm64`  | 2  | 2 | **2,256**   | **5,384**   | 28,672    | 9.14 | **76.1%** |
+| `gemm128` | 8  | 4 | **14,208**  | **38,432**  | 163,840   | 12.8 | **85.3%** |
+| `gemm256` | 32 | 8 | **98,304**  | **288,896** | 1,048,576 | 16.0 | **90.7%** |
 
-`gemm256` at 142.5 MACs per dynamic instruction is the headline efficiency
+`gemm256` at **170.7 MACs per dynamic instruction** is the headline efficiency
 claim for the ISA.
+
+**Cycles did not change when `v_ld16_g` was added, and that is the expected
+result.**  The loop is matrix-bound with a 3:1 margin, so removing 19
+instructions per wave per iteration removes issue slots the machine was not
+short of.  Instructions per MAC improved by 20% (142.5 to 170.7) and wall
+clock by nothing.  The wide load earns its place on `axpy` and on the
+single-wave silicon configuration, not here; recording that plainly is more
+useful than quietly claiming a GEMM win.
 
 #### The other two kernels, gpu16
 
-`axpy16k`, 4-way unrolled: 20 instructions per 64 elements (8 `v_ld4_g`,
-4 `v_mad`, 4 `v_st4_g`, 1 `s_waitcnt`, 2 `s_add`, 1 `s_addi`, 1 `s_bnz_i`),
-256 chunks over 4 waves.
+`axpy16k` (control, narrow accesses), 4-way unrolled: 20 instructions per 64
+elements (8 `v_ld4_g`, 4 `v_mad`, 4 `v_st4_g`, 1 `s_waitcnt`, 2 `s_add`,
+1 `s_addi`, 1 `s_bnz_i`), 256 chunks over 4 waves.
+
+`axpy16k_w` (wide accesses), 2 chunks of 64 elements per loop iteration:
+10 instructions per chunk (2 `v_ld16_g`, 1 `s_waitcnt`, 4 `v_mad`,
+1 `v_st16_g`, 2 `s_add`) plus `s_addi` and `s_bnz_i` per iteration, so 22
+instructions per 128 elements, 128 iterations over 4 waves.  It uses 9 VGPRs:
+`v0`-`v3` for `x`, `v4`-`v7` for `y`, `v8` for the per-lane offset `lane*16`.
+Only two of the four aligned quads are in use and the third cannot be paired
+with a fourth, which is why the two chunks in an iteration reuse the same
+registers and serialise on `s_waitcnt` rather than being double-buffered -
+see the quad-rule note in section 4.8.
 
 `escape4k`: 16 instructions per wave-iteration of the escape loop plus a
 3-cycle branch bubble, 256 waves, mean per-wave trip count 58.
 
 | Kernel | Instructions | Cycles | Bytes | AI | Matrix util | Lane efficiency |
 |--------|--------------|--------|-------|-----|-------------|-----------------|
-| `axpy16k`  | **5,120**   | **5,940**   | 196,608 | 0.083 | **0%** | 100% |
-| `escape4k` | **240,640** | **285,112** | 49,152  | 4.0   | **0%** | **41.4%** |
+| `axpy16k`   | **5,120**   | **5,940**   | 196,608 | 0.083 | **0%** | 100% |
+| `axpy16k_w` | **2,816**   | **3,250**   | 196,608 | 0.083 | **0%** | 100% |
+| `escape4k`  | **240,640** | **285,112** | 49,152  | 4.0   | **0%** | **41.4%** |
 
-Two findings worth stating loudly because they are the anti-GEMM results:
+Three findings worth stating loudly because they are the anti-GEMM results:
 
 * `axpy16k` is **issue-bound, not memory-bound**.  It needs 3,072 cycles of
   the 64 B/cycle port but 5,120 issue slots, so it achieves 33.1 B/cycle -
-  52% of the port.  A `v_ld16_g` would fix this (section 6.3).
+  52% of the port.  This is the observation that produced `v_ld16_g`.
+* `axpy16k_w` **fixes it, and stops just short of the port.** 2,816
+  instructions plus 384 cycles of branch bubble plus drain gives 3,250 cycles
+  against a 3,072-cycle port minimum: **60.5 B/cycle, 94.5% of the port**, and
+  a 1.83x improvement over the control.  Three separate limits - issue
+  (3,250), port (3,072) and per-wave load latency (~3,200) - now land within
+  6% of each other, which is what a balanced kernel looks like.  For
+  completeness: adding only `v_ld16_g` and keeping narrow stores gives 3,584
+  instructions and **4,018 cycles**, still issue-bound; the store is over half
+  of the benefit.
 * `escape4k` issues 237,568 lane-slots to do 98,304 lanes of useful work.
   **41.4% lane efficiency** is the direct, quantified price of having one PC
   per 16 lanes and no hardware reconvergence.
@@ -1282,23 +1460,27 @@ Two findings worth stating loudly because they are the anti-GEMM results:
 | `gemm64`  | 2,621,440   | **2,883,584**   | 1,572,864  | 540,672    | 0.48 |
 | `gemm128` | 20,971,520  | **23,068,672**  | 12,582,912 | 4,259,840  | 0.49 |
 | `gemm256` | 167,772,160 | **184,549,376** | 100,663,296| 33,816,576 | 0.50 |
-| `axpy16k` | 196,608     | **212,992**     | -          | 196,608    | 0.083 |
+| `axpy16k` / `axpy16k_w` | 196,608 | **212,992** | -      | 196,608    | 0.083 |
 | `escape4k`| 1,376,256   | **1,572,864**   | -          | 49,152     | 4.0  |
 
 #### Speedup summary - the claim being made
 
 | Kernel | cpu16w cycles | gpu16 cycles | **Speedup** | vs blocked cpu16w | Instruction ratio |
 |--------|---------------|--------------|-------------|--------------------|-------------------|
-| `gemm64`   | 2,883,584   | 5,384   | **535x** | 292x | 1024x |
-| `gemm128`  | 23,068,672  | 38,432  | **600x** | 327x | 1260x |
-| `gemm256`  | 184,549,376 | 288,896 | **639x** | 348x | 1425x |
-| `axpy16k`  | 212,992     | 5,940   | **35.9x** | - | 38.4x |
-| `escape4k` | 1,572,864   | 285,112 | **5.5x**  | - | 5.7x |
+| `gemm64`    | 2,883,584   | 5,384   | **535x** | 292x | 1162x |
+| `gemm128`   | 23,068,672  | 38,432  | **600x** | 327x | 1476x |
+| `gemm256`   | 184,549,376 | 288,896 | **639x** | 348x | 1707x |
+| `axpy16k`   | 212,992     | 5,940   | **35.9x** | - | 38.4x |
+| `axpy16k_w` | 212,992     | 3,250   | **65.5x** | - | 69.8x |
+| `escape4k`  | 1,572,864   | 285,112 | **5.5x**  | - | 5.7x |
 
 The spread from 639x to 5.5x is the honest summary of this ISA: it is a GEMM
-machine.  On a memory-bound kernel it delivers 36x from 16 lanes plus a wide
-memory port; on a divergence-heavy kernel it delivers **5.5x out of a
-theoretical 16x**, i.e. 34% of its own lane parallelism.
+machine.  On a memory-bound kernel it delivers 66x from 16 lanes plus a wide
+memory port - but only once wide accesses exist; without them the same kernel
+gets 36x, and the 30x difference is bought by two opcodes rather than by any
+hardware.  On a divergence-heavy kernel it delivers **5.5x out of a
+theoretical 16x**, i.e. 34% of its own lane parallelism, and no opcode fixes
+that.
 
 Global traffic tells the same story from the other side: `gemm256` moves
 1.00 MiB where cpu16w moves 33.8 MB.  **32x less memory traffic**, entirely
@@ -1306,7 +1488,7 @@ attributable to LDS tiling.
 
 ### 7.4 Tier 2 - RTL simulation through the existing CTest harness
 
-Once `gpu16.v` and `asm32` exist, the same five kernels run under `iverilog`
+Once `gpu16.v` and `asm32` exist, the same six kernels run under `iverilog`
 through the machinery already in the repo, with no new framework.
 
 What has to be added:
@@ -1315,14 +1497,34 @@ What has to be added:
    section 4.1 word format as 8 hex digits per line under
    `--hex --sep_with_line`.
 2. `tests/gemm64.s`, `tests/gemm128.s`, `tests/gemm256.s`, `tests/axpy16k.s`,
-   `tests/escape4k.s`, plus their `.data` inputs generated by a small
-   committed generator, and `tests/*.expect` holding the reference results
-   with `xx` for don't-care, exactly like `tests/cpu16_sum.expect`.
+   `tests/axpy16k_w.s`, `tests/escape4k.s`, plus their `.data` inputs
+   generated by a small committed generator, and `tests/*.expect` holding the
+   reference results with `xx` for don't-care, exactly like
+   `tests/cpu16_sum.expect`.  `axpy16k.s` and `axpy16k_w.s` share
+   `tests/axpy16k.expect`.
 3. `testgpu.v`, modelled on `test16.v`: `$readmemh` the program and data,
    run to `s_endpgm` or `+cycles`, dump the result region and compare.
 4. `tests/run_test.sh` extended with a `gpu` mode that picks `asm32` and
    `testgpu.v`, and `CMakeLists.txt` gaining the five `add_test` entries.
-5. `tests/cpu16_gemm8.s` - a genuine 8x8x8 GEMM on the **unmodified**
+5. `tests/gpu_wide16.s` - a **correctness** test for `v_ld16_g` / `v_st16_g`
+   in isolation, separate from the `axpy` performance pair, because a wide
+   access has failure modes a well-behaved kernel never reaches.  It checks,
+   in one program with one `.expect` file: (a) that a `v_ld16_g` of a known
+   byte pattern lands little-endian in the right four VGPRs, `v[Arg0+j]`
+   holding bytes `4j..4j+3`; (b) that an address not a multiple of 16 is
+   truncated down rather than faulting or rotating; (c) that all four legal
+   quads (`v0`, `v4`, `v8`, `v12`) behave identically, by running the same
+   load into each and comparing; (d) that under a partial `exec` mask -
+   `0x00ff`, then `0xaaaa` - disabled lanes neither store through `v_st16_g`
+   nor have their destination quad disturbed by `v_ld16_g`, verified by
+   pre-poisoning both the quad and the destination memory; (e) that a
+   `v_st16_g` followed by a `v_ld16_g` of the same address round-trips only
+   after `s_waitcnt`, which is the one hazard the ISA does *not* interlock
+   (section 1.4).  The assembler side is tested too: `asm32` must **reject**
+   `v_ld16_g v1, ...`, `v_ld16_g v7, ...` and any other non-4-aligned
+   register, as a hard error in the style `asm16.cpp` already uses, and that
+   rejection is itself a CTest entry asserting a non-zero exit status.
+6. `tests/cpu16_gemm8.s` - a genuine 8x8x8 GEMM on the **unmodified**
    `cpu16.v`.  `A` is 64 B, `Bt` is 64 B and an `int16` `C` is 128 B, which
    is exactly the 256 bytes of `cpu16.v`'s data memory.  512 MACs at a
    predicted 11 cycles each is **5,632 cycles plus ~40 of setup**.  This is
@@ -1343,6 +1545,7 @@ the CTest entry fails if the RTL lands outside it.  Predicted bands:
 | `gemm128`  | 38,432  | +/- 12% | outside 33,820 - 43,044 |
 | `gemm256`  | 288,896 | +/- 10% | outside 260,006 - 317,786 |
 | `axpy16k`  | 5,940   | +/- 15% | outside 5,049 - 6,831 |
+| `axpy16k_w`| 3,250   | +/- 15% | outside 2,763 - 3,738 |
 | `escape4k` | 285,112 | +/- 20% | outside 228,090 - 342,134 |
 | `cpu16_gemm8` (real cpu16.v) | 5,672 | +/- 5% | outside 5,388 - 5,956 |
 
@@ -1354,7 +1557,17 @@ or the prediction is simply wrong.
 The most likely way tier 1 is wrong, in order: the barrier bubble (guessed at
 32 cycles), the LDS 2-way conflict resolution, and whether the matrix unit
 really accepts a new `mma` every 16 cycles with no pipeline drain between
-accumulator blocks.
+accumulator blocks - i.e. whether requirement A1 of section 2.3 was met.  If
+it was not, every GEMM cycle count above should come in at roughly 2x and
+every instruction count should be exactly right, which makes the two failure
+modes easy to tell apart from one test run.
+
+There is also one prediction here that is a genuine A/B experiment rather than
+a model check: **`axpy16k_w` must beat `axpy16k` by 1.5x or more**.  It is
+predicted at 1.83x.  If the RTL shows less than 1.5x, the wide accesses are
+not paying for their decode and alignment rules and section 6.3's decision 3
+should be reversed - the kernels are written so that reversing it means
+deleting two opcodes and one test, and nothing else.
 
 ### 7.5 Tier 3 - real silicon
 
@@ -1466,14 +1679,21 @@ decode and control 0.03 mm2.
 | Separate accumulator file | **yes**, but it is the biggest single item | 0.95 mm2 of 3.3 mm2 in the full config |
 | No `div` | **yes** | saves ~15 kGE |
 | Three-term addressing `v + s + imm8` | **yes** | one adder per lane |
+| `v_ld16_g` / `v_st16_g` | **yes, and they matter more here than at tier 1** | no extra register-file port (section 4.8) and negligible decode, while the one-wave TinyTapeout configuration has no other way to hide latency: with a single wave, saving three issue slots out of four on every fill access is not a rounding error |
+| Requirement A1, the 16-lane accumulator read-modify-write | **yes at 4 lanes, unproven at 16** | as flops it is just a wide enable; the risk is the write-back path timing, not the area |
 | **Wave width 16** | **no on TinyTapeout** | must drop to 4; 16 lanes of datapath and register file is ~2 mm2 on its own |
-| **32 accumulators per lane** | **no on TinyTapeout** | must drop to 8; this is the dominant flop cost |
+| **32 accumulators per lane** | **no on TinyTapeout** | must drop to 8; this is the dominant flop cost, and it is the one place where the ISA as specified (section 6.3, decision 4) and the cheapest tapeout openly disagree |
 | **8 KiB LDS** | **no on TinyTapeout** | must drop to 256 B, which forces `KT = 8` and drops AI from 21.3 to 2.67 MAC/B |
 | **64 B/cycle global port** | **no anywhere** | pin-limited to 20-80 MB/s; see the wall-clock numbers below |
 | **4 resident waves** | **no on TinyTapeout** | one wave, so all the latency hiding in section 5.3 stops working and the matrix unit idles during fills |
 
-The last two rows are the real finding: **on a hobby tapeout the ISA is not
-the limit - pins and scratchpad are.**
+The rows that say "no anywhere" and "no on TinyTapeout" are the real finding:
+**on a hobby tapeout the ISA is not the limit - pins and scratchpad are.**
+Note which way the wide accesses fall.  They were added to fix a tier-1
+issue-bandwidth problem, they changed no GEMM cycle count at tier 1, and they
+survive to tier 3 as one of the few ISA features that gets *more* valuable as
+the machine gets smaller.  That is an argument for judging an ISA feature at
+the tier where the machine is cheapest, not the tier where it is fastest.
 
 #### Predicted tier-3 numbers
 
