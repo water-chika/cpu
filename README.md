@@ -27,6 +27,7 @@ straight away.
 
 | Test | Program | Checks |
 |------|---------|--------|
+| verilog_lint | every ```*.v``` | each verilog source compiles on its own under ```iverilog -Wall``` without a single message |
 | cpu8_sum | tests/cpu8_sum.s | 8 bit CPU sums 1..8 out of data memory into r2 |
 | cpu8_sum_list | cpu8_asm/sum.s | 8 bit CPU sums the whole of data.list (1..16) into r2 |
 | cpu8_label | tests/cpu8_label.s | 8 bit assembler resolves a label at address 75 and the CPU branches there |
@@ -391,9 +392,9 @@ rewrite itself; ```tests/cpu16_ldp.s``` does exactly that.
 
 ## Instruction Set Architecture - 8 Bit Instruction/Register SIMD32
 
-Not implemented.  ```cpu8_simd.v``` is a sketch and does not compile:
-its ```memory``` instantiation uses an invalid ```signal[]``` port syntax
-where it needs a ```generate``` loop over the lanes.
+Dropped.  ```cpu8_simd.v``` was a sketch that never compiled, and the SIMT
+design in [```docs/gpu_isa.md```](docs/gpu_isa.md) supersedes it - see
+"Removed modules" below.
 
 ## Instruction Set Architecture - 32 Bit Instruction SIMT GPU
 
@@ -422,9 +423,32 @@ stated architectural requirement.  The scalar unit is a widened
 before a tapeout.  ```s_waitcnt``` is split into ```s_waitcnt_g``` and
 ```s_waitcnt_l```.
 
+## Removed modules
+
+Two modules were deleted rather than repaired, because neither could be given
+a test in this harness and both had been superseded:
+
+* ```cpu8_simd.v```, a 32 lane SIMD sketch.  It never compiled - an invalid
+  ```signal[]``` port syntax where it needed a ```generate``` loop, an
+  undefined ```SIMD_WIDTH```, a lane variable used outside the loops that
+  declared it, and one single ported data memory shared by all 32 lanes.
+  Repairing it meant designing a per lane memory system and a divergence
+  model from scratch, which is exactly what
+  [```docs/gpu_isa.md```](docs/gpu_isa.md) now specifies properly, with an
+  exec mask, a banked scratchpad and a stated memory transaction rule.  It
+  also declared a module called ```cpu_inst8_data8```, the same name as the
+  one in ```cpu8.v```, so the two could never be used together anyway.
+* ```memory_ramb18e1.v```, a wrapper around the Xilinx ```RAMB18E1``` block
+  RAM primitive.  It redeclared every one of its ports, its body was entirely
+  commented out, and it instantiates a vendor primitive that is not in this
+  repository, so no testbench here can ever compile it.  ```memory.v``` is the
+  portable version and synthesis infers a block RAM from it.
+
+The ```verilog_lint``` test exists so that nothing rots this way again: it
+compiles every ```*.v``` on its own with ```-Wall``` and fails on any message.
+
 ## Known gaps
 
-* ```memory_ramb18e1.v``` does not compile: it redeclares every port.
 * ```cpu8.v``` does not implement ```ld_p```/```st_p```; it reports
   ```unknown opcode``` for them.  Only ```cpu16.v``` has the second program
   memory port they need.

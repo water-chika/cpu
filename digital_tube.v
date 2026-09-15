@@ -1,3 +1,4 @@
+`include "cpu8.v"
 
 module digital_tube(
     input [3:0] d,
@@ -22,20 +23,23 @@ end
 
 endmodule
 
-module test(
+// The board top: it runs the 8 bit CPU off a divided clock and shows r1 on a
+// six digit seven segment display.  It used to instantiate a module called
+// "main", which was renamed to cpu_inst8_data8 when main.v became cpu8.v, and
+// it used to be called "test", which collided with the testbench in test.v.
+module digital_tube_board(
     input clk,
     output [7:0] dig,
     output reg [5:0] sel
     );
 
     reg [36:0] counter;
-    
-    main U0(
+
+    cpu_inst8_data8 U0(
     .clk(counter[20])
     );
     initial begin
         counter = 0;
-        #20 $finish;
     end
     
     reg [3:0] digits[5:0];
