@@ -1,0 +1,38 @@
+// if/else, while, break and continue, and the comparison operators.
+int main() {
+    int i = 0;
+    int sum = 0;
+    int odd = 0;
+    // 1+2+...+10 = 55, of which the odd ones sum to 25
+    while (i < 10) {
+        i = i + 1;
+        sum = sum + i;
+        if (i & 1) {
+            odd = odd + i;
+        } else {
+            sum = sum + 0;
+        }
+    }
+    out(0, sum);
+    out(1, odd);
+
+    // break leaves the loop early: stops with j == 4
+    int j = 0;
+    while (j < 100) {
+        if (j == 4) { break; }
+        j = j + 1;
+    }
+    out(2, j);
+
+    // continue skips the rest of the body: counts the multiples of 3 below 20
+    int k = 0;
+    int threes = 0;
+    while (k < 20) {
+        k = k + 1;
+        if (k - (k / 3) * 3) { continue; }
+        threes = threes + 1;
+    }
+    out(3, threes);
+
+    return 0;
+}

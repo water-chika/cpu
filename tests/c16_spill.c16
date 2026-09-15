@@ -1,0 +1,13 @@
+// Deep expressions: only five of cpu16's eight registers hold value stack
+// slots, so anything nested more than five deep has to spill to memory and
+// come back through the two scratch registers.  This nests ten deep.
+//
+// 1+(2+(3+(4+(5+(6+(7+(8+(9+10))))))))  = 55
+// and the same shape with a multiply at the bottom.
+int main() {
+    out(0, 1 + (2 + (3 + (4 + (5 + (6 + (7 + (8 + (9 + 10)))))))));
+    // a comparison at the bottom of a deep stack, so the carry trick runs
+    // with the operands spilled
+    out(1, 1 + (1 + (1 + (1 + (1 + (1 + (1 + (9 > 3)))))))); 
+    return 0;
+}

@@ -1,0 +1,23 @@
+// peek and poke: read the eight bytes the testbench loads at address 0,
+// and use a scratch byte as accumulator storage.
+//
+// tests/sum.data is 1..8, so the sum is 36 and the largest is 8.
+int main() {
+    poke(32, 0);
+    poke(33, 0);
+    int i = 0;
+    while (i < 8) {
+        int v = peek(i);
+        poke(32, peek(32) + v);
+        if (v > peek(33)) {
+            poke(33, v);
+        }
+        i = i + 1;
+    }
+    out(0, peek(32));
+    out(1, peek(33));
+    // a value written and read straight back
+    poke(40, peek(32) * 2);
+    out(2, peek(40));
+    return 0;
+}

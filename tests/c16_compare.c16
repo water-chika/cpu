@@ -1,0 +1,18 @@
+// Every comparison operator, and the fact that they produce a clean 0 or 1.
+int main() {
+    int flags = 0;
+    if (3 < 4) { flags = flags | 1; }
+    if (4 > 3) { flags = flags | 2; }
+    if (3 <= 3) { flags = flags | 4; }
+    if (3 >= 4) { flags = flags | 8; }
+    if (5 == 5) { flags = flags | 16; }
+    if (5 != 5) { flags = flags | 32; }
+    if (!0) { flags = flags | 64; }
+    out(0, flags);
+
+    // the comparisons are values, not just branch conditions
+    out(1, (9 > 2) + (2 > 9) + (7 == 7));
+    out(2, (1 < 2) && (3 != 3));
+    out(3, (1 < 2) || (3 != 3));
+    return 0;
+}

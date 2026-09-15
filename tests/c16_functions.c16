@@ -1,0 +1,21 @@
+// Functions, parameters, nested calls and the caller saved expression stack.
+int scale = 3;
+
+int add(int a, int b) {
+    return a + b;
+}
+
+int triple(int v) {
+    return v * scale;
+}
+
+int main() {
+    out(0, add(20, 22));
+    out(1, triple(7));
+    // a call inside the argument of another call: the outer operand has to
+    // survive the inner one
+    out(2, add(add(1, 2), triple(3)));
+    // a call buried in the middle of an expression
+    out(3, 100 - add(triple(4), 8) * 2);
+    return 0;
+}

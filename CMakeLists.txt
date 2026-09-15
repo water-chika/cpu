@@ -143,6 +143,38 @@ if(IVERILOG_EXECUTABLE AND VVP_EXECUTABLE)
     add_cpu_test(cpu16_adc   asm16 test16.v tests/cpu16_adc.s   -              cpu16_adc.expect   100)
     add_cpu_test(cpu16_ldp   asm16 test16.v tests/cpu16_ldp.s   -              cpu16_ldp.expect   100)
 
+    # The compiler's tests go one step further than the assembler's: they
+    # compile the program down both output paths, diff the machine words, and
+    # only then simulate.  A disagreement between the paths is a failure even
+    # if the program would have run correctly.
+    function(add_c16_test name program data expect cycles)
+        if(data STREQUAL "-")
+            set(data_arg "-")
+        else()
+            set(data_arg ${CMAKE_CURRENT_SOURCE_DIR}/${data})
+        endif()
+        add_test(
+            NAME ${name}
+            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_c16_test.sh
+                    $<TARGET_FILE:c16>
+                    $<TARGET_FILE:asm16>
+                    ${CMAKE_CURRENT_SOURCE_DIR}
+                    test16.v
+                    ${CMAKE_CURRENT_SOURCE_DIR}/${program}
+                    ${data_arg}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/${expect}
+                    ${cycles}
+        )
+        set_tests_properties(${name} PROPERTIES FAIL_REGULAR_EXPRESSION "TEST FAIL")
+    endfunction()
+
+    add_c16_test(c16_arith     tests/c16_arith.c16     -              c16_arith.expect       400)
+    add_c16_test(c16_control   tests/c16_control.c16   -              c16_control.expect    6000)
+    add_c16_test(c16_compare   tests/c16_compare.c16   -              c16_compare.expect    2000)
+    add_c16_test(c16_functions tests/c16_functions.c16 -              c16_functions.expect  2000)
+    add_c16_test(c16_spill     tests/c16_spill.c16     -              c16_spill.expect      2000)
+    add_c16_test(c16_memory    tests/c16_memory.c16    tests/sum.data c16_memory.expect     4000)
+    add_c16_test(c16_collatz   tests/c16_collatz.c16   -              c16_collatz.expect   40000)
 else()
     message(WARNING "iverilog/vvp not found, the simulation tests are disabled")
 endif()

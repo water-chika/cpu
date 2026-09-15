@@ -1,0 +1,37 @@
+// A program whose answer is not obvious by inspection: over the starting
+// values 1..15, which one takes the longest to reach 1 under the Collatz
+// rule, and how many steps does it take?  Everything stays inside 8 bits
+// because the chains below 16 peak at 160.
+//
+// The answer is 9, with 19 steps.
+int best = 0;
+int arg = 0;
+
+int chain(int n) {
+    int steps = 0;
+    while (n != 1) {
+        int half = n / 2;
+        if (n - half * 2) {
+            n = n * 3 + 1;
+        } else {
+            n = half;
+        }
+        steps = steps + 1;
+    }
+    return steps;
+}
+
+int main() {
+    int n = 1;
+    while (n < 16) {
+        int s = chain(n);
+        if (s > best) {
+            best = s;
+            arg = n;
+        }
+        n = n + 1;
+    }
+    out(0, arg);
+    out(1, best);
+    return 0;
+}
