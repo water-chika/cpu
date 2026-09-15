@@ -205,6 +205,38 @@ if(IVERILOG_EXECUTABLE AND VVP_EXECUTABLE)
     add_cpu_test(cpu16_adc   asm16 test16.v tests/cpu16_adc.s   -              cpu16_adc.expect   100)
     add_cpu_test(cpu16_ldp   asm16 test16.v tests/cpu16_ldp.s   -              cpu16_ldp.expect   100)
 
+    # The gpu16 scalar unit.  There is no asm32 yet - docs/gpu_isa.md section
+    # 7.4 lists it as work still to do - so these programs are hand encoded
+    # hex words that carry their own disassembly in // comments.  Each one
+    # must reach s_endpgm and then match all sixteen scalar registers.
+    function(add_gpu_test name program data expect cycles)
+        if(data STREQUAL "-")
+            set(data_arg "-")
+        else()
+            set(data_arg ${CMAKE_CURRENT_SOURCE_DIR}/${data})
+        endif()
+        add_test(
+            NAME ${name}
+            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_gpu_test.sh
+                    ${CMAKE_CURRENT_SOURCE_DIR}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/${program}
+                    ${data_arg}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/${expect}
+                    ${cycles}
+                    ${ARGN}
+        )
+        set_tests_properties(${name} PROPERTIES FAIL_REGULAR_EXPRESSION "TEST FAIL")
+    endfunction()
+
+    add_gpu_test(gpu_alu    tests/gpu_alu.hex32    -  gpu_alu.expect    200
+                 +arg_ptr=4096 +group_x=7 +group_y=9)
+    add_gpu_test(gpu_imm    tests/gpu_imm.hex32    -  gpu_imm.expect    200)
+    add_gpu_test(gpu_branch tests/gpu_branch.hex32 -  gpu_branch.expect 300)
+    add_gpu_test(gpu_sys    tests/gpu_sys.hex32    -  gpu_sys.expect    200
+                 +wave_id=2 +group_x=5 +group_y=11)
+    add_gpu_test(gpu_mem    tests/gpu_mem.hex32
+                 tests/gpu_mem.data32 gpu_mem.expect 200)
+
     # The compiler's tests go one step further than the assembler's: they
     # compile the program down both output paths, diff the machine words, and
     # only then simulate.  A disagreement between the paths is a failure even

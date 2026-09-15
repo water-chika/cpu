@@ -1,0 +1,5 @@
+// 32 bit words; the byte address of word n is 4n.
+deadbeef
+00c0ffee
+12345678
+0000002a

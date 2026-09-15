@@ -548,8 +548,9 @@ design in [```docs/gpu_isa.md```](docs/gpu_isa.md) supersedes it - see
 
 ## Instruction Set Architecture - 32 Bit Instruction SIMT GPU
 
-Specification only, no verilog and no assembler yet.  See
-[```docs/gpu_isa.md```](docs/gpu_isa.md).
+See [```docs/gpu_isa.md```](docs/gpu_isa.md).  The scalar unit exists in
+```gpu16.v```; the vector unit, the exec mask, the LDS, the matrix unit and
+```asm32``` do not yet.
 
 ```gpu16``` is a SIMT sibling of cpu16 aimed at tiled integer GEMM: 16 lanes
 per wavefront with a software-managed exec mask, 16 scalar and 16 vector
@@ -572,6 +573,25 @@ stated architectural requirement.  The scalar unit is a widened
 ```cpu16.v``` synthesisable becomes work that comes before the GPU rather than
 before a tapeout.  ```s_waitcnt``` is split into ```s_waitcnt_g``` and
 ```s_waitcnt_l```.
+
+### What is built
+
+```gpu16.v``` implements ```gpu16_scalar```, the widened ```cpu16.v``` that
+section 4.13 calls for: 16 x 32 bit scalar registers, 4 bit register select
+fields, a 16 bit word addressed PC, a 24 bit data address, sign extended 16
+bit immediates and a 32 bit instruction word with an 8 bit opcode.  It decodes
+the whole of section 4.3's scalar ALU, section 4.4's control flow apart from
+the two exec-mask branches, ```s_ld_g```, and ```s_waitcnt_g```,
+```s_endpgm``` and ```s_nop```.  Every vector, LDS and matrix opcode reports
+```unknown opcode``` rather than guessing.
+
+```testgpu.v``` is its testbench, modelled on ```test16.v```, and the five
+```gpu_*``` CTests run hand encoded programs on it and check all sixteen
+scalar registers.  A gpu16 program must reach ```s_endpgm```: unlike cpu16,
+running off the end is a failure even if the registers look right.  There is
+no ```asm32``` yet, so the programs in ```tests/*.hex32``` are hex words
+carrying their own disassembly in ```//``` comments, which ```$readmemh```
+ignores.
 
 Revision 4 adds section 8, which answers a follow-up question: should the
 instruction word be enlarged to carry 5-bit register fields and a 32-entry
@@ -604,7 +624,9 @@ a test in this harness and both had been superseded:
   RAM primitive.  It redeclared every one of its ports, its body was entirely
   commented out, and it instantiates a vendor primitive that is not in this
   repository, so no testbench here can ever compile it.  ```memory.v``` is the
-  portable version and synthesis infers a block RAM from it.
+  portable version.  Its read port is asynchronous, which is what keeps the
+  CPUs' timing what it has always been, so synthesis infers distributed RAM
+  from it rather than a block RAM.
 
 The ```verilog_lint``` test exists so that nothing rots this way again: it
 compiles every ```*.v``` on its own with ```-Wall``` and fails on any message.
@@ -615,3 +637,9 @@ compiles every ```*.v``` on its own with ```-Wall``` and fails on any message.
   ```unknown opcode``` for them.  Only ```cpu16.v``` has the second program
   memory port they need.
 * ```variables_to_registers``` is not implemented.
+* ```gpu16_scalar``` is scalar only.  There is no vector unit, no exec mask,
+  no LDS and no matrix unit, and therefore no ```asm32``` and none of section
+  7.4's kernels yet.  Its global loads complete in one cycle, so
+  ```s_waitcnt_g``` is architecturally required but does nothing; there is
+  deliberately no forwarding from a load into the next instruction, so a
+  program that omits the wait does not accidentally work.

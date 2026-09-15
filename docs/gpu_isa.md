@@ -846,6 +846,16 @@ refactor that is dangerous without tests, and the repo already has three
 passing cpu16 CTests to hold it in place.  Fixing `cpu16.v` is derisked work
 that improves the existing machine whether or not the GPU is ever built.
 
+**Done.**  All three defects are gone from `cpu8.v`, `cpu16.v`, `memory.v` and
+`digital_tube.v`, and `gpu16_scalar` in `gpu16.v` is written in the same
+style.  The clean-up needed two things written down that statement order used
+to imply: a forwarding mux, so the instruction after a load still sees the
+loaded value on the edge the load writes it, and `stall_active`, which is
+`stall` after the clear that used to happen part way through a cycle with a
+blocking assignment.  Neither is new behaviour; the whole test suite passed
+with every `.expect` file untouched, which is the derisking the paragraph
+above was counting on.
+
 **An honest measure of the saving.**  What is being reused is on the order of
 forty lines of control logic and a decode table, against a GPU whose novel
 content is the matrix unit, the exec mask, the scratchpad and four-wave
@@ -1784,9 +1794,13 @@ move, and the Efabless situation in particular.
 This is a checklist against the current repo, and the current repo fails most
 of it:
 
-1. **Synthesisable RTL with no simulation-only constructs.**  `cpu16.v` uses
-   `#1` delays inside `always @(posedge clk)` and blocking assignments to
-   sequential state.  Neither survives synthesis.  `gpu16.v` must be written
+1. **Synthesisable RTL with no simulation-only constructs.**  *Done for the
+   CPUs.*  `cpu16.v` used to use `#1` delays inside `always @(posedge clk)`
+   and blocking assignments to sequential state, neither of which survives
+   synthesis; it now has an asynchronous reset and writes all sequential
+   state with non-blocking assignments, as do `cpu8.v`, `memory.v` and
+   `gpu16.v`.  The one `$display` left in each is the `unknown opcode` arm,
+   which synthesis ignores and the test harness greps for.  `gpu16.v` must be written
    with non-blocking assignments to all sequential state, no `#` delays, no
    `initial` blocks for reset state, and no `$display`.
    **Section 6.3's decision 5 escalates this from tier-3 hygiene to tier-2

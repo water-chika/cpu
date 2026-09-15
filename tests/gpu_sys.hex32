@@ -1,0 +1,20 @@
+// gpu16 scalar unit: s_rd_sys (section 4.3), s_addpc, s_sar and s_nop.
+//
+// Launched with wave_id = 2, group_id_x = 5, group_id_y = 11.
+//
+//  PC
+//   0
+1e300000 // s_rd_sys s3, 0     wave_id      = 2
+1e400001 // s_rd_sys s4, 1     group_id_x   = 5
+1e500002 // s_rd_sys s5, 2     group_id_y   = 11
+1e600003 // s_rd_sys s6, 3     num_waves    = 4
+1e700004 // s_rd_sys s7, 4     wave_width   = 16
+1e800005 // s_rd_sys s8, 5     lds_size     = 8192
+13900000 // s_addpc  s9, 0     PC_next 7  + 0  = 7
+13a0fffe // s_addpc  s10, -2   PC_next 8  + -2 = 6
+0cb0fff0 // s_imm    s11, -16
+0cc00002 // s_imm    s12, 2
+16dbc000 // s_sar    s13, s11, s12    -16 >>> 2 = -4
+bf000000 // s_nop
+1ee00009 // s_rd_sys s14, 9    perf_instrs: PC 0..11 have retired = 12
+b3000000 // s_endpgm

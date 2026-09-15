@@ -1,0 +1,37 @@
+// gpu16 scalar unit: section 4.4 control flow, every form the scalar-only
+// core implements.  The two exec-mask branches (0x29, 0x2a) are deliberately
+// absent - there is no exec mask yet.
+//
+// PC is word addressed and the _i forms are relative to PC_next.
+//
+//  PC
+//   0
+0c300005 // s_imm   s3, 5                counter
+0c400000 // s_imm   s4, 0                accumulator
+//   2   <- loop top
+04434000 // s_add   s4, s4, s3
+1a33ffff // s_addi  s3, s3, -1
+2503fffd // s_bnz_i s3, -3               6 + -3 -> 2, five passes, s4 = 15
+26030002 // s_bz_i  s3, +2               6 + 2  -> 8
+0c50dead // s_imm   s5, 0xdead           skipped
+0c60beef // s_imm   s6, 0xbeef           skipped
+//   8
+0c500001 // s_imm   s5, 1
+0c60fff9 // s_imm   s6, -7
+0c70000d // s_imm   s7, 13               a branch target in a register
+23067000 // s_blz   s6, s7               taken, s6 < 0
+0c80dead // s_imm   s8, 0xdead           skipped
+//  13
+0c800002 // s_imm   s8, 2
+24067000 // s_bgz   s6, s7               not taken, s6 < 0
+21067000 // s_bz    s6, s7               not taken, s6 != 0
+0ca00013 // s_imm   s10, 19
+2005a000 // s_bnz   s5, s10              taken, s5 != 0
+0cb0dead // s_imm   s11, 0xdead          skipped
+//  19
+28c00002 // s_call  s12, +2              s12 = 20, 20 + 2 -> 22
+0cd00007 // s_imm   s13, 7               the call returns here
+b3000000 // s_endpgm
+//  22   the "function"
+0cf00042 // s_imm   s15, 0x42
+2200c000 // s_b     s12                  return through the link register
