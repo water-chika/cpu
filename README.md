@@ -306,6 +306,21 @@ Not implemented.  ```cpu8_simd.v``` is a sketch and does not compile:
 its ```memory``` instantiation uses an invalid ```signal[]``` port syntax
 where it needs a ```generate``` loop over the lanes.
 
+## Instruction Set Architecture - 32 Bit Instruction SIMT GPU
+
+Specification only, no verilog and no assembler yet.  See
+[```docs/gpu_isa.md```](docs/gpu_isa.md).
+
+```gpu16``` is a SIMT sibling of cpu16 aimed at tiled integer GEMM: 16 lanes
+per wavefront with a software-managed exec mask, 16 scalar and 16 vector
+registers plus 32 matrix accumulators per lane, an 8 KiB scratchpad with a
+barrier, and an ```mma_i8``` matrix multiply-accumulate that does a 16x16x4
+```int8``` block into ```int32``` accumulators.  The document carries the full
+bit-level encoding in the same style as the cpu16 tables above, a worked
+tiled GEMM kernel with its register-blocking analysis, and a benchmark plan
+with predicted numbers for three tiers - analytical model, RTL simulation
+through this CTest harness, and a real tapeout.
+
 ## Known gaps
 
 * The assembler has no label support, so branch targets are built by hand out
