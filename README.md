@@ -17,10 +17,10 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-If ```hipcc``` is on the system, a GPU backend for the assembler is built as
-well; if it is not, configuring prints ```HIP not found, building without the
-GPU assembler backend``` and everything else builds and tests exactly the
-same.  ROCm is never required.
+If ```hipcc``` is on the system, GPU backends for the assembler and the
+compiler are built as well; if it is not, configuring prints ```HIP not
+found, building without the GPU backends``` and everything else builds and
+tests exactly the same.  ROCm is never required.
 
 Each test assembles a program from source, runs it on the verilog CPU under
 ```iverilog```, and compares the final register values against a checked in
@@ -42,6 +42,19 @@ straight away.
 | cpu16_label | tests/cpu16_label.s | 16 bit assembler resolves a label at address 75 and the CPU branches there |
 | cpu16_adc | tests/cpu16_adc.s | 16 bit CPU carries between bytes through adc and sbb |
 | cpu16_ldp | tests/cpu16_ldp.s | 16 bit CPU rewrites one of its own instructions with st_p and reads it back with ld_p |
+| backends_c16 | generated | the compiler's serial, multi core and GPU backends agree byte for byte, and its text path assembles to exactly the words its binary path emits |
+| c16_arith | tests/c16_arith.c16 | compiled arithmetic and bit operations |
+| c16_control | tests/c16_control.c16 | compiled while, if/else, break and continue |
+| c16_compare | tests/c16_compare.c16 | every comparison operator, as a value rather than only a branch |
+| c16_functions | tests/c16_functions.c16 | calls, parameters, globals and a call nested inside another call's argument |
+| c16_spill | tests/c16_spill.c16 | an expression ten deep, so the value stack spills out of the registers |
+| c16_memory | tests/c16_memory.c16 | peek and poke against the data memory the testbench loads |
+| c16_collatz | tests/c16_collatz.c16 | the longest Collatz chain below 16 - an answer you cannot read off the source |
+
+Each ```c16_*``` simulation test compiles its program down **both** of the
+compiler's output paths, assembles the text one with ```asm16```, and diffs
+the machine words before it simulates anything.  The paths disagreeing is a
+failure even if the program would have run correctly.
 
 To watch a program execute, run the simulation by hand and add ```+trace```:
 
@@ -484,6 +497,48 @@ are the fields the two instructions have left over.
 instruction fetch never has to stand aside.  A store is visible to the fetch
 from the next time that word is fetched, which is what makes a program able to
 rewrite itself; ```tests/cpu16_ldp.s``` does exactly that.
+
+## c16, a small C like compiler
+
+```c16``` compiles a small C like language - ```int``` variables, arithmetic,
+comparisons, ```if```, ```while```, and functions - to cpu16 machine code.
+
+```
+build/c16 --asm  < program.c16                 # readable cpu16 assembly
+build/c16 --hex --sep_with_line < program.c16  # machine words, directly
+```
+
+It has two output paths and they are required to agree byte for byte.  The
+**text path** writes ordinary assembly that this repository's own ```asm16```
+assembles unmodified, for reading and debugging.  The **binary path** goes
+straight to encoded machine words, reusing the assembler's own per item
+encoder out of ```asm_kernel.hpp``` - it never formats a character and never
+lexes one back.  Skipping the text is worth **2.9x** on the whole job, and
+most of that saving is the re-lexing rather than the formatting.
+
+Both paths have serial, multi core and HIP backends, built from one shared
+device-safe kernel header so that they cannot disagree.  They are measured
+separately:
+
+| path | backend | time | lines/s | speedup |
+| --- | --- | --- | --- | --- |
+| text | serial | 301 ms | 2.06 M | 1.00x |
+| text | threads | 83.2 ms | 7.45 M | 3.62x |
+| text | hip | 95.3 ms | 6.51 M | 3.16x |
+| binary | serial | 240 ms | 2.59 M | 1.00x |
+| binary | threads | 64.3 ms | 9.65 M | 3.73x |
+| binary | hip | 66.1 ms | 9.38 M | 3.62x |
+
+15.41 MiB of generated source, 620008 lines, on 24 cores and a Radeon RX 9070
+XT.  Parallelism breaks even at about 0.39 MiB of source; below that it is a
+straight loss, and since a real cpu16 program is at most a few hundred lines,
+**the serial backend is the right one for every program the hardware can
+actually run.**  The GPU ties with 24 cores on the binary path and loses on
+the text path.  ```cmake --build build --target benchc``` reproduces the
+table; ```build/c16_bench --sweep``` reproduces the break even.
+
+The language, its grammar, its limits, the register and call model and the
+full benchmark are in [```docs/c16.md```](docs/c16.md).
 
 ## Instruction Set Architecture - 8 Bit Instruction/Register SIMD32
 
