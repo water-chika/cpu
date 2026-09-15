@@ -62,6 +62,8 @@ target_link_libraries(asm_bench PRIVATE asm_core)
 add_executable(c16 c16.cpp)
 target_link_libraries(c16 PRIVATE c16_core)
 
+add_executable(c16_bench c16_bench.cpp)
+target_link_libraries(c16_bench PRIVATE c16_core)
 
 add_executable(variables_to_registers variables_to_registers.cpp)
 target_compile_features(variables_to_registers PUBLIC cxx_std_20)
@@ -81,6 +83,16 @@ add_custom_target(bench8
     DEPENDS asm_bench
     USES_TERMINAL
     COMMENT "benchmarking the cpu8 assembler across every available backend")
+
+# And the same for the compiler, which reports both of its output paths:
+#
+#   cmake --build build --target benchc
+#
+add_custom_target(benchc
+    COMMAND $<TARGET_FILE:c16_bench> --functions 20000 --body 24 --repeat 5
+    DEPENDS c16_bench
+    USES_TERMINAL
+    COMMENT "benchmarking the c16 compiler across every available backend")
 
 # Simulation tests.  Each one assembles a program with the assembler built
 # above, runs it on the verilog CPU under iverilog, and compares the final
@@ -106,6 +118,15 @@ foreach(isa 8 16)
                              PROPERTIES FAIL_REGULAR_EXPRESSION "TEST FAIL")
     endforeach()
 endforeach()
+
+# The compiler has the same obligation twice over: every backend of a path
+# has to agree byte for byte, and the two paths have to agree with each
+# other - the assembly the text path writes must assemble, with this
+# repository's own asm16, to exactly the words the binary path emitted
+# without ever formatting any text.  c16_bench --check proves both on a
+# program far larger than any that fits on the real cpu16.
+add_test(NAME backends_c16 COMMAND c16_bench --functions 4000 --body 24 --repeat 1 --check)
+set_tests_properties(backends_c16 PROPERTIES FAIL_REGULAR_EXPRESSION "TEST FAIL")
 
 if(IVERILOG_EXECUTABLE AND VVP_EXECUTABLE)
     function(add_cpu_test name assembler testbench program data expect cycles)
