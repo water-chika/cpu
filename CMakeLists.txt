@@ -256,6 +256,21 @@ if(IVERILOG_EXECUTABLE AND VVP_EXECUTABLE)
     add_gpu_test(gpu_mem    tests/gpu_mem.s
                  tests/gpu_mem.data32 gpu_mem.expect 200)
 
+    # The vector unit.  These pass a second expectation file, +vexpect, which
+    # holds all 256 VGPRs - sixteen lanes of v0, then sixteen lanes of v1, and
+    # so on - so a pass is a statement about every lane and not just about the
+    # wave as a whole.  gpu_exec.s is the one that matters most: it is written
+    # so that lane 0 is right whether or not the exec mask is obeyed, which is
+    # exactly the bug a sixteen lane machine tested like a scalar one keeps.
+    add_gpu_test(gpu_vector    tests/gpu_vector.s    - gpu_vector.expect    200
+                 +vexpect=${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_vector.vexpect)
+    add_gpu_test(gpu_lane      tests/gpu_lane.s      - gpu_lane.expect      200
+                 +vexpect=${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_lane.vexpect)
+    add_gpu_test(gpu_divergent tests/gpu_divergent.s - gpu_divergent.expect 300
+                 +vexpect=${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_divergent.vexpect)
+    add_gpu_test(gpu_exec      tests/gpu_exec.s      - gpu_exec.expect      200
+                 +vexpect=${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_exec.vexpect)
+
     # What the five tests above cannot reach.  gpu16.v is the scalar unit, so
     # simulation covers about a third of the ISA; the vector ALU, the matrix
     # unit, LDS and the exec mask are pinned by their encodings instead, which
