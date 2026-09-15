@@ -1,17 +1,17 @@
-module memory(
+module memory #(
+   parameter DATA_WIDTH = 8,
+   parameter ADDR_WIDTH = 8,
+   parameter RAM_DEPTH = 1 << ADDR_WIDTH
+) (
    input clk,
    input write_enable,
    input enable,
-   input [7:0] address,
-   input [7:0] in_data,
-   output reg [7:0] out_data
+   input [ADDR_WIDTH-1:0] address,
+   input [DATA_WIDTH-1:0] in_data,
+   output reg [DATA_WIDTH-1:0] out_data
 );
 
-parameter DATA_WIDTH = 8;
-parameter ADDR_WIDTH = 8;
-parameter RAM_DEPTH = 1 << ADDR_WIDTH;
-
-reg [DATA_WIDTH-1:0] mem[RAM_DEPTH-1:0];
+reg [DATA_WIDTH-1:0] mem[0:RAM_DEPTH-1];
 
 always @(posedge clk) begin
     if (enable) begin

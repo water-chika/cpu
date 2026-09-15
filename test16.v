@@ -1,18 +1,16 @@
-`include "cpu8.v"
+`include "cpu16.v"
 
-// Self checking testbench for the 8 bit instruction / 8 bit data CPU.
+// Self checking testbench for the 16 bit instruction / 8 bit data CPU.
 //
-// It is driven entirely from plusargs so that one testbench can run every
-// program under tests/:
+// Same plusarg interface as test.v:
 //
-//   vvp sim +program=<hex file> +expect=<hex file> [+data=<hex file>]
-//            [+cycles=<n>] [+trace]
+//   vvp sim16 +program=<hex file> +expect=<hex file> [+data=<hex file>]
+//             [+cycles=<n>] [+trace]
 //
-// The expect file holds the 8 expected register values (r0 first) as hex
-// bytes; a value of "xx" means "do not care".  The simulation prints exactly
-// one "TEST PASS" or "TEST FAIL" line, so a regression can never pass
-// silently.
-module test();
+// The program file holds 16 bit instructions as 4 digit hex words, the data
+// file holds 8 bit bytes, and the expect file holds the 8 expected register
+// values (r0 first) as hex bytes, where "xx" means "do not care".
+module test16();
 
 reg clk;
 integer i;
@@ -27,7 +25,7 @@ reg [1023:0] data_file;
 reg [1023:0] expect_file;
 reg [7:0] expected[0:7];
 
-cpu_inst8_data8 U0(.clk(clk));
+cpu_inst16_data8 U0(.clk(clk));
 
 initial begin
     errors = 0;
@@ -73,8 +71,8 @@ initial begin
     $readmemh(expect_file, expected);
 
     if ($test$plusargs("trace")) begin
-        $monitor("%g\tstall=%b, condition=%b, inst=%8b, reg0=%8b, reg1=%8b, reg2=%8b, reg3=%8b, reg4=%8b, reg5=%8b, reg6=%8b, reg7=%8b, IP=%8b",
-            $time, U0.stall, U0.condition, U0.Inst, U0.registers[0], U0.registers[1], U0.registers[2], U0.registers[3],
+        $monitor("%g\tstall=%b, inst=%16b, reg0=%8b, reg1=%8b, reg2=%8b, reg3=%8b, reg4=%8b, reg5=%8b, reg6=%8b, reg7=%8b, IP=%8b",
+            $time, U0.stall, U0.Inst, U0.registers[0], U0.registers[1], U0.registers[2], U0.registers[3],
             U0.registers[4], U0.registers[5], U0.registers[6], U0.registers[7], U0.IP);
     end
 

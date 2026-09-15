@@ -56,13 +56,13 @@ initial begin
     data_write_enable = 1'b0;
 end
 
-wire [INST_WIDTH:0] Inst;
+wire [INST_WIDTH-1:0] Inst;
 
 assign program_address = IP;
 assign program_read_enable = 1'b1;
 assign program_write_enable = 1'b0;
-assign program_in_data = 8'b00000000;
-assign Inst = stall ? 8'b00000000 : program_out_data;
+assign program_in_data = {INST_WIDTH{1'b0}};
+assign Inst = stall ? {INST_WIDTH{1'b0}} : program_out_data;
 
 reg [7:0] registers[7:0];
 
@@ -73,17 +73,38 @@ initial begin:INIT_REGS
     end
 end
 
-assign opcode = Inst[15:15-(7-1)];
+// Instruction layout:
+//
+//   |f e d c b a 9|8 7 6|5 4 3|2 1 0|
+//   |   Opcode    | Arg0| Arg1| Arg2|
+//
+// For the data process instructions Arg0 is src0, Arg1 is src1 and Arg2 is dst.
+// The immediate and shift instructions reinterpret Arg0/Arg1 as an immediate
+// value and a shift amount; see README.md.
+wire [6:0] opcode;
+wire [2:0] src0;
+wire [2:0] src1;
+wire [2:0] dst;
+wire [2:0] imm3;
+wire [2:0] imm_shift;
+wire [7:0] imm;
+wire [2:0] shift_imm;
+
+assign opcode = Inst[15:9];
 assign src0 = Inst[8:6];
 assign src1 = Inst[5:3];
 assign dst = Inst[2:0];
-assign imm4 = Inst[6:3];
-assign imm_shift = Inst[8:7];
-wire [7:0] imm;
-assign imm = imm4 << imm_shift;
+assign imm3 = Inst[8:6];
+assign imm_shift = Inst[5:3];
+assign imm = {5'b0, imm3} << imm_shift;
 assign shift_imm = Inst[5:3];
 
 reg [2:0] data_dst;
+
+initial begin
+    data_dst = 0;
+    data_read_enable = 1'b0;
+end
 
 always @(posedge clk) begin
 
@@ -118,14 +139,21 @@ always @(posedge clk) begin
         2: registers[dst] <= ~registers[src0];
         3: registers[dst] <= registers[src0] ^ registers[src1];
         4: registers[dst] <= registers[src0] + registers[src1];
-        5: registers[dst] <= registers[src0] - registers[src1];
-        6: registers[dst] <= -registers[src0];
-        7: registers[dst] <= registers[src0] * registers[src1];
-        8: registers[dst] <= registers[src0] / registers[src1];
-        9: registers[dst] <= registers[src0];
-        10: registers[dst] <= imm;
-        11: registers[dst] <= registers[src0] << shift_imm;
-        12: registers[dst] <= registers[src0] >> shift_imm;
+        6: registers[dst] <= registers[src0] - registers[src1];
+        8: registers[dst] <= -registers[src0];
+        9: registers[dst] <= registers[src0] * registers[src1];
+        10: registers[dst] <= registers[src0] / registers[src1];
+        11: registers[dst] <= registers[src0];
+        12: registers[dst] <= imm;
+        13: registers[dst] <= registers[dst] | imm;
+        14: registers[dst] <= registers[src0] << shift_imm;
+        15: registers[dst] <= registers[src0] >> shift_imm;
+        16: registers[dst] <= (registers[src0] << shift_imm)
+                            | (registers[src0] >> (8 - shift_imm));
+        17: registers[dst] <= (registers[src0] >> shift_imm)
+                            | (registers[src0] << (8 - shift_imm));
+        18: registers[dst] <= $signed(registers[src0]) >>> shift_imm;
+        19: registers[dst] <= IP + imm;
 
         32:
             if (registers[src0] != 0) begin
@@ -143,12 +171,12 @@ always @(posedge clk) begin
             stall = 1'b1;
             end
         35:
-            if (registers[src0] < 0) begin
+            if ($signed(registers[src0]) < 0) begin
                 IP = registers[src1];
                 stall = 1'b1;
             end
         36:
-            if (registers[src0] > 0) begin
+            if ($signed(registers[src0]) > 0) begin
                 IP = registers[src1];
                 stall = 1'b1;
             end

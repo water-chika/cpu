@@ -6,6 +6,47 @@ The repo contains an ISA definition and a verilog implementation.
 
 It is simulated and tested  with ```iverilog``` simulator.
 
+## Building and testing
+
+The assemblers are built with CMake, and the simulation tests are driven by
+CTest:
+
+```
+cmake -S . -B build
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+Each test assembles a program from source, runs it on the verilog CPU under
+```iverilog```, and compares the final register values against a checked in
+```tests/*.expect``` file (```xx``` means "do not care").  A test fails if the
+assembler rejects the program, if the CPU decodes an unknown opcode because
+the program ran off its end, or if any register holds an unexpected value.
+Nothing is generated ahead of time, so a fresh clone can run the tests
+straight away.
+
+| Test | Program | Checks |
+|------|---------|--------|
+| cpu8_sum | tests/cpu8_sum.s | 8 bit CPU sums 1..8 out of data memory into r2 |
+| cpu16_sum | tests/cpu16_sum.s | 16 bit CPU sums 1..8 out of data memory into r2 |
+| cpu16_count | cpu16_asm/test.s | 16 bit CPU counts to 4 and branches |
+
+To watch a program execute, run the simulation by hand and add ```+trace```:
+
+```
+./build/asm16 --hex --sep_with_line < tests/cpu16_sum.s > /tmp/program.list
+iverilog -I . -o /tmp/sim16 test16.v
+vvp /tmp/sim16 +program=/tmp/program.list +data=tests/sum.data \
+    +expect=tests/cpu16_sum.expect +cycles=300 +trace
+```
+
+```+program_words=<n>``` and ```+data_words=<n>``` are optional and only stop
+```$readmemh``` warning that the file is shorter than the whole memory.
+
+Since the assembler has no label support yet, every program has to end by
+branching to its own address to halt, and that address has to be built by
+hand out of an immediate and a shift.
+
 ## Instruction Set Architecture - 8 Bit
 
 Instruction is 8 bit width.
@@ -152,34 +193,37 @@ bl
 
 ## Instruction Set Architecture - 16 Bit Instruction & 8 Bit Registers
 
-Instruction is 16 bit width.
+Instruction is 16 bit width.  Every instruction has the same shape: a 7 bit
+opcode and three 3 bit argument fields.
 
 ```
-|f e d c b a 9 8 7 6 5 4 3 2 1 0|
-| Opcode      | Src0| Src1| Dst |
-
-Src0 op Src1 -> Dst
-
-|f e d c b a 9 8 7 6 5 4 3 2 1 0|
-| Opcode      | Op0 | Src1| Dst |
-
-op Src -> Dst
-
-|f e d c b a 9 8 7 6 5 4 3 2 1 0|
-| Opcode      | Op0 | Op1 | Dst |
-
-op result-> Dst
-
-|f e d c b a 9 8 7 6 5 4 3 2 1 0|
-| Opcode      | Op0 | Src1| Op2 |
-
-op Src
-
-|f e d c b a 9 8 7 6 5 4 3 2 1 0|
-| Opcode      | Src0| Src1| Op2 |
-
-op(Src0,Src1)
+|f e d c b a 9|8 7 6|5 4 3|2 1 0|
+|   Opcode    | Arg0| Arg1| Arg2|
 ```
+
+The assembler always takes all three arguments, so a source line is always
+```<op> <arg0> <arg1> <arg2>```.  What the fields mean depends on the
+instruction:
+
+| Instructions | Arg0 | Arg1 | Arg2 |
+|--------------|------|------|------|
+| and or xor add sub mul div | src0 | src1 | dst |
+| not neg mov  | src0 | unused | dst |
+| shl shr srl srr sar | src0 | shift amount | dst |
+| imm imm_s add_ip | immediate | shift amount | dst |
+| bnz bz blz bgz | register compared with zero | register holding the branch target | unused |
+| b            | unused | register holding the branch target | unused |
+| ld ld_p      | unused | register holding the address | dst |
+| st st_p cl swap | src0 | register holding the address | dst |
+
+The immediate is only 3 bits wide, so ```imm``` loads ```arg0 << arg1``` and
+```imm_s``` ors ```arg0 << arg1``` into the destination register.  Any 8 bit
+constant is built from an ```imm``` followed by as many ```imm_s``` as it
+needs, for example 12 is ```imm 1 3 r7``` then ```imm_s 4 0 r7```.
+
+Lines starting with ```#``` are comments, and blank lines are ignored.  An
+unknown opcode, a bad argument or an argument that does not fit in 3 bits is
+a hard error rather than something silently encoded.
 
 There are 8 registers that is 8 bit width.
 
@@ -249,6 +293,23 @@ Instruction field arg encodes register containing memory address.
 | ld_p|   68   | load from program memory |
 | st_p|   69   | store to program memory  |
 
+#### Not implemented in cpu16.v yet
+
+```adc``` and ```sbb``` need a carry flag, which the ISA does not define a
+place for yet, and ```ld_p```/```st_p``` need a second port on the program
+memory.  The assembler will happily encode all four, but the CPU reports
+```unknown opcode``` when it decodes one, which fails the tests.
+
 ## Instruction Set Architecture - 8 Bit Instruction/Register SIMD32
 
-Not implemeted
+Not implemented.  ```cpu8_simd.v``` is a sketch and does not compile:
+its ```memory``` instantiation uses an invalid ```signal[]``` port syntax
+where it needs a ```generate``` loop over the lanes.
+
+## Known gaps
+
+* The assembler has no label support, so branch targets are built by hand out
+  of an immediate and a shift.
+* ```memory_ramb18e1.v``` does not compile: it redeclares every port.
+* ```cpu8_asm/sum.s``` sums 32 words but ```data.list``` only holds 14, so it
+  reads uninitialised memory.  ```tests/cpu8_sum.s``` is the fixed version.

@@ -1,8 +1,10 @@
 #include <iostream>
+#include <sstream>
 #include <unordered_map>
 #include <cstdint>
 #include <format>
 #include <string>
+#include <vector>
 
 auto opcodes = std::unordered_map<std::string, uint8_t>{
     {"and", 0},
@@ -53,13 +55,24 @@ auto args = std::unordered_map<std::string, uint8_t>{
     {"b", 1},
 };
 
-uint8_t parse_arg(const std::string& str) {
+int parse_arg(const std::string& str) {
     if (args.contains(str)) {
         return args[str];
     }
     else {
         return stoi(str);
     }
+}
+
+// Strip a '#' comment and return the remaining tokens of one source line.
+std::vector<std::string> tokenize(const std::string& line) {
+    auto code = line.substr(0, line.find('#'));
+    auto stream = std::istringstream{code};
+    auto tokens = std::vector<std::string>{};
+    for (std::string token; stream >> token; ) {
+        tokens.push_back(token);
+    }
+    return tokens;
 }
 
 int main(int argc, const char* argv[]) {
@@ -86,17 +99,41 @@ int main(int argc, const char* argv[]) {
             return 0;
         }
     }
-    while (true) {
-        std::string opcode, arg;
-        std::cin >> opcode >> arg;
-        if (!std::cin.good()) {
-           break;
+    int line_number = 0;
+    for (std::string line; std::getline(std::cin, line); ) {
+        line_number++;
+        auto tokens = tokenize(line);
+        if (tokens.empty()) {
+            continue;
+        }
+        if (tokens.size() != 2) {
+            std::cerr << std::format("asm: line {}: expected '<op> <arg>', got {} token(s)\n",
+                                     line_number, tokens.size());
+            return 1;
+        }
+        const auto& opcode = tokens[0];
+        const auto& arg = tokens[1];
+        if (!opcodes.contains(opcode)) {
+            std::cerr << std::format("asm: line {}: unknown opcode '{}'\n", line_number, opcode);
+            return 1;
         }
         if (enable_debug) {
             std::cerr << opcode << ',' << arg << std::endl;
         }
         uint8_t opcode_b = opcodes[opcode];
-        uint8_t arg_b = parse_arg(arg);
+        int arg_b;
+        try {
+            arg_b = parse_arg(arg);
+        }
+        catch (const std::exception&) {
+            std::cerr << std::format("asm: line {}: unknown argument '{}'\n", line_number, arg);
+            return 1;
+        }
+        if (arg_b < 0 || arg_b > 7) {
+            std::cerr << std::format("asm: line {}: argument '{}' does not fit in 3 bits\n",
+                                     line_number, arg);
+            return 1;
+        }
         uint8_t code = (opcode_b << 3) | arg_b;
         if (enable_debug) {
             std::cerr << (int)opcode_b << ',' << (int)arg_b << std::endl;

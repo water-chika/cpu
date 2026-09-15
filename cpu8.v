@@ -55,7 +55,7 @@ initial begin
     data_write_enable = 1'b0;
 end
 
-wire [INST_WIDTH:0] Inst;
+wire [INST_WIDTH-1:0] Inst;
 
 assign program_address = IP;
 assign program_read_enable = 1'b1;
@@ -96,6 +96,7 @@ reg [2:0] data_dst;
 initial begin
     data_dst = 0;
     src1 = 0;
+    data_read_enable = 1'b0;
 end
 
 always @(posedge clk) begin

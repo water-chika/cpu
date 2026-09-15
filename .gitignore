@@ -1,0 +1,13 @@
+# build output
+build/
+a.out
+*.o
+
+# simulator products
+sim
+sim16
+*.vvp
+*.vcd
+
+# assembler output
+test.list
