@@ -321,6 +321,13 @@ tiled GEMM kernel with its register-blocking analysis, and a benchmark plan
 with predicted numbers for three tiers - analytical model, RTL simulation
 through this CTest harness, and a real tapeout.
 
+Revision 2 fixes ```B``` pre-transposed as a precondition, settles the
+wavefront at 16 lanes for the first implementation, adds the wide
+```v_ld16_g```/```v_st16_g``` accesses with a correctness test and an A/B
+benchmark control, confirms 32 accumulators per lane, and promotes the
+accumulator file's 16-lane 32-bit read-modify-write to a stated architectural
+requirement.  Two questions are still open for review.
+
 ## Known gaps
 
 * The assembler has no label support, so branch targets are built by hand out

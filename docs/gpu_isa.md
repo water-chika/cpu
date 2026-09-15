@@ -673,7 +673,7 @@ a 32-entry VGPR file in a second revision.
 | `mma_i8 A1, v1, v3` | 0x70 | 1 | 1 | 3 | 0 | 0x00 | `70113000` |
 | `mma_i8 A0, v1, v3` | 0x70 | 0 | 1 | 3 | 0 | 0x00 | `70013000` |
 | `s_imm s9, 32` | 0x10 | 9 | 0 | imm16 = 0x0020 | | | `10900020` |
-| `v_ld4_l v1, v7, s9, 12` | 0xa1 | 1 | 7 | 9 | 0 | 0x0c | `a179000c` |
+| `v_ld4_l v1, v7, s9, 12` | 0xa1 | 1 | 7 | 9 | 0 | 0x0c | `a117900c` |
 | `v_ld16_g v12, v9, s1, 0` | 0x86 | 12 | 9 | 1 | 0 | 0x00 | `86c91000` |
 | `v_st16_g v4, v8, s2, 0` | 0x87 | 4 | 8 | 2 | 0 | 0x00 | `87482000` |
 | `v_add_s v13, v13, s6` | 0x4f | 13 | 13 | 6 | 0 | 0x00 | `4fdd6000` |
@@ -1121,8 +1121,8 @@ Where it runs out of road, in the order the limits bite:
 
 Prologue and epilogue are the reason utilisation falls off at small sizes:
 the 32 `acc_rd` + `v_st4_g` pairs per wave are a fixed 384 issue slots per
-workgroup regardless of `K`, which is 5% of a `K = 256` run and 17% of a
-`K = 64` run - and, per section 5.3, they are the one part of the kernel
+workgroup regardless of `K`, which is 4% of a `K = 256` run's cycles and 14%
+of a `K = 64` run's - and, per section 5.3, they are the one part of the kernel
 `v_st16_g` cannot help, because the accumulator layout is transposed relative
 to what a wide store wants.
 
