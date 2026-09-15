@@ -242,6 +242,32 @@ if(IVERILOG_EXECUTABLE AND VVP_EXECUTABLE)
     add_gpu_test(gpu_mem    tests/gpu_mem.s
                  tests/gpu_mem.data32 gpu_mem.expect 200)
 
+    # What the five tests above cannot reach.  gpu16.v is the scalar unit, so
+    # simulation covers about a third of the ISA; the vector ALU, the matrix
+    # unit, LDS and the exec mask are pinned by their encodings instead, which
+    # needs no hardware at all.  The expectation file is derived from section
+    # 4.2's field table and section 4.3 to 4.10's opcodes, and ends with
+    # section 4.11's twelve worked encodings copied out of the prose.
+    add_test(
+        NAME gpu_encoding
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_encoding_test.sh
+                $<TARGET_FILE:asm_gpu16>
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_encoding.s
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_encoding.expect32
+    )
+    set_tests_properties(gpu_encoding PROPERTIES FAIL_REGULAR_EXPRESSION "TEST FAIL")
+
+    # An assembler that accepts nonsense is worse than one that is missing,
+    # because the output is not something anyone reads back.  These are the
+    # rules sections 4.1 to 4.10 state that no hardware enforces.
+    add_test(
+        NAME gpu_reject
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_reject_test.sh
+                $<TARGET_FILE:asm_gpu16>
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_reject.cases
+    )
+    set_tests_properties(gpu_reject PROPERTIES FAIL_REGULAR_EXPRESSION "TEST FAIL")
+
     # The compiler's tests go one step further than the assembler's: they
     # compile the program down both output paths, diff the machine words, and
     # only then simulate.  A disagreement between the paths is a failure even

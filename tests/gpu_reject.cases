@@ -1,0 +1,50 @@
+# Programs asm_gpu16 has to refuse, and why.  Tab separated: source, then a
+# substring the diagnostic must contain.
+#
+# Section 8.5 observes that bit 4 of every register field is always written
+# zero and says the assembler is what checks it; these are that check, plus
+# the other rules sections 4.1 to 4.10 state but no hardware enforces.
+
+# There are sixteen registers in each file, not thirty two.
+s_add s16, s1, s2	register 's16' does not exist
+v_mov v1, v16	register 'v16' does not exist
+
+# The register files are not interchangeable.  Section 4.2 fixes which file
+# each field names, so an SGPR in a VGPR slot is an error and not a different
+# instruction.
+s_add s1, v2, s3	not the kind of operand that goes there
+v_add v1, s2, v3	not the kind of operand that goes there
+v_mov_s v1, v2	not the kind of operand that goes there
+v_writelane v1, v2, 0	not the kind of operand that goes there
+
+# Section 4.8: v_ld16_g and v_st16_g name a quad, so v0, v4, v8 or v12.
+v_ld16_g v5, v1, s2, 0	does not start a VGPR quad
+v_st16_g v13, v1, s2, 0	does not start a VGPR quad
+
+# The immediate is sixteen bits and the Mod field is eight.
+s_imm s1, 100000	does not fit in 16 bits
+s_imm s1, -40000	does not fit in 16 bits
+s_ld_g s1, s2, 256	out of range
+s_waitcnt_g 256	out of range
+
+# Mod also carries shifts, lane numbers and accumulator indices, each with a
+# range of its own that is narrower than the field.
+s_shli s1, s2, 32	out of range
+v_readlane s1, v2, 16	out of range
+acc_rd v1, 32	out of range
+s_rd_sys s1, 16	out of range
+s_rd_sys s1, 6	out of range
+
+# The operand count is per instruction, from zero to four.
+s_add s1, s2	takes 3 operand(s)
+s_add s1, s2, s3, s4	takes 3 operand(s)
+s_endpgm s1	takes 0 operand(s)
+v_mad v1, v2, v3	takes 4 operand(s)
+
+# A label is an address.  It stands in for the immediate of the instructions
+# that branch or take one, and nowhere else.
+s_addi s1, s2, some_label	does not take a label there
+s_b_i nowhere	unknown label 'nowhere'
+
+# And an instruction that does not exist is not silently skipped.
+s_frobnicate s1, s2	unknown opcode
