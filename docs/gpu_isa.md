@@ -824,7 +824,8 @@ neither, because a 32-bit scalar unit running GEMM has no multi-word
 arithmetic (section 4.3).  Alignment means the numbers never disagree, not
 that both machines implement the same set.
 
-**What cannot align, and why.**  cpu16's memory operations are opcodes 64-67,
+**What cannot align, and why.**  cpu16's memory operations are opcodes 64-69
+(`ld`, `st`, `st` zero, read-modify-write, and now `ld_p`/`st_p`),
 which in gpu16 is the middle of the vector ALU block.  There is no way to
 reconcile this and no reason to try: gpu16 has to distinguish scalar from
 vector and global from LDS, and cpu16 has no concept of either distinction.
@@ -1328,7 +1329,7 @@ should add a transposing *fill* helper rather than change the kernel.
 | Dynamic / ragged tile handling (`M`, `N`, `K` not multiples of the tile) | The `exec` mask plus `v_cmp_*` can do it, but the kernel would roughly double in length.  Padding the matrices host-side is the intended answer. |
 | A DMA engine for global-to-LDS staging | A real accelerator would have one and it would remove 24 of the 81 instructions in the main loop.  It is a memory-system feature, not an ISA feature, and can be added later as one instruction. |
 | Instruction cache, virtual memory, exceptions, traps, multi-CU dispatch | All out of scope for a machine that is one compute unit with a 64 Ki-word program memory. |
-| `ld_p` / `st_p` (cpu16 has them) | Self-modifying code needs a second program memory port; four resident waves make it meaningless. |
+| `ld_p` / `st_p` (cpu16 implements them, on a real second program-memory port) | The port is the cheap part; the problem is that four resident waves share one program memory, so a wave rewriting an instruction would be rewriting it underneath three others. Self-modifying code needs either a private program memory per wave or a defined flush, and neither is worth it here. This is a case where the sibling ISA gained a feature gpu16 still declines. |
 | ~~Wider vector loads~~ | **No longer omitted.**  `v_ld16_g` / `v_st16_g` were added at 0x86 / 0x87 (section 4.8) after the first draft showed the memory-bound kernel was *issue*-bound rather than port-bound.  They cost one bit of opcode space and a 4-alignment rule on one register field, and they buy 1.8x on `axpy` and 19 instructions per GEMM loop iteration. |
 | 16-byte **LDS** accesses (`v_ld16_l`) | 256 B out of a 16-way banked scratchpad is four bank cycles however it is issued, so this saves issue slots and buys no bandwidth, and it fights the 36-byte-stride conflict-free addressing of section 3.2. |
 | A `v_ld16_g` with a non-aligned destination register | Allowing any `Arg0` would need a 4-way rotate on the VGPR write port for no benefit; the assembler rejects it instead. |
@@ -1798,13 +1799,16 @@ of it:
    synchronous active-low reset that initialises `PC`, `exec`, the wave
    scoreboard and nothing else; register files and memories come up
    undefined and must be written before being read.  The `initial` loops that
-   zero the register file in `cpu16.v` and `cpu8_simd.v` have to become reset
-   logic or be deleted.
+   zero the register file in `cpu16.v` have to become reset logic or be
+   deleted.  (`cpu8_simd.v` carried the same problem and has since been
+   deleted from the repo outright, which is the cheaper fix where it applies.)
 3. **Memories as macros or as flops, explicitly.**  `memory.v` infers a RAM,
    which is fine for FPGA and wrong for ASIC.  Each memory must be either an
    instantiated SRAM macro (`sky130_sram_1rw1r_32x256_8`, 1 KiB, ~0.12 mm2
-   each) or an explicit flop array, chosen per memory by size.
-   `memory_ramb18e1.v` is Xilinx-specific and must not be in the ASIC build.
+   each) or an explicit flop array, chosen per memory by size.  The repo's
+   Xilinx-specific `memory_ramb18e1.v` wrapper has since been deleted, which
+   removes the risk of it reaching an ASIC build by accident but also removes
+   the FPGA path noted below.
 4. **Test data on and off chip through a very limited pin count.**  This is
    the hard constraint and it dominates tier 3 performance.
 5. **No combinational loops, no latches, no multiply/divide inference that
@@ -1919,8 +1923,11 @@ gap is the single most useful thing tier 3 will teach this project.
 
 #### Optional intermediate: FPGA validation
 
-`memory_ramb18e1.v` already implies a Xilinx 7-series target, so an
-Artix-7 board (Arty A7-100T, ~$270) is the natural intermediate step.
+The repo used to carry a `memory_ramb18e1.v` wrapper around a Xilinx block
+RAM primitive, which implied a 7-series target; it has since been deleted, so
+this step now starts from inferred memories rather than from existing code.
+An Artix-7 board (Arty A7-100T, ~$270) remains the natural intermediate
+step.
 `gpu16-full` needs 64 int8 MACs (32 DSP48E1 slices packing two int8 MACs
 each, of 240 available), 8 KiB of LDS as 8 BRAM18 in 16 banks, and the
 register files in distributed RAM.  100 MHz is comfortable, and the board's
