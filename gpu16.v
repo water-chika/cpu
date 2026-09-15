@@ -1,6 +1,7 @@
 `include "memory.v"
+`include "gpu16_vector.v"
 
-// gpu16's scalar unit.
+// gpu16: one wave of the machine in docs/gpu_isa.md.
 //
 // docs/gpu_isa.md section 6.3 decision 5 settles that this is a widened
 // cpu16.v rather than a new core, and section 4.13 writes out what "widened"
@@ -19,19 +20,29 @@
 // deliberately keeps identical wherever the two machines share an operation.
 // The branch block really is cpu16's decimal 32-36 as gpu16's 0x20-0x24.
 //
-// SCOPE.  This is the scalar unit only: sections 4.3 (scalar ALU), 4.4
-// (scalar control flow, minus the two exec-mask branches) and the three wave
-// control opcodes from 4.10 that a scalar program cannot do without, plus
-// s_ld_g from 4.8 because it is the only scalar memory instruction and it is
-// what the 24 bit data address exists for.  There is no vector unit, no exec
-// mask, no LDS and no matrix unit, so every opcode belonging to those falls
+// SCOPE.  Sections 4.3 (scalar ALU), 4.4 (scalar control flow, including the
+// two exec-mask branches), 4.5 (exec mask control), 4.6 (vector ALU, in
+// gpu16_vector.v) and the three wave control opcodes from 4.10 that a
+// program cannot do without, plus s_ld_g from 4.8 because it is the only
+// scalar memory instruction and it is what the 24 bit data address exists
+// for.  There is still no LDS (4.9), no matrix unit (4.7) and no per lane
+// memory access (the rest of 4.8), so every opcode belonging to those falls
 // through to the `unknown opcode` arm.  Nothing here guesses at their
 // behaviour.
+//
+// SIMT, in one always block.  Section 1.1 gives the wave one PC, one fetch
+// and one decode driving sixteen copies of the datapath, so the vector unit
+// below is an instance, not a second core: it is handed the same instruction
+// word this block decoded, in the same cycle, and the only feedback is the
+// lane mask a v_cmp_* writes and the one lane value v_readlane reads.
+// Divergence is entirely software managed (section 1.3) - there is no
+// reconvergence stack and no per-lane PC anywhere in this file, and the only
+// way exec ever changes is an instruction from section 4.5 changing it.
 //
 // STYLE.  Same rules as the post clean-up cpu16.v: no delays, every
 // sequential register written with a non blocking assignment from one clocked
 // block, and an asynchronous reset.
-module gpu16_scalar #(
+module gpu16 #(
     // The architectural program counter is 16 bits wide.  PROGRAM_ADDR_WIDTH
     // is how much of that this instance actually decodes; a simulation does
     // not want a 64 Ki word array it will never touch.
@@ -117,6 +128,38 @@ wire [31:0] dst_value = registers[arg0];
 wire [31:0] src0_value = registers[arg1];
 wire [31:0] src1_value = registers[arg2];
 
+// ---------------------------------------------------------------- exec mask
+//
+// Section 1.2: one 16 bit register, bit l enabling lane l, 0xFFFF at launch.
+// It is a wave register and not a lane register, so it lives here beside the
+// PC rather than in the vector unit, and section 4.5's six instructions are
+// decoded here for the same reason.  Section 2.1 says a mask occupies bits
+// [15:0] of an SGPR and that mask producing instructions zero bits [31:16],
+// which is why every read of it below is zero extended rather than merged.
+
+reg [15:0] exec;
+
+wire [15:0] cmp_mask;
+wire [31:0] readlane_value;
+
+gpu16_vector #(
+    .WAVE_WIDTH(WAVE_WIDTH)
+) vector (
+    .clk(clk),
+    .reset(reset),
+    .issue(issue),
+    .inst(Inst),
+    .exec(exec),
+    // s[Arg1] and s[Arg2].  The vector unit has no port on this register
+    // file, so the two scalar operands a vector instruction may name are
+    // read here and passed down.
+    .s_src0(src0_value),
+    .s_src1(src1_value),
+    .imm(imm),
+    .cmp_mask(cmp_mask),
+    .readlane_value(readlane_value)
+);
+
 // The instruction after this one.  Section 4.3 and 4.4 define s_addpc,
 // s_call and every `_i` branch against it, and the PC is word addressed.
 wire [15:0] PC_next = PC + 16'b1;
@@ -193,6 +236,8 @@ always @(posedge clk or posedge reset) begin
         PC <= 16'b0;
         bubble <= 2'b0;
         halted_r <= 1'b0;
+        // Section 1.2 and 4.12: every lane is enabled at wave launch.
+        exec <= 16'hffff;
         gmem_address <= 24'b0;
         gmem_dst <= 4'b0;
         gmem_read <= 1'b0;
@@ -307,6 +352,60 @@ always @(posedge clk or posedge reset) begin
                         PC <= PC_next + imm16;
                         bubble <= 2'd3;
                     end
+                // The two exec-mask branches.  Section 1.3 makes these the
+                // escape hatch for a branch every lane has fallen out of: the
+                // body is still correct with exec == 0 - every vector
+                // instruction in it is a no-op - so these are an optimisation
+                // and not a correctness requirement.
+                8'h29:
+                    if (exec == 16'b0) begin
+                        PC <= PC_next + imm16;
+                        bubble <= 2'd3;
+                    end
+                8'h2a:
+                    if (exec != 16'b0) begin
+                        PC <= PC_next + imm16;
+                        bubble <= 2'd3;
+                    end
+
+                // --------------------------------------- 4.5 exec mask
+                //
+                // The saveexec family reads exec and writes it in the same
+                // instruction, and the value saved is the value *before* the
+                // update, so a program can restore it to reconverge.  Both
+                // assignments are non blocking and both right hand sides
+                // therefore see the old exec, including when Arg0 and Arg1
+                // name the same register.
+                8'h30: registers[arg0] <= {16'b0, exec};
+                8'h31: exec <= src0_value[15:0];
+                8'h32: begin
+                    registers[arg0] <= {16'b0, exec};
+                    exec <= exec & src0_value[15:0];
+                end
+                8'h33: begin
+                    registers[arg0] <= {16'b0, exec};
+                    exec <= exec | src0_value[15:0];
+                end
+                8'h34: begin
+                    registers[arg0] <= {16'b0, exec};
+                    exec <= exec ^ src0_value[15:0];
+                end
+                8'h35: exec <= 16'hffff;
+
+                // ---------------------------------------- 4.6 vector ALU
+                //
+                // The VGPR writes all happen in the vector unit, which sees
+                // this same instruction word and this same issue signal.  The
+                // arms here are the two vector instructions whose destination
+                // is a *scalar* register, plus one silent arm for the rest so
+                // that they are not reported as unknown opcodes.
+                8'h59: registers[arg0] <= readlane_value;
+                8'h5c, 8'h5d, 8'h5e, 8'h5f:
+                    registers[arg0] <= {16'b0, cmp_mask};
+                8'h40, 8'h41, 8'h42, 8'h43, 8'h44, 8'h45, 8'h46, 8'h47,
+                8'h48, 8'h49, 8'h4a, 8'h4b, 8'h4c, 8'h4d, 8'h4e, 8'h4f,
+                8'h50, 8'h51, 8'h52, 8'h53, 8'h54, 8'h55, 8'h56, 8'h57,
+                8'h58, 8'h5a, 8'h5b: ;
 
                 // --------------------------------------- 4.8 global memory
                 8'h85:

@@ -1,8 +1,9 @@
 `include "gpu16.v"
 
-// Self checking testbench for gpu16's scalar unit, modelled on test16.v.
+// Self checking testbench for gpu16, modelled on test16.v.
 //
-//   vvp simgpu +program=<hex file> +expect=<hex file> [+data=<hex file>]
+//   vvp simgpu +program=<hex file> +expect=<hex file> [+vexpect=<hex file>]
+//              [+data=<hex file>]
 //              [+cycles=<n>] [+arg_ptr=<n>] [+group_x=<n>] [+group_y=<n>]
 //              [+wave_id=<n>] [+trace]
 //
@@ -10,6 +11,18 @@
 // expect file holds the 16 expected scalar registers (s0 first) as 8 digit
 // hex words, where "xxxxxxxx" means "do not care".  $readmemh understands //
 // comments, so a hand encoded program can carry its own disassembly.
+//
+// +vexpect is the same thing for the vector register file: 256 words, v0
+// first, and within a VGPR lane 0 first, which is gpu16_vector.v's own
+// `vregs[{reg, lane}]` order.  Sixteen words to a line is therefore one line
+// per VGPR across the wave, which is the shape the answer is easiest to read
+// in.  A test that does not pass +vexpect checks no VGPR at all, which is why
+// the five scalar-era programs needed no new expectation file.
+//
+// The exec mask deliberately has no plusarg of its own.  A program that wants
+// its final mask checked ends with `s_rd_exec s15` and puts the answer in the
+// scalar expectation file - section 4.5 already provides the instruction, and
+// a test that goes through the ISA proves the ISA works.
 //
 // Unlike test16.v this insists the program reach s_endpgm.  cpu16 programs
 // are allowed to run off their end into a field of zeroes; a gpu16 wave
@@ -37,9 +50,14 @@ integer wave;
 reg [1023:0] program_file;
 reg [1023:0] data_file;
 reg [1023:0] expect_file;
+reg [1023:0] vexpect_file;
 reg [31:0] expected[0:15];
+reg [31:0] vexpected[0:255];
+integer has_vexpect;
+integer lane;
+integer vreg;
 
-gpu16_scalar #(
+gpu16 #(
     .PROGRAM_ADDR_WIDTH(PROGRAM_ADDR_WIDTH),
     .DATA_INDEX_WIDTH(DATA_INDEX_WIDTH)
 ) U0 (
@@ -58,6 +76,9 @@ initial begin
     for (i = 0; i < 16; i = i + 1) begin
         expected[i] = 32'hxxxxxxxx;
     end
+    for (i = 0; i < 256; i = i + 1) begin
+        vexpected[i] = 32'hxxxxxxxx;
+    end
 
     if (!$value$plusargs("program=%s", program_file)) begin
         $display("TEST FAIL: no +program=<file> given");
@@ -68,6 +89,7 @@ initial begin
         $finish;
     end
     has_data = $value$plusargs("data=%s", data_file);
+    has_vexpect = $value$plusargs("vexpect=%s", vexpect_file);
     // The word counts only exist so that $readmemh is not asked to fill more
     // of the memory than the file covers, which it warns about.
     if (!$value$plusargs("program_words=%d", program_words)) begin
@@ -107,10 +129,13 @@ initial begin
         end
     end
     $readmemh(expect_file, expected);
+    if (has_vexpect) begin
+        $readmemh(vexpect_file, vexpected);
+    end
 
     if ($test$plusargs("trace")) begin
-        $monitor("%g\tPC=%04h inst=%08h bubble=%b halt=%b | s0=%08h s1=%08h s2=%08h s3=%08h s4=%08h s5=%08h s6=%08h s7=%08h",
-            $time, U0.PC, U0.Inst, U0.bubble, U0.halted,
+        $monitor("%g\tPC=%04h inst=%08h bubble=%b halt=%b exec=%04h | s0=%08h s1=%08h s2=%08h s3=%08h s4=%08h s5=%08h s6=%08h s7=%08h",
+            $time, U0.PC, U0.Inst, U0.bubble, U0.halted, U0.exec,
             U0.registers[0], U0.registers[1], U0.registers[2], U0.registers[3],
             U0.registers[4], U0.registers[5], U0.registers[6], U0.registers[7]);
     end
@@ -143,6 +168,24 @@ initial begin
             end
             else begin
                 $display("  ok:       s%0d = %08h", i, expected[i]);
+            end
+        end
+    end
+
+    if (has_vexpect) begin
+        for (vreg = 0; vreg < 16; vreg = vreg + 1) begin
+            for (lane = 0; lane < 16; lane = lane + 1) begin
+                i = vreg * 16 + lane;
+                if (^vexpected[i] !== 1'bx) begin
+                    if (U0.vector.vregs[i] !== vexpected[i]) begin
+                        $display("  MISMATCH: v%0d lane %0d = %08h, expected %08h",
+                            vreg, lane, U0.vector.vregs[i], vexpected[i]);
+                        errors = errors + 1;
+                    end
+                    else begin
+                        $display("  ok:       v%0d lane %0d = %08h", vreg, lane, vexpected[i]);
+                    end
+                end
             end
         end
     end
