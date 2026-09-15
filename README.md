@@ -34,6 +34,7 @@ straight away.
 | cpu16_count | cpu16_asm/test.s | 16 bit CPU counts to 4 and branches |
 | cpu16_label | tests/cpu16_label.s | 16 bit assembler resolves a label at address 75 and the CPU branches there |
 | cpu16_adc | tests/cpu16_adc.s | 16 bit CPU carries between bytes through adc and sbb |
+| cpu16_ldp | tests/cpu16_ldp.s | 16 bit CPU rewrites one of its own instructions with st_p and reads it back with ld_p |
 
 To watch a program execute, run the simulation by hand and add ```+trace```:
 
@@ -263,8 +264,10 @@ instruction:
 | imm imm_s add_ip | immediate | shift amount | dst |
 | bnz bz blz bgz | register compared with zero | register holding the branch target | unused |
 | b            | unused | register holding the branch target | unused |
-| ld ld_p      | unused | register holding the address | dst |
-| st st_p cl swap | src0 | register holding the address | dst |
+| ld           | unused | register holding the address | dst |
+| st cl swap   | src0 | register holding the address | dst |
+| ld_p         | half | register holding the address | dst |
+| st_p         | src0 | register holding the address | half |
 
 The immediate is only 3 bits wide, so ```imm``` loads ```arg0 << arg1``` and
 ```imm_s``` ors ```arg0 << arg1``` into the destination register.  Any 8 bit
@@ -366,14 +369,25 @@ Instruction field arg encodes register containing memory address.
 | st  |   65   | store to data memory  |
 | cl  |   66   | clear data memory     |
 | swap|   67   | swap register and data memory |
-| ld_p|   68   | load from program memory |
-| st_p|   69   | store to program memory  |
+| ld_p|   68   | load a byte from program memory |
+| st_p|   69   | store a byte to program memory  |
 
-#### Not implemented in cpu16.v yet
+Program memory is 16 bits wide and a register is 8 bits, so ```ld_p``` and
+```st_p``` move **one half of a program word** at a time.  Which half is
+chosen by an argument, written as 0 for the low byte and 1 for the high byte:
 
-```ld_p```/```st_p``` need a second port on the program memory.  The
-assembler will happily encode both, but the CPU reports ```unknown opcode```
-when it decodes one, which fails the tests.
+```
+ld_p <half> <address register> <dst>
+st_p <src0> <address register> <half>
+```
+
+The half sits in Arg0 for the load and in Arg2 for the store, because those
+are the fields the two instructions have left over.
+
+```cpu16.v``` gives the program memory a second port for this, so the
+instruction fetch never has to stand aside.  A store is visible to the fetch
+from the next time that word is fetched, which is what makes a program able to
+rewrite itself; ```tests/cpu16_ldp.s``` does exactly that.
 
 ## Instruction Set Architecture - 8 Bit Instruction/Register SIMD32
 
@@ -411,4 +425,7 @@ before a tapeout.  ```s_waitcnt``` is split into ```s_waitcnt_g``` and
 ## Known gaps
 
 * ```memory_ramb18e1.v``` does not compile: it redeclares every port.
+* ```cpu8.v``` does not implement ```ld_p```/```st_p```; it reports
+  ```unknown opcode``` for them.  Only ```cpu16.v``` has the second program
+  memory port they need.
 * ```variables_to_registers``` is not implemented.

@@ -20,20 +20,45 @@ initial begin
     IP = 0;
 end
 
-wire program_write_enable;
 wire program_read_enable;
 wire [7:0] program_address;
-wire [INST_WIDTH-1:0] program_in_data;
 wire [INST_WIDTH-1:0] program_out_data;
 
-memory #(.DATA_WIDTH(INST_WIDTH)) program(
+// The second program memory port, which is what ld_p and st_p run on.  The
+// fetch owns port A and never gives it up, so a program can read or write its
+// own instruction memory without ever stalling the fetch.
+wire program_b_enable;
+reg program_b_write_enable;
+reg program_b_read_enable;
+reg program_b_half;
+reg [7:0] program_b_address;
+reg [7:0] program_b_in_data;
+wire [7:0] program_b_out_data;
+reg [2:0] program_b_dst;
+
+program_memory program(
     .clk(clk),
-    .write_enable(program_write_enable),
-    .enable(program_read_enable),
-    .address(program_address),
-    .in_data(program_in_data),
-    .out_data(program_out_data)
+    .a_enable(program_read_enable),
+    .a_address(program_address),
+    .a_out_data(program_out_data),
+    .b_enable(program_b_enable),
+    .b_write_enable(program_b_write_enable),
+    .b_half(program_b_half),
+    .b_address(program_b_address),
+    .b_in_data(program_b_in_data),
+    .b_out_data(program_b_out_data)
 );
+
+assign program_b_enable = 1'b1;
+
+initial begin
+    program_b_write_enable = 1'b0;
+    program_b_read_enable = 1'b0;
+    program_b_half = 1'b0;
+    program_b_address = 0;
+    program_b_in_data = 0;
+    program_b_dst = 0;
+end
 
 wire data_enable;
 reg data_write_enable;
@@ -60,8 +85,6 @@ wire [INST_WIDTH-1:0] Inst;
 
 assign program_address = IP;
 assign program_read_enable = 1'b1;
-assign program_write_enable = 1'b0;
-assign program_in_data = {INST_WIDTH{1'b0}};
 assign Inst = stall ? {INST_WIDTH{1'b0}} : program_out_data;
 
 reg [7:0] registers[7:0];
@@ -126,6 +149,13 @@ always @(posedge clk) begin
     if (data_read_enable) begin
         registers[data_dst] = data_out_data;
         data_read_enable = 1'b0;
+    end
+    if (program_b_write_enable) begin
+        program_b_write_enable = 1'b0;
+    end
+    if (program_b_read_enable) begin
+        registers[program_b_dst] = program_b_out_data;
+        program_b_read_enable = 1'b0;
     end
 
     if (stall == 1'b1) begin
@@ -241,6 +271,20 @@ always @(posedge clk) begin
             data_write_enable = 1'b1;
             data_read_enable = 1'b1;
             data_in_data = registers[dst];
+        end
+        68:
+        begin
+            program_b_address = registers[src1];
+            program_b_half = src0[0];
+            program_b_dst = dst;
+            program_b_read_enable = 1'b1;
+        end
+        69:
+        begin
+            program_b_address = registers[src1];
+            program_b_half = dst[0];
+            program_b_in_data = registers[src0];
+            program_b_write_enable = 1'b1;
         end
         default: $display("unknown opcode %b", opcode);
     endcase
