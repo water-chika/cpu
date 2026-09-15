@@ -44,8 +44,27 @@ target_link_libraries(asm PRIVATE asm_core)
 add_executable(asm16 asm16.cpp)
 target_link_libraries(asm16 PRIVATE asm_core)
 
+add_executable(asm_bench asm_bench.cpp)
+target_link_libraries(asm_bench PRIVATE asm_core)
+
 add_executable(variables_to_registers variables_to_registers.cpp)
 target_compile_features(variables_to_registers PUBLIC cxx_std_20)
+
+# A human runs the benchmark with:
+#
+#   cmake --build build --target bench
+#
+# and gets the table for the 16 bit assembler.  "bench8" is the same for cpu8.
+add_custom_target(bench
+    COMMAND $<TARGET_FILE:asm_bench> --isa 16 --lines 2000000 --repeat 5
+    DEPENDS asm_bench
+    USES_TERMINAL
+    COMMENT "benchmarking the cpu16 assembler across every available backend")
+add_custom_target(bench8
+    COMMAND $<TARGET_FILE:asm_bench> --isa 8 --lines 2000000 --repeat 5
+    DEPENDS asm_bench
+    USES_TERMINAL
+    COMMENT "benchmarking the cpu8 assembler across every available backend")
 
 # Simulation tests.  Each one assembles a program with the assembler built
 # above, runs it on the verilog CPU under iverilog, and compares the final
@@ -57,6 +76,20 @@ find_program(IVERILOG_EXECUTABLE iverilog)
 find_program(VVP_EXECUTABLE vvp)
 
 enable_testing()
+
+# The backends have to agree byte for byte, on both ISAs and both output
+# formats, or the parallel assembler is worthless.  These run whatever
+# backends the machine has: with no GPU the hip column simply says so.
+foreach(isa 8 16)
+    foreach(format hex bin)
+        add_test(
+            NAME backends_cpu${isa}_${format}
+            COMMAND asm_bench --isa ${isa} --lines 200000 --format ${format} --check
+        )
+        set_tests_properties(backends_cpu${isa}_${format}
+                             PROPERTIES FAIL_REGULAR_EXPRESSION "TEST FAIL")
+    endforeach()
+endforeach()
 
 if(IVERILOG_EXECUTABLE AND VVP_EXECUTABLE)
     function(add_cpu_test name assembler testbench program data expect cycles)
