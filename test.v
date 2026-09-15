@@ -15,6 +15,7 @@
 module test();
 
 reg clk;
+reg reset;
 integer i;
 integer errors;
 integer cycles;
@@ -27,10 +28,11 @@ reg [1023:0] data_file;
 reg [1023:0] expect_file;
 reg [7:0] expected[0:7];
 
-cpu_inst8_data8 U0(.clk(clk));
+cpu_inst8_data8 U0(.clk(clk), .reset(reset));
 
 initial begin
     errors = 0;
+    reset = 0;
     for (i = 0; i < 8; i = i + 1) begin
         expected[i] = 8'hxx;
     end
@@ -78,8 +80,14 @@ initial begin
             U0.registers[4], U0.registers[5], U0.registers[6], U0.registers[7], U0.IP);
     end
 
+    // The CPU has an asynchronous reset in place of the initial blocks it
+    // used to have, so the testbench has to pulse it.  The pulse is over
+    // before the first rising edge at t=10, which is why the number of
+    // instructions executed in "cycles" cycles is exactly what it always was.
     clk = 1;
-    #(cycles*10 + 5);
+    reset = 1;
+    #7 reset = 0;
+    #(cycles*10 + 5 - 7);
 
     for (i = 0; i < 8; i = i + 1) begin
         if (^expected[i] !== 1'bx) begin

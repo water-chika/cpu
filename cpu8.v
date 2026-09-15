@@ -1,7 +1,17 @@
 `include "memory.v"
 
+// The 8 bit instruction / 8 bit data CPU.
+//
+// Rewritten in the same synthesisable style as cpu16.v: no `#` delays, every
+// piece of sequential state written with a non blocking assignment from one
+// clocked block, and an asynchronous `reset` in place of the `initial` blocks
+// that used to set the register file, the instruction pointer and the
+// condition flag.  Behaviour is unchanged cycle for cycle; see the comment at
+// the top of cpu16.v for the two places where preserving that needed an
+// explicit mux.
 module cpu_inst8_data8(
-    input clk
+    input clk,
+    input reset
 );
 
 parameter INST_WIDTH = 8;
@@ -12,12 +22,11 @@ reg [7:0] instruction_pointer_1;
 reg stall;
 reg [7:0] stall_counter; // If it needs more than 1 stall clock
 
-initial begin
-    IP = 0;
-    instruction_pointer_1 = 0;
-    stall = 1'b0;
-    stall_counter = 0;
-end
+// See cpu16.v: this is `stall` after the clear that used to happen with a
+// blocking assignment part way through the cycle.
+wire stall_active = stall & (stall_counter != 0);
+
+integer i;
 
 wire program_write_enable;
 wire program_read_enable;
@@ -51,28 +60,16 @@ memory data(
 
 assign data_enable = 1'b1;
 
-initial begin
-    data_write_enable = 1'b0;
-end
-
 wire [INST_WIDTH-1:0] Inst;
 
 assign program_address = IP;
 assign program_read_enable = 1'b1;
 assign program_write_enable = 1'b0;
 assign program_in_data = 8'b00000000;
-assign Inst = stall ? 8'b00000000 : program_out_data;
+assign Inst = stall_active ? 8'b00000000 : program_out_data;
 
 reg [7:0] registers[7:0];
 reg [0:0] condition;
-
-initial begin:INIT_REGS
-    integer i;
-    for (i = 0; i < 8; i=i+1) begin
-        registers[i] <= 0;
-    end
-    condition <= 1'b1;
-end
 
 wire [4:0] opcode;
 wire [2:0] arg;
@@ -92,104 +89,122 @@ assign arg = Inst[2:0];
 
 reg [2:0] data_dst;
 
+// The write back of a load, which lands on the same edge as the decode of the
+// instruction that follows the load, so that instruction has to see it.
+wire [7:0] src0_value = (data_read_enable && data_dst == src0) ? data_out_data
+                                                              : registers[src0];
+wire [7:0] src1_value = (data_read_enable && data_dst == src1) ? data_out_data
+                                                              : registers[src1];
 
-initial begin
-    data_dst = 0;
-    src1 = 0;
-    data_read_enable = 1'b0;
-end
+// The instruction after this one.
+wire [7:0] IP_next = stall_active ? IP : IP + 8'b1;
 
-always @(posedge clk) begin
-
-    // delay to wait memory operation
-    #1 if (data_write_enable) begin
-        data_write_enable = 1'b0;
-    end
-    if (data_read_enable) begin
-        registers[data_dst] = data_out_data;
-        data_read_enable = 1'b0;
-    end
-
-    if (stall == 1'b1) begin
-        if (stall_counter == 0) begin
-            stall = 1'b0;
+always @(posedge clk or posedge reset) begin
+    if (reset) begin
+        IP <= 8'b0;
+        instruction_pointer_1 <= 8'b0;
+        stall <= 1'b0;
+        stall_counter <= 8'b0;
+        condition <= 1'b1;
+        src1 <= 3'b0;
+        data_write_enable <= 1'b0;
+        data_read_enable <= 1'b0;
+        data_address <= 8'b0;
+        data_in_data <= 8'b0;
+        data_dst <= 3'b0;
+        for (i = 0; i < 8; i = i + 1) begin
+            registers[i] <= 8'b0;
         end
-        else begin
-            stall_counter = stall_counter-1;
+    end
+    else begin
+        // A memory operation lasts exactly one edge.
+        data_write_enable <= 1'b0;
+        data_read_enable <= 1'b0;
+
+        if (data_read_enable) begin
+            registers[data_dst] <= data_out_data;
         end
-    end
 
-    IP = IP;
+        if (stall) begin
+            if (stall_counter == 0) begin
+                stall <= 1'b0;
+            end
+            else begin
+                stall_counter <= stall_counter - 1;
+            end
+        end
 
-    if (~stall) begin
-        IP = IP + 1;
-    end
+        IP <= IP_next;
 
-    if (condition) begin
-    // delay to wait memory operation
-    #1 case (opcode)
-        0: registers[dst]     <= registers[src0] & registers[src1];
-        1: registers[dst]     <= registers[src0] | registers[src1];
-        2: registers[dst]     <= 8'b11111111     ^ registers[src1];
-        3: registers[dst]     <= registers[src0] ^ registers[src1];
-        4: registers[dst]     <= registers[src0] + registers[src1];
-        5: registers[dst]     <= registers[src0] - registers[src1];
-        6: registers[dst]     <= 8'b00000000     - registers[src1];
-        7: registers[dst]     <= registers[src0] * registers[src1];
-        8: registers[dst]     <= registers[src0] / registers[src1];
-        9: registers[dst]     <= 8'b00000000     | registers[src1];
-        10: registers[dst1]   <= registers[src0] | 8'b00000000;
-        11: registers[dst1]   <=           imm;
-        12: registers[dst1]   <= registers[src1] << shift_imm;
-        13: registers[dst1]   <= registers[src1] >> shift_imm;
+        if (condition) begin
+        case (opcode)
+            0: registers[dst]     <= src0_value    & src1_value;
+            1: registers[dst]     <= src0_value    | src1_value;
+            2: registers[dst]     <= 8'b11111111   ^ src1_value;
+            3: registers[dst]     <= src0_value    ^ src1_value;
+            4: registers[dst]     <= src0_value    + src1_value;
+            5: registers[dst]     <= src0_value    - src1_value;
+            6: registers[dst]     <= 8'b00000000   - src1_value;
+            7: registers[dst]     <= src0_value    * src1_value;
+            8: registers[dst]     <= src0_value    / src1_value;
+            9: registers[dst]     <= 8'b00000000   | src1_value;
+            10: registers[dst1]   <= src0_value    | 8'b00000000;
+            11: registers[dst1]   <=           imm;
+            12: registers[dst1]   <= src1_value   << shift_imm;
+            13: registers[dst1]   <= src1_value   >> shift_imm;
 
-        14: condition = registers[src0] != 0;
-        15: condition = registers[src0] == 0;
-        16: condition = registers[src0] < 0;
-        17: condition = registers[src0] > 0;
-        18:
+            14: condition <= src0_value != 0;
+            15: condition <= src0_value == 0;
+            16: condition <= src0_value < 0;
+            17: condition <= src0_value > 0;
+            18:
+                begin
+                    case (arg)
+                        0: condition <= 1;
+                        1:
+                            begin
+                                IP <= instruction_pointer_1;
+                                stall <= 1'b1;
+                            end
+                        default: ;
+                    endcase
+                end
+
+            19: instruction_pointer_1 <= src0_value;
+            20: data_address <= src0_value;
+
+            24:
             begin
-                case (arg)
-                    0: condition = 1;
-                    1:
-                        begin
-                            IP = instruction_pointer_1;
-                            stall = 1'b1;
-                        end
-                endcase
+                data_dst <= dst;
+                data_read_enable <= 1'b1;
+            end
+            25:
+            begin
+                data_write_enable <= 1'b1;
+                data_in_data <= src0_value;
+            end
+            26:
+            begin
+                data_write_enable <= 1'b1;
+                data_in_data <= 8'b00000000;
+            end
+            27:
+            begin
+                data_dst <= dst;
+                data_write_enable <= 1'b1;
+                data_read_enable <= 1'b1;
+                data_in_data <= src0_value;
             end
 
-        19: instruction_pointer_1 = registers[src0];
-        20: data_address = registers[src0];
-
-        24:
-        begin
-            data_dst = dst;
-            data_read_enable = 1'b1;
+            31: src1 <= arg;
+            default: $display("unknown opcode %b", opcode);
+        endcase
         end
-        25:
-        begin
-            data_write_enable = 1'b1;
-            data_in_data = registers[src0];
-        end
-        26:
-        begin
-            data_write_enable = 1'b1;
-            data_in_data = 8'b00000000;
-        end
-        27:
-        begin
-            data_dst = dst;
-            data_write_enable = 1'b1;
-            data_read_enable = 1'b1;
-            data_in_data = registers[src0];
-        end
-
-        31: src1 = arg;
-        default: $display("unknown opcode %b", opcode);
-    endcase
+        // "endif": an opcode 18 always re-enables execution, even the one
+        // that was itself skipped.  This comes last so that it overrides the
+        // arms above.
+        if (opcode == 18) condition <= 1;
     end
-    if (opcode == 18) condition = 1;
 end
 
 endmodule

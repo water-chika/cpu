@@ -29,6 +29,7 @@ endmodule
 // it used to be called "test", which collided with the testbench in test.v.
 module digital_tube_board(
     input clk,
+    input reset,
     output [7:0] dig,
     output reg [5:0] sel
     );
@@ -36,38 +37,51 @@ module digital_tube_board(
     reg [36:0] counter;
 
     cpu_inst8_data8 U0(
-    .clk(counter[20])
+    .clk(counter[20]),
+    .reset(reset)
     );
-    initial begin
-        counter = 0;
-    end
-    
+
     reg [3:0] digits[5:0];
     reg [3:0] d;
     integer i;
     integer n;
-    always @(posedge clk) begin
-        counter = counter + 1;
-        n = U0.registers[1];
-        for (i = 0; i < 6; i=i+1) begin
-            digits[i] = n % 10;
-            if (sel[i] == 1'b0) begin
-                d = digits[i];
+    integer digit;
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            counter <= 0;
+            d <= 0;
+            for (i = 0; i < 6; i=i+1) begin
+                digits[i] <= 0;
             end
-            n = n / 10;
+        end
+        else begin
+            counter <= counter + 1;
+            // n and digit are working values, not state: they are written
+            // before they are read on every pass, so a blocking assignment to
+            // them is the correct way to describe the combinational chain.
+            n = U0.registers[1];
+            for (i = 0; i < 6; i=i+1) begin
+                digit = n % 10;
+                digits[i] <= digit[3:0];
+                if (sel[i] == 1'b0) begin
+                    d <= digit[3:0];
+                end
+                n = n / 10;
+            end
         end
     end
-    
+
     digital_tube U1(
     .dig(dig),
     .d(d)
     );
-    
-    initial begin
-        sel = 8'b11111110;
-    end
-    
-    always @(posedge counter[10]) begin
-        sel = {sel[4:0], sel[5]};
+
+    always @(posedge counter[10] or posedge reset) begin
+        if (reset) begin
+            sel <= 6'b111110;
+        end
+        else begin
+            sel <= {sel[4:0], sel[5]};
+        end
     end
 endmodule
