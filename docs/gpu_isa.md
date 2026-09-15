@@ -14,8 +14,9 @@ The whole design is driven by one workload: **tiled integer GEMM**,
 `B` supplied pre-transposed.  Every choice below is justified by the kernel in
 section 5, and section 7 measures the result against a scalar cpu16 baseline.
 
-**Revision 2.**  The first draft ended with six open questions (section 6.3).
-Four have since been decided and folded in, and this revision is the result:
+**Revision 3.**  The first draft ended with six open questions (section 6.3).
+**All six have since been decided** and folded in; this revision is the
+result:
 
 * `B` pre-transposed is a **precondition**, not an option (5.6).
 * Wave width is **16 for the first implementation**, with the cost of a later
@@ -28,8 +29,16 @@ Four have since been decided and folded in, and this revision is the result:
   promoted from the document's least-confident assumption to **architectural
   requirement A1** (2.3), with the consequences of failing it recorded
   explicitly (6.2).
+* The scalar unit **is a widened `cpu16.v`** (4.13).  The scalar opcode map is
+  consequently realigned onto cpu16's numbering, holes and all (4.3), and the
+  five branch opcodes turned out to already match exactly.
+* **`s_waitcnt` is split** into `s_waitcnt_g` and `s_waitcnt_l` (4.10), which
+  costs the GEMM kernel zero instructions and removes an encoding in which
+  "do not care" and "wait for 15" were indistinguishable.
 
-Two questions remain open and are flagged for the reviewer in section 6.3.
+No questions remain open.  What remains is measurement: section 7.4 exists to
+falsify section 7.3, and section 6.2 ranks what is most likely to break
+first.
 
 ## Contents
 
@@ -155,7 +164,8 @@ two cases explicitly, because a GPU cannot afford to stall on every load:
   retires.  In particular `acc_rd` after `mma_i8` is safe with no manual wait.
 * **Memory results are not interlocked.**  `v_ld*`, `s_ld_g` and the stores
   are fire-and-forget; a per-wave counter tracks outstanding operations and
-  `s_waitcnt` is the only thing that makes a load's result visible.  This is
+  `s_waitcnt_g` / `s_waitcnt_l` are the only things that make a load's result
+  visible.  This is
   what lets a wave issue a whole tile of global loads before touching any of
   them.
 
@@ -327,12 +337,13 @@ tile to get this.
 ### 3.3 Synchronisation
 
 * `s_barrier` - all waves of the workgroup wait until all have arrived.  It
-  does *not* imply a memory wait; pair it with `s_waitcnt`.
-* `s_waitcnt imm8` - stall until at most `imm8[3:0]` global and `imm8[7:4]`
-  LDS operations are outstanding for this wave.  `s_waitcnt 0` waits for
+  does *not* imply a memory wait; pair it with `s_waitcnt_l`.
+* `s_waitcnt_g imm8` / `s_waitcnt_l imm8` - stall until at most `imm8`
+  global, respectively LDS, operations are outstanding for this wave.  A
+  count of 0 waits for
   everything.
-* LDS writes by a wave are visible to that wave after `s_waitcnt`, and to
-  other waves of the workgroup after `s_waitcnt` followed by `s_barrier`.
+* LDS writes by a wave are visible to that wave after `s_waitcnt_l`, and to
+  other waves of the workgroup after `s_waitcnt_l` followed by `s_barrier`.
 * Global writes are visible to other workgroups only after the kernel ends.
   There are no atomics (section 6).
 
@@ -419,7 +430,7 @@ meanings.  `mma_i8`'s Arg0 names an accumulator *block* (`A0` = 0, `A1` = 1);
 | `s_ld_g` | s dst | - | s base | - | byte offset |
 | `v_ld_l v_ld4_l` | v dst | v addr | s base | - | byte offset |
 | `v_st_l v_st4_l` | v src | v addr | s base | - | byte offset |
-| `s_waitcnt` | - | - | - | - | counts |
+| `s_waitcnt_g s_waitcnt_l` | - | - | - | - | outstanding-operation count |
 | `s_barrier s_endpgm s_nop` | - | - | - | - | - |
 
 Effective address for every memory instruction is
@@ -432,38 +443,74 @@ inner loop needs no address arithmetic at all.
 
 Signed integers are 2's complement, as in cpu8/cpu16.
 
-| Op | Opcode | binary | Description |
-|----|--------|--------|-------------|
-| `s_and`  | 0x00 | 00000000 | bitwise and |
-| `s_or`   | 0x01 | 00000001 | bitwise or |
-| `s_not`  | 0x02 | 00000010 | bitwise not |
-| `s_xor`  | 0x03 | 00000011 | bitwise xor |
-| `s_add`  | 0x04 | 00000100 | addition |
-| `s_sub`  | 0x05 | 00000101 | subtract |
-| `s_neg`  | 0x06 | 00000110 | negate |
-| `s_mul`  | 0x07 | 00000111 | multiply, low 32 bits |
-| `s_shl`  | 0x08 | 00001000 | shift left by `s[Arg2]` |
-| `s_shr`  | 0x09 | 00001001 | logical shift right |
-| `s_sar`  | 0x0a | 00001010 | arithmetic shift right |
-| `s_mov`  | 0x0b | 00001011 | move |
-| `s_shli` | 0x0c | 00001100 | shift left by Mod |
-| `s_shri` | 0x0d | 00001101 | logical shift right by Mod |
-| `s_sari` | 0x0e | 00001110 | arithmetic shift right by Mod |
-| `s_min`  | 0x0f | 00001111 | signed minimum |
-| `s_imm`  | 0x10 | 00010000 | `s[dst] = sext(imm16)` |
-| `s_immh` | 0x11 | 00010001 | `s[dst] = (s[dst] & 0xffff) \| (imm16 << 16)` |
-| `s_addi` | 0x12 | 00010010 | `s[dst] = s[src0] + sext(imm16)` |
-| `s_muli` | 0x13 | 00010011 | `s[dst] = s[src0] * sext(imm16)` |
-| `s_max`  | 0x14 | 00010100 | signed maximum |
-| `s_addpc`| 0x15 | 00010101 | `s[dst] = PC_next + sext(imm16)` |
-| `s_rd_sys`| 0x16 | 00010110 | read system register `Mod` |
-| `s_andi` | 0x18 | 00011000 | `s[dst] = s[src0] & sext(imm16)` |
-| `s_ori`  | 0x19 | 00011001 | `s[dst] = s[src0] \| sext(imm16)` |
-| `s_xori` | 0x1a | 00011010 | `s[dst] = s[src0] ^ sext(imm16)` |
+**The numbering is not free-form: it is cpu16's.**  Section 6.3 decision 5
+settles that the scalar unit is a widened `cpu16.v`, so every operation gpu16
+shares with cpu16 is given **the same opcode number cpu16 already uses**, and
+cpu16's holes are left as holes rather than being compacted away.  The
+decode `case` in a widened `cpu16.v` is then cpu16's own `case` with arms
+added, not a renumbered one.  Section 4.13 works through what that does and
+does not buy.
 
-There is no `s_div`.  cpu16 has `div` and it is by far the most expensive
-thing in its datapath; a GEMM machine has no use for it and section 7.5 shows
-the area matters.
+| Op | Opcode | binary | cpu16 | Description |
+|----|--------|--------|-------|-------------|
+| `s_and`  | 0x00 | 00000000 | 0 | bitwise and |
+| `s_or`   | 0x01 | 00000001 | 1 | bitwise or |
+| `s_not`  | 0x02 | 00000010 | 2 | bitwise not |
+| `s_xor`  | 0x03 | 00000011 | 3 | bitwise xor |
+| `s_add`  | 0x04 | 00000100 | 4 | addition |
+| *not implemented* | 0x05 | 00000101 | 5 = `adc` | reserved for it, see below |
+| `s_sub`  | 0x06 | 00000110 | 6 | subtract |
+| *not implemented* | 0x07 | 00000111 | 7 = `sbb` | reserved for it, see below |
+| `s_neg`  | 0x08 | 00001000 | 8 | negate |
+| `s_mul`  | 0x09 | 00001001 | 9 | multiply, low 32 bits |
+| *not implemented* | 0x0a | 00001010 | 10 = `div` | see below |
+| `s_mov`  | 0x0b | 00001011 | 11 | move |
+| `s_imm`  | 0x0c | 00001100 | 12 | `s[dst] = sext(imm16)` |
+| `s_ori`  | 0x0d | 00001101 | 13 | `s[dst] = s[src0] \| sext(imm16)`; cpu16's 2-operand `or`-immediate generalised |
+| `s_shli` | 0x0e | 00001110 | 14 | shift left by Mod |
+| `s_shri` | 0x0f | 00001111 | 15 | logical shift right by Mod |
+| *not implemented* | 0x10 | 00010000 | 16 = `rotl` | no use in the target workload |
+| *not implemented* | 0x11 | 00010001 | 17 = `rotr` | as above |
+| `s_sari` | 0x12 | 00010010 | 18 | arithmetic shift right by Mod |
+| `s_addpc`| 0x13 | 00010011 | 19 | `s[dst] = PC_next + sext(imm16)` |
+| `s_shl`  | 0x14 | 00010100 | - | shift left by `s[Arg2]` |
+| `s_shr`  | 0x15 | 00010101 | - | logical shift right by `s[Arg2]` |
+| `s_sar`  | 0x16 | 00010110 | - | arithmetic shift right by `s[Arg2]` |
+| `s_min`  | 0x17 | 00010111 | - | signed minimum |
+| `s_max`  | 0x18 | 00011000 | - | signed maximum |
+| `s_immh` | 0x19 | 00011001 | - | `s[dst] = (s[dst] & 0xffff) \| (imm16 << 16)` |
+| `s_addi` | 0x1a | 00011010 | - | `s[dst] = s[src0] + sext(imm16)` |
+| `s_muli` | 0x1b | 00011011 | - | `s[dst] = s[src0] * sext(imm16)` |
+| `s_andi` | 0x1c | 00011100 | - | `s[dst] = s[src0] & sext(imm16)` |
+| `s_xori` | 0x1d | 00011101 | - | `s[dst] = s[src0] ^ sext(imm16)` |
+| `s_rd_sys`| 0x1e | 00011110 | - | read system register `Mod` |
+
+Everything with a cpu16 number in the third column has cpu16's semantics,
+widened to 32 bits.  Everything without one is new, and is placed above
+cpu16's highest ALU opcode so that the two ranges never interleave.
+
+There is no `s_div`.  cpu16 has `div` at opcode 10 and it is by far the most
+expensive thing in its datapath; a GEMM machine has no use for it and section
+**`s_adc` and `s_sbb` (0x05, 0x07) are named but not implemented.**  These
+two numbers were holes in `cpu16.v` when this document was first written and
+were kept as holes for that reason; `cpu16.v` has since filled them with
+add-with-carry and subtract-with-borrow beside a one-bit carry flag.  gpu16
+adopts the numbers and not the instructions.  The motivation for them in
+cpu16 is that an 8-bit machine cannot add two 32-bit quantities without
+chaining four of them, which is a real and frequent need; gpu16's scalar
+registers are already 32 bits wide and its addresses are 24, so the GEMM
+kernel has no multi-word arithmetic anywhere in it.  Implementing them would
+add a carry flag to the scalar unit - a piece of architectural state with its
+own hazard and its own save/restore question the moment anything resembling
+an interrupt appears - in exchange for nothing the target workload asks for.
+Reserving the numbers costs nothing and means a later revision can add them
+without disturbing anything else.
+
+Opcode 0x0a is **reserved rather than reused**,
+so that deleting `div` from a widened `cpu16.v` is deleting one `case` arm
+and nothing else - and so that a future revision that wants it back does not
+have to renumber.  The same applies to the two rotates.  Five wasted
+encodings out of 256 is the price of the decode staying literally cpu16's.
 
 System registers for `s_rd_sys`:
 
@@ -489,8 +536,11 @@ RTL without a separate instrumentation harness.
 
 Branch conditions compare a scalar register with zero, the same four
 conditions cpu16 already defines.  Register-target forms match cpu16
-exactly; the `_i` forms take a signed 16-bit PC-relative word offset and
-exist so that programs do not have to build targets out of shifts.
+exactly - **including the opcode numbers**, which needed no adjustment at
+all: cpu16's branches are decimal 32-36 and gpu16's are 0x20-0x24, which are
+the same five numbers.  The `_i` forms take a signed 16-bit PC-relative word
+offset and exist so that programs do not have to build targets out of
+shifts.
 
 | Op | Opcode | binary | Description |
 |----|--------|--------|-------------|
@@ -661,10 +711,33 @@ a 32-entry VGPR file in a second revision.
 
 | Op | Opcode | binary | Description |
 |----|--------|--------|-------------|
-| `s_barrier` | 0xb0 | 10110000 | workgroup barrier |
-| `s_waitcnt` | 0xb1 | 10110001 | wait until outstanding <= Mod |
-| `s_endpgm`  | 0xb2 | 10110010 | terminate the wave |
-| `s_nop`     | 0xbf | 10111111 | no operation |
+| `s_barrier`    | 0xb0 | 10110000 | workgroup barrier |
+| `s_waitcnt_g`  | 0xb1 | 10110001 | wait until at most `Mod` **global** operations are outstanding |
+| `s_waitcnt_l`  | 0xb2 | 10110010 | wait until at most `Mod` **LDS** operations are outstanding |
+| `s_endpgm`     | 0xb3 | 10110011 | terminate the wave |
+| `s_nop`        | 0xbf | 10111111 | no operation |
+
+**Two counters, two instructions** (section 6.3, decision 6).  The first draft
+packed both into one `Mod`, four bits each.  That is wrong for three reasons,
+in increasing order of seriousness:
+
+* it puts sub-field unpacking into the decoder, and decision 5 makes the
+  decoder cpu16's, which uses its immediates whole and never unpacks nibbles -
+  the two decisions push the same way;
+* it caps each counter at 15, so the encoding silently couples the maximum
+  depth of two unrelated queues;
+* worst, with a 4-bit field "I do not care about the global counter" and "wait
+  until at most 15 global operations are outstanding" are **the same
+  encoding**.  That is safe only while no queue can exceed 15 entries, and
+  nothing in the ISA says one cannot.
+
+Split, each counter gets the full 8-bit `Mod` and means exactly one thing.
+The cost is that a site needing both counters drained spends two instructions
+instead of one.  **The GEMM kernel in section 5.3 has no such site**: every
+one of its fourteen waits is unambiguously global (staging loads) or
+unambiguously LDS (fragment reads, and the pre-barrier drain), so the split
+changes the kernel's instruction count by zero.  That is also the evidence
+that the two counters were always doing independent jobs.
 
 ### 4.11 Worked encodings
 
@@ -672,7 +745,7 @@ a 32-entry VGPR file in a second revision.
 |----------|--------|------|------|------|------|-----|-----|
 | `mma_i8 A1, v1, v3` | 0x70 | 1 | 1 | 3 | 0 | 0x00 | `70113000` |
 | `mma_i8 A0, v1, v3` | 0x70 | 0 | 1 | 3 | 0 | 0x00 | `70013000` |
-| `s_imm s9, 32` | 0x10 | 9 | 0 | imm16 = 0x0020 | | | `10900020` |
+| `s_imm s9, 32` | 0x0c | 9 | 0 | imm16 = 0x0020 | | | `0c900020` |
 | `v_ld4_l v1, v7, s9, 12` | 0xa1 | 1 | 7 | 9 | 0 | 0x0c | `a117900c` |
 | `v_ld16_g v12, v9, s1, 0` | 0x86 | 12 | 9 | 1 | 0 | 0x00 | `86c91000` |
 | `v_st16_g v4, v8, s2, 0` | 0x87 | 4 | 8 | 2 | 0 | 0x00 | `87482000` |
@@ -680,7 +753,8 @@ a 32-entry VGPR file in a second revision.
 | `acc_rd v15, 17` | 0x72 | 15 | 0 | 0 | 0 | 0x11 | `72f00011` |
 | `s_cbr_execz +6` | 0x29 | 0 | 0 | imm16 = 0x0006 | | | `29000006` |
 | `v_cmp_gz s4, v6` | 0x5f | 4 | 6 | 0 | 0 | 0x00 | `5f460000` |
-| `s_waitcnt 0` | 0xb1 | 0 | 0 | 0 | 0 | 0x00 | `b1000000` |
+| `s_waitcnt_g 0` | 0xb1 | 0 | 0 | 0 | 0 | 0x00 | `b1000000` |
+| `s_waitcnt_l 3` | 0xb2 | 0 | 0 | 0 | 0 | 0x03 | `b2000003` |
 
 ### 4.12 Kernel launch state
 
@@ -694,6 +768,72 @@ At wave launch:
 
 The argument block layout is a kernel convention, not an ISA rule.  The GEMM
 kernel uses `+0 &A`, `+4 &Bt`, `+8 &C`, `+12 M`, `+16 N`, `+20 K`.
+
+### 4.13 Relationship to `cpu16.v`
+
+Section 6.3 decision 5 settles that gpu16's scalar unit is **a widened
+`cpu16.v`**, not a new core.  "Widened" hides six separate changes, so they
+are written out here rather than left to the imagination:
+
+| | `cpu16.v` today | gpu16 scalar unit |
+|---|---|---|
+| registers | 8 x 8-bit (`reg [7:0] registers[7:0]`) | 16 x 32-bit |
+| register select fields | 3 bits | 4 bits |
+| PC | 8-bit, 256 instructions | 16-bit, 64 Ki instructions |
+| data address | 8-bit, 256 bytes | 24-bit |
+| immediate | 8-bit | 16-bit |
+| instruction word | 16-bit, 7-bit opcode | 32-bit, 8-bit opcode |
+
+**What is genuinely inherited.**  Not the widths - those all change - but:
+
+* the **control skeleton**: `IP` increment gated on `stall`, the single flat
+  `case (opcode)` decode, register writeback, and the load-result-visible-one-
+  cycle-later discipline that the cpu16 tests already pin down;
+* the **ALU semantics**: two's complement, the same operations with the same
+  meanings, and now the same opcode numbers (section 4.3);
+* the **branch block verbatim**.  cpu16's branches are opcodes 32-36 and
+  gpu16's are 0x20-0x24.  Those are the same five numbers, in the same order,
+  with the same four compare-with-zero conditions.  This block needed no
+  adjustment to align, which is the strongest single piece of evidence that
+  the two ISAs really are siblings rather than a resemblance asserted in
+  prose.
+
+This is also how the two ISAs are expected to drift.  `cpu16.v` filled its
+opcode holes 5 and 7 with `adc`/`sbb` after this document's first draft;
+gpu16 reserves those numbers for the same two instructions and implements
+neither, because a 32-bit scalar unit running GEMM has no multi-word
+arithmetic (section 4.3).  Alignment means the numbers never disagree, not
+that both machines implement the same set.
+
+**What cannot align, and why.**  cpu16's memory operations are opcodes 64-67,
+which in gpu16 is the middle of the vector ALU block.  There is no way to
+reconcile this and no reason to try: gpu16 has to distinguish scalar from
+vector and global from LDS, and cpu16 has no concept of either distinction.
+The memory block is gpu16's own (sections 4.8, 4.9), and a widened `cpu16.v`
+contributes nothing to it.
+
+**What decision 5 turns from a nice-to-have into a prerequisite.**  Section
+7.5 lists three things in `cpu16.v` that no synthesis tool will accept: `#1`
+delays inside `always @(posedge clk)`, blocking assignments to sequential
+state, and `initial` blocks zeroing the register file in place of a reset.  As
+long as the GPU was a separate core those were a tapeout-tier concern to be
+dealt with eventually.  If the GPU's scalar unit *is* this module, they become
+**blocking work that comes first**, before any GPU RTL is written.  That is a
+real cost of the decision and it should be counted as one.
+
+It is also the decision's quiet benefit: that clean-up is exactly the kind of
+refactor that is dangerous without tests, and the repo already has three
+passing cpu16 CTests to hold it in place.  Fixing `cpu16.v` is derisked work
+that improves the existing machine whether or not the GPU is ever built.
+
+**An honest measure of the saving.**  What is being reused is on the order of
+forty lines of control logic and a decode table, against a GPU whose novel
+content is the matrix unit, the exec mask, the scratchpad and four-wave
+issue - none of which cpu16 has anything to say about.  The implementation
+saving is real but modest.  The larger return is that one person's mental
+model, one assembler's structure and one set of debugging habits cover both
+machines, and that the README can present gpu16 as the next member of a
+family rather than as an unrelated second project.
 
 ---
 
@@ -791,7 +931,7 @@ gemm_i8:
         s_ld_g   s6,  s0, 20           # K
         s_rd_sys s12, 0                # wave id 0..3
         v_lane_id v0
-        s_waitcnt 0
+        s_waitcnt_g 0
 
         s_shli   s14, s2,  6           # M0 = 64 * group_id_y
         s_shli   s15, s1,  5           # N0 = 32 * group_id_x
@@ -849,7 +989,7 @@ gemm_i8:
         s_addi   s4,  s4,  32
         s_addi   s0,  s0,  -32
         s_imm    s11, 4096
-        s_waitcnt 0
+        s_waitcnt_l 0
         s_barrier
 
 # ================================================================= main loop
@@ -866,53 +1006,53 @@ kloop:
         v_ld4_l  v4, v7, s9,  4
         v_ld4_l  v5, v8, s9,  4
         v_ld4_l  v6, v7, s10, 4
-        s_waitcnt 48                   # wait for the first triple only
+        s_waitcnt_l 3                  # wait for the first triple only
         mma_i8   A0, v1, v3
         mma_i8   A1, v2, v3
 
         v_ld4_l  v1, v7, s9,  8
         v_ld4_l  v2, v8, s9,  8
         v_ld4_l  v3, v7, s10, 8
-        s_waitcnt 48
+        s_waitcnt_l 3
         mma_i8   A0, v4, v6
         mma_i8   A1, v5, v6
 
         v_ld4_l  v4, v7, s9,  12
         v_ld4_l  v5, v8, s9,  12
         v_ld4_l  v6, v7, s10, 12
-        s_waitcnt 48
+        s_waitcnt_l 3
         mma_i8   A0, v1, v3
         mma_i8   A1, v2, v3
 
         v_ld4_l  v1, v7, s9,  16
         v_ld4_l  v2, v8, s9,  16
         v_ld4_l  v3, v7, s10, 16
-        s_waitcnt 48
+        s_waitcnt_l 3
         mma_i8   A0, v4, v6
         mma_i8   A1, v5, v6
 
         v_ld4_l  v4, v7, s9,  20
         v_ld4_l  v5, v8, s9,  20
         v_ld4_l  v6, v7, s10, 20
-        s_waitcnt 48
+        s_waitcnt_l 3
         mma_i8   A0, v1, v3
         mma_i8   A1, v2, v3
 
         v_ld4_l  v1, v7, s9,  24
         v_ld4_l  v2, v8, s9,  24
         v_ld4_l  v3, v7, s10, 24
-        s_waitcnt 48
+        s_waitcnt_l 3
         mma_i8   A0, v4, v6
         mma_i8   A1, v5, v6
 
         v_ld4_l  v4, v7, s9,  28
         v_ld4_l  v5, v8, s9,  28
         v_ld4_l  v6, v7, s10, 28
-        s_waitcnt 48
+        s_waitcnt_l 3
         mma_i8   A0, v1, v3
         mma_i8   A1, v2, v3
 
-        s_waitcnt 0
+        s_waitcnt_l 0
         mma_i8   A0, v4, v6
         mma_i8   A1, v5, v6
 
@@ -922,7 +1062,7 @@ kloop:
         s_xori   s9,  s9,  4096
         s_xori   s10, s10, 4096
         s_xori   s11, s11, 4096
-        s_waitcnt 0
+        s_waitcnt_l 0
         s_barrier
         s_addi   s0,  s0,  -32
         s_bnz_i  s0, kloop
@@ -964,14 +1104,14 @@ fill_tile:
         s_mov    s1, s3
         v_ld16_g v12, v9, s1, 0        # A rows 0..7
         s_add    s1, s1, s8            # += 8*K
-        s_waitcnt 0
+        s_waitcnt_g 0
         v_st4_l  v12, v10, s11, 0
         v_st4_l  v13, v10, s11, 4
         v_st4_l  v14, v10, s11, 8
         v_st4_l  v15, v10, s11, 12
         v_ld16_g v12, v9, s1, 0        # A rows 8..15
         s_addi   s11, s11, 288         # 8 rows * 36
-        s_waitcnt 0
+        s_waitcnt_g 0
         v_st4_l  v12, v10, s11, 0
         v_st4_l  v13, v10, s11, 4
         v_st4_l  v14, v10, s11, 8
@@ -979,7 +1119,7 @@ fill_tile:
         s_addi   s11, s11, -288
         # ---- Bt: 8 rows = exactly one access ----
         v_ld16_g v12, v9, s4, 0
-        s_waitcnt 0
+        s_waitcnt_g 0
         v_st4_l  v12, v11, s11, 0
         v_st4_l  v13, v11, s11, 4
         v_st4_l  v14, v11, s11, 8
@@ -998,8 +1138,10 @@ Notes on the listing:
 * The write-back loop is written with `...` because it is 32 mechanical
   `acc_rd` / `v_st4_g` / `s_add` triples; `Mod` names the accumulator so the
   sequence has no indexing logic.
-* `s_waitcnt 48` means "at most 3 outstanding LDS operations", i.e. wait for
-  the older triple while the newer triple is still in flight.
+* `s_waitcnt_l 3` means "at most 3 outstanding LDS operations", i.e. wait for
+  the older triple while the newer triple is still in flight.  Every one of
+  the fourteen waits in this listing names exactly one counter and none needs
+  both, which is the argument in section 4.10 for splitting them.
 * The fill has **one** staging quad, so its three `v_ld16_g` accesses cannot
   overlap each other: each one's global latency is exposed behind only four
   store instructions.  With four resident waves this is invisible - the loop
@@ -1197,7 +1339,7 @@ In descending order of how likely it is to be wrong:
 2. **Whether 4 resident waves are enough to hide global latency.**  The
    double-buffered fill issues its loads one whole `KT` panel ahead, which
    gives roughly 1024 cycles of slack against an assumed 40-cycle global
-   latency.  That is generous.  But the `s_waitcnt 0` before the barrier
+   latency.  That is generous.  But the `s_waitcnt_l 0` before the barrier
    serialises the whole workgroup on the slowest wave, and I have not modelled
    barrier skew properly - the flat 32-cycle bubble in section 7.2 is a guess.
 3. **The cross-lane A-fragment read.**  I claim it is a 16:1 multiplexer
@@ -1231,15 +1373,16 @@ throughput halves to 32 MAC/cycle, and every cycle count and GMAC/s figure in
 section 7 is **2x optimistic** - while every *instruction* count, byte count
 and arithmetic intensity stays exactly right, because those are properties of
 the listing.  The fallback is not a redesign: it is the same ISA at half
-speed, with `s_waitcnt`-visible timing unchanged.  Tier 2 measures this
+speed, with `s_waitcnt`-visible timing unchanged (both counters).  Tier 2 measures this
 directly through `perf_mma_busy`, and it is the single most valuable number
 the RTL will produce.
 
 ### 6.3 Decisions taken, and what is still open
 
-The first draft of this document ended with six open questions.  Four have
-been answered and are now part of the specification; they are recorded here
-rather than deleted, because the reasoning matters more than the outcome.
+The first draft of this document ended with six open questions.  **All six
+have now been answered** and are part of the specification; they are recorded
+here rather than deleted, because the reasoning matters more than the
+outcome.
 
 | # | Question | Decision | Where it lands |
 |---|----------|----------|----------------|
@@ -1247,10 +1390,10 @@ rather than deleted, because the reasoning matters more than the outcome.
 | 2 | Wave width 16 or 32? | **16, for the first implementation.**  32 stays on the table as a later widening, not as a competing design. | 1.1, 7.5 |
 | 3 | Add a wider vector load? | **Added**, as `v_ld16_g` *and* `v_st16_g`, with a test at tier 2. | 4.8, 7.4 |
 | 4 | 32 accumulators per lane, or 16? | **32.** | 2.3, 5.4 |
-| 5 | Should the scalar unit be a widened `cpu16.v`? | *still open* | - |
-| 6 | Should `s_waitcnt` split into two counters? | *still open* | - |
+| 5 | Should the scalar unit be a widened `cpu16.v`? | **Yes.**  The scalar opcode map is realigned onto cpu16's numbering and cpu16's holes are kept as holes. | 4.3, 4.13 |
+| 6 | Should `s_waitcnt` split into two counters? | **Yes**, into `s_waitcnt_g` (0xb1) and `s_waitcnt_l` (0xb2). | 4.10 |
 
-Three notes on the decisions, since none of them is free:
+Five notes on the decisions, since none of them is free:
 
 * **Wave width 16 "firstly" is a sequencing decision, not a closed one.**  The
   ISA is written so that widening to 32 changes the `exec` mask from 16 to 32
@@ -1268,18 +1411,24 @@ Three notes on the decisions, since none of them is free:
   to 8 accumulators per lane to fit a TinyTapeout die.  That is a
   configuration of this ISA, not a different ISA, and the tension is real and
   unresolved: the spec says 32 and the cheapest tapeout says 8.
+* **Reusing `cpu16.v` buys less implementation effort than it looks and more
+  coherence than it looks.**  Every width in that module changes (section
+  4.13); what survives is the control skeleton, the ALU semantics and - with
+  no adjustment needed at all - the five branch opcodes.  It also promotes
+  three known non-synthesisable constructs in `cpu16.v` from "clean up before
+  a tapeout" to "clean up before starting", which is the decision's real
+  price.  It is paid in work the repo wanted done anyway, protected by tests
+  that already exist.
+* **Splitting `s_waitcnt` costs the GEMM kernel nothing and removes a latent
+  correctness trap.**  All fourteen waits in section 5.3 name exactly one
+  counter, so the instruction count is unchanged.  The trap was that with two
+  4-bit fields, "do not care about the other counter" and "wait until at most
+  15 are outstanding" were the same encoding - fine today, silently wrong the
+  moment a queue exceeds 15 entries.
 
-**Still open, for the reviewer:**
-
-1. **Whether the scalar unit should be a cpu16 core verbatim.**  Reusing
-   `cpu16.v` as the scalar unit with a widened register file would save a lot
-   of implementation effort and would make the two ISAs genuinely siblings,
-   at the cost of the 32-bit scalar registers and the imm16 encoding.
-2. **Whether `s_waitcnt` should be split into separate global and LDS
-   counters** rather than two nibbles of one immediate.  The GEMM kernel uses
-   `s_waitcnt 48` to wait on LDS while global loads are in flight, which
-   already relies on the two counters being independent; the question is only
-   whether they deserve separate opcodes.
+**No questions remain open.**  What is left is not a decision but a
+measurement: section 7.4's tier 2 exists to falsify the numbers, and section
+6.2 lists, in order, the seven things most likely to be wrong when it does.
 
 ---
 
@@ -1413,17 +1562,17 @@ useful than quietly claiming a GEMM win.
 #### The other two kernels, gpu16
 
 `axpy16k` (control, narrow accesses), 4-way unrolled: 20 instructions per 64
-elements (8 `v_ld4_g`, 4 `v_mad`, 4 `v_st4_g`, 1 `s_waitcnt`, 2 `s_add`,
+elements (8 `v_ld4_g`, 4 `v_mad`, 4 `v_st4_g`, 1 `s_waitcnt_g`, 2 `s_add`,
 1 `s_addi`, 1 `s_bnz_i`), 256 chunks over 4 waves.
 
 `axpy16k_w` (wide accesses), 2 chunks of 64 elements per loop iteration:
-10 instructions per chunk (2 `v_ld16_g`, 1 `s_waitcnt`, 4 `v_mad`,
+10 instructions per chunk (2 `v_ld16_g`, 1 `s_waitcnt_g`, 4 `v_mad`,
 1 `v_st16_g`, 2 `s_add`) plus `s_addi` and `s_bnz_i` per iteration, so 22
 instructions per 128 elements, 128 iterations over 4 waves.  It uses 9 VGPRs:
 `v0`-`v3` for `x`, `v4`-`v7` for `y`, `v8` for the per-lane offset `lane*16`.
 Only two of the four aligned quads are in use and the third cannot be paired
 with a fourth, which is why the two chunks in an iteration reuse the same
-registers and serialise on `s_waitcnt` rather than being double-buffered -
+registers and serialise on `s_waitcnt_g` rather than being double-buffered -
 see the quad-rule note in section 4.8.
 
 `escape4k`: 16 instructions per wave-iteration of the escape loop plus a
@@ -1519,12 +1668,26 @@ What has to be added:
    nor have their destination quad disturbed by `v_ld16_g`, verified by
    pre-poisoning both the quad and the destination memory; (e) that a
    `v_st16_g` followed by a `v_ld16_g` of the same address round-trips only
-   after `s_waitcnt`, which is the one hazard the ISA does *not* interlock
+   after `s_waitcnt_l`, which is the one hazard the ISA does *not* interlock
    (section 1.4).  The assembler side is tested too: `asm32` must **reject**
    `v_ld16_g v1, ...`, `v_ld16_g v7, ...` and any other non-4-aligned
    register, as a hard error in the style `asm16.cpp` already uses, and that
    rejection is itself a CTest entry asserting a non-zero exit status.
-6. `tests/cpu16_gemm8.s` - a genuine 8x8x8 GEMM on the **unmodified**
+6. `tests/gpu_waitcnt.s` - a test for the split counters, which exist
+   precisely because the packed form could not express "do not care".  It
+   issues a long run of global loads and a long run of LDS stores
+   simultaneously and checks that `s_waitcnt_g N` retires the global queue to
+   `N` while leaving the LDS queue untouched, and vice versa; that a count
+   larger than 15 is honoured, which the old packed encoding could not
+   represent; and that `s_waitcnt_l 0` followed by `s_barrier` is what makes
+   one wave's LDS writes visible to another, by having wave 0 write a pattern
+   that waves 1-3 read back.
+7. **A regression guard for decision 5**, which is a test of the repo rather
+   than of the chip: once `cpu16.v` has been made synthesisable, the three
+   existing cpu16 CTests must still pass unchanged.  They are the only thing
+   standing between that refactor and a silent behaviour change, and they
+   should be run before and after rather than only after.
+8. `tests/cpu16_gemm8.s` - a genuine 8x8x8 GEMM on the **unmodified**
    `cpu16.v`.  `A` is 64 B, `Bt` is 64 B and an `int16` `C` is 128 B, which
    is exactly the 256 bytes of `cpu16.v`'s data memory.  512 MACs at a
    predicted 11 cycles each is **5,632 cycles plus ~40 of setup**.  This is
@@ -1597,6 +1760,12 @@ of it:
    sequential state.  Neither survives synthesis.  `gpu16.v` must be written
    with non-blocking assignments to all sequential state, no `#` delays, no
    `initial` blocks for reset state, and no `$display`.
+   **Section 6.3's decision 5 escalates this from tier-3 hygiene to tier-2
+   blocking work**: if the scalar unit *is* a widened `cpu16.v`, then
+   `cpu16.v` has to be made synthesisable before the GPU is started, not
+   before it is taped out.  Section 4.13 argues this is the cheapest moment
+   to pay it, because the three existing cpu16 CTests already protect the
+   refactor.
 2. **A defined clock and reset strategy.**  One clock domain, one
    synchronous active-low reset that initialises `PC`, `exec`, the wave
    scoreboard and nothing else; register files and memories come up

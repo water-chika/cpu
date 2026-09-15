@@ -396,12 +396,17 @@ tiled GEMM kernel with its register-blocking analysis, and a benchmark plan
 with predicted numbers for three tiers - analytical model, RTL simulation
 through this CTest harness, and a real tapeout.
 
-Revision 2 fixes ```B``` pre-transposed as a precondition, settles the
-wavefront at 16 lanes for the first implementation, adds the wide
-```v_ld16_g```/```v_st16_g``` accesses with a correctness test and an A/B
-benchmark control, confirms 32 accumulators per lane, and promotes the
-accumulator file's 16-lane 32-bit read-modify-write to a stated architectural
-requirement.  Two questions are still open for review.
+Revision 3 closes all six of the spec's open questions.  ```B```
+pre-transposed is a precondition, the wavefront is 16 lanes for the first
+implementation, the wide ```v_ld16_g```/```v_st16_g``` accesses were added
+with a correctness test and an A/B benchmark control, 32 accumulators per lane
+is confirmed, and the accumulator file's 16-lane 32-bit read-modify-write is a
+stated architectural requirement.  The scalar unit is a widened
+```cpu16.v```, so gpu16's scalar opcodes are realigned onto cpu16's numbering
+- cpu16's five branch opcodes already matched exactly - and making
+```cpu16.v``` synthesisable becomes work that comes before the GPU rather than
+before a tapeout.  ```s_waitcnt``` is split into ```s_waitcnt_g``` and
+```s_waitcnt_l```.
 
 ## Known gaps
 
