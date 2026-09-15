@@ -20,6 +20,12 @@ target_compile_features(asm_core INTERFACE cxx_std_20)
 target_link_libraries(asm_core INTERFACE Threads::Threads)
 target_compile_options(asm_core INTERFACE -Wall -Wextra)
 
+# The compiler is the same shape: a header only pipeline (c16_kernel.hpp,
+# c16_compiler.hpp, c16_pipeline.hpp) that reuses the assembler's encoder, so
+# it carries asm_core along with its own optional GPU backend.
+add_library(c16_core INTERFACE)
+target_link_libraries(c16_core INTERFACE asm_core)
+
 # The ROCm/HIP backend is entirely optional.  Without hipcc the project still
 # configures, builds and tests; the "hip" backend simply reports itself
 # unavailable and the benchmark says so in its table.
@@ -33,9 +39,15 @@ if(CMAKE_HIP_COMPILER)
     target_compile_definitions(asm_hip PUBLIC ASM_HAVE_HIP)
     target_compile_options(asm_hip PRIVATE -Wall -Wextra)
     target_link_libraries(asm_core INTERFACE asm_hip)
-    message(STATUS "HIP found (${CMAKE_HIP_COMPILER}), building the GPU assembler backend")
+    add_library(c16_hip STATIC c16_hip.hip)
+    set_source_files_properties(c16_hip.hip PROPERTIES LANGUAGE HIP)
+    target_include_directories(c16_hip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(c16_hip PUBLIC C16_HAVE_HIP ASM_HAVE_HIP)
+    target_compile_options(c16_hip PRIVATE -Wall -Wextra)
+    target_link_libraries(c16_core INTERFACE c16_hip)
+    message(STATUS "HIP found (${CMAKE_HIP_COMPILER}), building the GPU backends")
 else()
-    message(STATUS "HIP not found, building without the GPU assembler backend")
+    message(STATUS "HIP not found, building without the GPU backends")
 endif()
 
 add_executable(asm asm.cpp)
@@ -46,6 +58,10 @@ target_link_libraries(asm16 PRIVATE asm_core)
 
 add_executable(asm_bench asm_bench.cpp)
 target_link_libraries(asm_bench PRIVATE asm_core)
+
+add_executable(c16 c16.cpp)
+target_link_libraries(c16 PRIVATE c16_core)
+
 
 add_executable(variables_to_registers variables_to_registers.cpp)
 target_compile_features(variables_to_registers PUBLIC cxx_std_20)
@@ -126,6 +142,7 @@ if(IVERILOG_EXECUTABLE AND VVP_EXECUTABLE)
     add_cpu_test(cpu16_label asm16 test16.v tests/cpu16_label.s -              cpu16_label.expect 200)
     add_cpu_test(cpu16_adc   asm16 test16.v tests/cpu16_adc.s   -              cpu16_adc.expect   100)
     add_cpu_test(cpu16_ldp   asm16 test16.v tests/cpu16_ldp.s   -              cpu16_ldp.expect   100)
+
 else()
     message(WARNING "iverilog/vvp not found, the simulation tests are disabled")
 endif()
