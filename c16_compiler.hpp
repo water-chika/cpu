@@ -73,7 +73,7 @@ constexpr uint8_t C16_OP_ADD = 4,  C16_OP_ADC = 5,    C16_OP_SUB = 6,  C16_OP_NE
 constexpr uint8_t C16_OP_MUL = 9,  C16_OP_DIV = 10,   C16_OP_MOV = 11, C16_OP_IMM = 12;
 constexpr uint8_t C16_OP_IMM_S = 13, C16_OP_SHL = 14, C16_OP_SHR = 15;
 constexpr uint8_t C16_OP_BNZ = 32, C16_OP_BZ = 33,    C16_OP_B = 34;
-constexpr uint8_t C16_OP_LD = 64,  C16_OP_ST = 65;
+constexpr uint8_t C16_OP_LD = 64,  C16_OP_ST = 65,    C16_OP_CL = 66;
 
 // ------------------------------------------------------------- diagnostics
 
@@ -556,6 +556,17 @@ private:
             int8_t reg = materialise(0, C16_REG_SCRATCH_A);
             constant(C16_REG_ADDR, static_cast<uint8_t>(address));
             insn(C16_OP_ST, reg, C16_REG_ADDR, 0);
+        }
+        else {
+            // Without an initialiser the slot would still hold whatever the
+            // last call to this function left in it, because every function
+            // has one fixed frame rather than a fresh one per call.  That is
+            // an undefined value, and undefined values make the language
+            // impossible to check against a reference implementation, so
+            // "int x;" means zero.  cpu16 clears a byte of memory in a single
+            // instruction, so this costs one word beyond the address.
+            constant(C16_REG_ADDR, static_cast<uint8_t>(address));
+            insn(C16_OP_CL, 0, C16_REG_ADDR, 0);
         }
         // A declaration only becomes visible after its own initialiser, so
         // "int x = x;" is an error rather than a read of itself.
