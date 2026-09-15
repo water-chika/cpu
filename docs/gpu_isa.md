@@ -14,6 +14,20 @@ The whole design is driven by one workload: **tiled integer GEMM**,
 `B` supplied pre-transposed.  Every choice below is justified by the kernel in
 section 5, and section 7 measures the result against a scalar cpu16 baseline.
 
+**Revision 4** adds section 8, which answers the reviewer's follow-up
+question - *should the instruction word be enlarged to carry 5-bit register
+fields and a 32-entry VGPR file?* - by costing three options against the
+section 7 numbers.  The answer is **no**, and the reason is that checking the
+premise against section 7.3 shrinks it: the 32-register argument was worth
+5.5% on the least important of six benchmarks and exactly zero on GEMM.  The
+recommendation is to take the 5-bit fields **for free** by absorbing the
+`Arg3` field that only two instructions use, implement 16 registers anyway,
+and fix the kernel problem with a dead bit in `v_ld16_g`'s `Mod` field.  That
+section also corrects an omission in section 7.5's area table, which never
+accounted for program memory.  Section 8 is an evaluation and a
+recommendation; **it does not change the encoding in sections 4.1 to 4.13**,
+which still describe the 32-bit 8/4/4/4/4/8 word as specified.
+
 **Revision 3.**  The first draft ended with six open questions (section 6.3).
 **All six have since been decided** and folded in; this revision is the
 result:
@@ -49,6 +63,7 @@ first.
 5. [A worked tiled GEMM kernel](#5-a-worked-tiled-gemm-kernel)
 6. [Deliberate omissions and low-confidence areas](#6-deliberate-omissions-and-low-confidence-areas)
 7. [Benchmark and evaluation plan](#7-benchmark-and-evaluation-plan)
+8. [Revision 4: should the instruction word grow to 32 registers?](#8-revision-4-should-the-instruction-word-grow-to-32-registers)
 
 ---
 
@@ -695,8 +710,12 @@ bound, not port-bound.
 VGPR for a per-lane address (almost all of them do) has only **three** quads
 left, which is enough to hold one 64-element chunk of two operands but not
 enough to double-buffer two chunks.  This is the binding constraint on the
-`axpy` kernel in section 7.3 and is the strongest argument in the document for
-a 32-entry VGPR file in a second revision.
+`axpy` kernel in section 7.3.  Revision 1 called this "the strongest argument
+in the document for a 32-entry VGPR file"; **section 8 checks that claim
+against the numbers and withdraws it.**  The kernel it binds is already at
+94.5% of the global port, so the whole prize is 5.5% on one benchmark, and
+section 8.4 shows the same 5.5% is available for one dead bit of this
+instruction's own `Mod` field.
 
 ### 4.9 LDS
 
@@ -1430,6 +1449,15 @@ Five notes on the decisions, since none of them is free:
 measurement: section 7.4's tier 2 exists to falsify the numbers, and section
 6.2 lists, in order, the seven things most likely to be wrong when it does.
 
+A seventh question was asked after revision 3 - *should the instruction word
+be enlarged so a 32-entry VGPR file fits?* - and is answered in **section 8**.
+It is kept separate from the table above because it is the only question whose
+answer was changed by checking the premise rather than by weighing the
+options: the argument for 32 registers was worth 5.5% on one benchmark and
+nothing on GEMM, which is less than it cost to ask.
+
+| 7 | Should the instruction word grow to carry 5-bit register fields? | **No.**  Absorb the `Arg3` field instead, which only `v_mad` and `v_dot4` use, and keep 16 registers implemented. | 8.5 |
+
 ---
 
 ## 7. Benchmark and evaluation plan
@@ -1985,3 +2013,307 @@ Every one of these is checkable.  The area, clock and power numbers come out
 of OpenLane the first time the design is hardened; the wall-clock numbers come
 out of a host timer on the demo board; the tier-1 cycle counts come out of
 CTest as soon as the RTL exists.
+
+---
+
+## 8. Revision 4: should the instruction word grow to 32 registers?
+
+Revision 3 ended with one item for the reviewer: `v_ld16_g` needs a 4-aligned
+VGPR quad, 16 VGPRs contain exactly four quads, a kernel holding a per-lane
+address register keeps only three, and three is enough to hold one chunk of
+two operands but not to double-buffer two.  Section 4.8 called that "the
+strongest argument in the document for a 32-entry VGPR file".  The reviewer
+asked the obvious follow-up: **32 registers need a 5-bit field, so should the
+instruction word grow to carry one?**
+
+This section answers that.  The short version is that the question contains a
+buried assumption worth examining before any of the three options is costed.
+
+### 8.1 First, how much is the problem actually worth?
+
+Section 4.8's claim was written from the encoding side and never checked
+against section 7.3's numbers.  Checking it changes the answer.
+
+The kernel the quad rule binds is `axpy16k_w`, and section 7.3 already reports
+it at **3,250 cycles against a 3,072-cycle global-port floor - 94.5% of the
+port**.  Double-buffering cannot create bandwidth.  The most it can do is hide
+the remaining latency and the branch bubbles, so:
+
+> **The entire prize for fixing the double-buffering problem is 178 cycles,
+> or 5.5%, on one of six benchmark kernels.**
+
+And it cannot help the kernel the ISA exists for.  `gemm256` runs at
+**90.7% matrix utilisation** (288,896 cycles against a 262,144-cycle matrix
+floor).  The 26,752-cycle gap is 32 cycles of barrier bubble per workgroup
+iteration plus the prologue and epilogue - section 5.4's accounting attributes
+none of it to register pressure, because the main loop's fill is already
+overlapped with `mma` by the two-phase `v1`-`v3` / `v4`-`v6` fragment split.
+More registers do not shorten a barrier.  A 32-entry VGPR file changes
+`gemm64`, `gemm128` and `gemm256` by **zero cycles and zero instructions**.
+
+So the true shape of the question is: what is a 5.5% improvement on the
+*least* important benchmark worth paying for?  That reframing does most of the
+work below, and it is the single most useful thing this section establishes.
+It should have been checked in revision 2, when `axpy16k_w`'s 94.5% figure was
+first computed; writing "strongest argument for 32 registers" two sections
+away from "94.5% of port" is exactly the kind of mistake a document this size
+invites.
+
+### 8.2 Option (a) - keep 32-bit instructions and 16 VGPRs
+
+Do nothing.  Kernels live with three usable quads and no double-buffering.
+
+| | |
+|---|---|
+| Section 7.3 effect | baseline: `gemm*` unchanged, `axpy16k_w` 2,816 instructions / 3,250 cycles, 94.5% of port |
+| Section 7.5 area | `gpu16-full` **3.3 mm2**; `gpu4-tiny` **0.19 mm2 = 12 TinyTapeout tiles** |
+| Section 7.6 cost | **$620** to a first `gpu4-tiny` chip; 0.39 GMAC/s/mm2 |
+| Encoding | unchanged |
+| Risk | a future kernel with more live state than `axpy` has no room at all |
+
+The cost of option (a) is not the 5.5%.  It is that **the 5th bit is gone
+forever**.  Once `v_mad`'s Arg3 and the 8-bit Mod are both spent, there is no
+32-bit rearrangement that yields 5-bit register fields later without
+renumbering every instruction in the ISA - the one thing section 4.13 just
+spent a page arguing gpu16 should never do to its own encoding, having gone to
+some trouble to align with cpu16's.
+
+That is the genuine argument against (a), and it is an argument about
+option value, not about performance.
+
+### 8.3 Option (b) - widen the instruction word
+
+Carry 5-bit register fields by growing the word to 40, 48 or 64 bits.
+
+**What it does *not* cost.**  Two objections that look obvious are wrong and
+should be dismissed rather than used as padding:
+
+* *Alignment.* Program memory is word-addressed and separate (section 3), so a
+  40-bit or 48-bit instruction word is entirely legal - `PC` indexes words,
+  not bytes.  Harvard architecture is what makes this a non-issue, and the
+  `.list` readability requirement of section 4.1 survives too: 40 bits is 10
+  hex digits, 48 is 12.  This is a real freedom, not a constraint.
+* *Fetch bandwidth.* One instruction per cycle per CU is 4 B/cycle at 32 bits
+  and 8 B/cycle at 64.  Against a 64 B/cycle global port that is noise.
+
+**What it does cost.**
+
+1. **Program-memory area, paid on every instruction whether or not it uses a
+   high register.**  Section 7.5's area table omits program memory entirely,
+   which is an omission in this document and is corrected here.  The six
+   benchmark kernels are a few hundred static instructions, so a realistic
+   store is 512 instructions: **2 KiB at 32 bits, about 0.24 mm2** in
+   sky130 SRAM macros at section 7.5's 0.12 mm2/KiB.  At 64 bits it is 4 KiB
+   and **0.48 mm2**.
+
+   > **Widening the word to afford 32 registers costs +0.24 mm2; simply
+   > building the 32 registers costs +0.55 mm2.  The tax on the instruction
+   > path is roughly half the price of the thing it is trying to buy, and it
+   > is paid by every configuration, including the ones that implement 8
+   > registers and can never use the field.**
+
+2. **The scalar half of the ISA pays all of it and gets none of it.**  A
+   scalar ALU instruction needs 8 bits of opcode and three 4-bit register
+   fields - 20 bits.  A scalar immediate form needs 8 + 4 + 4 + 16 = 32.
+   Nothing in the scalar half wants a 5-bit vector field.  In a 64-bit word,
+   every `s_add` in every kernel carries 32 dead bits.
+3. **It is the one change that damages the section 4.13 relationship.**  The
+   scalar unit is a widened `cpu16.v`, and the family story is that the word
+   doubles: 16 bits for cpu16, 32 for gpu16.  40 and 48 break the pattern
+   outright.  64 preserves it arithmetically while doubling the padding in
+   point 2.  This is soft, but section 4.13 is the only thing making these two
+   machines a family rather than two projects, and it was committed to one
+   revision ago on the reviewer's own instruction.
+4. **A variable-length compromise is worse than either.**  32-bit scalar plus
+   64-bit vector instructions would fix point 2, at the price of a length bit,
+   a fetch path that can straddle, and the loss of "every instruction has the
+   same shape" - a property section 4.1 inherits deliberately from cpu8 and
+   cpu16 and the single largest reason this ISA is small enough for one person
+   to implement.  Rejected.
+
+| | 64-bit word + 32 VGPRs |
+|---|---|
+| Section 7.3 effect | `gemm*` **unchanged**; `axpy16k_w` 3,250 -> ~3,072 cycles, **5.5% better**, instruction counts unchanged |
+| Section 7.5 area | `gpu16-full` 3.3 -> **4.09 mm2** (+0.55 registers, +0.24 program memory); `gpu4-tiny` 0.19 -> **0.27 mm2 = about 17 tiles**, before counting its wider program store |
+| Section 7.6 cost | `gpu4-tiny` **falls off TinyTapeout**, whose ceiling is about 16 tiles - the $620 route is lost |
+| Section 7.6 derived | `gpu16-full` area efficiency **0.39 -> 0.31 GMAC/s/mm2, a 19% regression in the headline metric** |
+
+That last row is the verdict on option (b).  It buys 5.5% on the benchmark
+that matters least and gives back **19%** of the number section 7.6 uses to
+justify the entire design.  `gemm256` throughput is unchanged at 1.28 GMAC/s
+because the kernel is matrix-bound, so the whole regression is area the design
+gained without gaining any work.
+
+### 8.4 Option (c) - stay at 32 bits and find the bit elsewhere
+
+Four candidates, of which two are dead, one is the answer, and one is a
+better answer to a different question.
+
+**(c1) Absorb Arg3 - this works, and it is nearly free.**
+
+`Arg3` is used by exactly **two instructions in the entire ISA**, `v_mad` and
+`v_dot4` (section 4.2).  Dropping it repacks the word as:
+
+```
+|1f          18|17    13|12     8|7     3|2 1 0|
+|    Opcode  8 | Arg0 5 | Arg1 5 | Arg2 5|     |
+```
+
+8 + 5 + 5 + 5 + 8 for Mod is **31 bits, with one bit spare**.  Three 5-bit
+register fields and the full 8-bit Mod both survive.
+
+The cost is that `v_mad` and `v_dot4` lose their third source.  That cost is
+very close to zero because **both are already accumulate forms**: section
+4.6 defines them as `v[dst] = v[src0] * v[src1] + v[src2]` and
+`v[dst] = v[src2] + sum_k ...`.  Making the accumulator implicitly the
+destination - `v[dst] += v[src0] * v[src1]` - preserves the operation exactly
+where the destination is the accumulator, which is what both benchmark uses
+are.  `axpy16k_w`'s four `v_mad` per chunk compute `y += a*x` into `y`;
+they become four two-source `v_mac` with **the same instruction count and the
+same cycle count**.  The GEMM kernel uses neither instruction.
+
+What is genuinely lost is the *non-destructive* three-operand form, which
+costs one extra `v_mov` wherever a kernel needs the addend to stay live.
+Neither benchmark does; a stencil or an FFT butterfly might.
+
+**(c2) Fewer scalar registers - dead, and section 5.2 already proves it.**
+
+Section 5.2's allocation ends "All 16 scalar and all 16 vector registers are
+live in the main loop", and the scalar table backs that up with thirteen
+named non-temporary values: a loop counter, four fill pointers and bases,
+`&C`, `K`, `N`, `8*K`, two LDS read bases, the other buffer's base and the
+wave id.  Cutting to 8 SGPRs would force spill and reload to LDS inside the
+inner loop of the kernel the machine exists to run.  Rejected on evidence,
+not on taste.
+
+**(c3) An implied or aligned quad encoding - solves nothing as posed, but
+points at the actual fix.**
+
+As posed this is a misdiagnosis, and saying so is more useful than costing
+it: `v_ld16_g`'s Arg0 already uses only 2 of its 4 bits, so tightening its
+encoding frees bits *in that one instruction* and does nothing for the field
+width every other instruction needs.  The quad rule is a symptom of having 16
+registers, not the cause.
+
+Relaxing the alignment so a quad may start anywhere does not help either, and
+the arithmetic is worth writing down.  `axpy16k_w` holds 4 VGPRs of `x`, 4 of
+`y` and 1 lane-address register.  Double-buffering two chunks needs
+`2 x (4 + 4) + 1 = ` **17 registers**.  Not 32 - **seventeen**.  The kernel
+misses by exactly one register, which is why it is worth one more look:
+
+> **(c3') Give `v_ld16_g` and `v_st16_g` an implicit lane stride.**  Their
+> effective address is truncated down to a multiple of 16, so the low 4 bits
+> of the 8-bit `Mod` field are already dead in these two instructions.  Spend
+> one of them as a mode bit meaning "lane `l` accesses `s[Arg2] + Mod +
+> 16*l`, ignoring Arg1".  The contiguous wide access - overwhelmingly the
+> common case, and the only case `axpy` uses - then needs **no address VGPR
+> at all**, and the kernel double-buffers in 16 registers with one to spare.
+
+That is a zero-bit, zero-area change that captures the whole 5.5%.  It does
+not serve the GEMM fill, whose lane offset is `(lane>>1)*K + (lane&1)*16` and
+genuinely needs the VGPR term - but the GEMM fill is not the bottleneck and
+does not double-buffer anyway.
+
+The alternative of recomputing the address each iteration instead of holding
+it costs 2 instructions on a 22-instruction loop, **9%, to chase 5.5%**.  It
+is a losing trade and is recorded here so it is not rediscovered later.
+
+**(c4) A register window or base register - the right idea for a machine this
+is not.**
+
+VGPR number = `window_base + Arg`, with the base in an SGPR or in wave state.
+The objection is not area, which is one adder, but that it puts a *data*
+dependency in the decode stage: the scoreboard tracks physical registers, so
+it cannot check a hazard until the base is resolved, and a write to the base
+creates a stall against every following vector instruction.  Decode is
+currently the simplest part of the design and the part inherited most directly
+from `cpu16.v` (section 4.13).  It also destroys static register knowledge in
+the assembler and in `.list` output, which is a real loss on a machine whose
+debugging story is "read the listing".
+
+Four resident waves already bank the register file; a window adds a second,
+software-visible banking scheme on top.  Rejected for a 5.5% prize.
+
+| Option | Section 7.3 | `gpu16-full` area | `gpu4-tiny` | Encoding cost |
+|--------|-------------|-------------------|-------------|---------------|
+| (a) status quo | baseline | 3.3 mm2 | 12 tiles, $620 | none, but the 5th bit is gone forever |
+| (b) 64-bit word + 32 VGPRs | `gemm*` unchanged, `axpy16k_w` **-5.5%** | **4.09 mm2**, 0.39 -> 0.31 GMAC/s/mm2 | **~17 tiles, over the ceiling** | every instruction 2x; scalar half all waste |
+| (c1) absorb Arg3 | unchanged | 3.3 mm2 | 12 tiles, $620 | `v_mad`/`v_dot4` become 2-source |
+| (c2) fewer SGPRs | **GEMM inner loop spills** | 3.3 mm2 | 12 tiles | rejected |
+| (c3') implicit lane stride | `axpy16k_w` **-5.5%** | 3.3 mm2 | 12 tiles, $620 | **one dead Mod bit** |
+| (c4) register window | unchanged | +~0 | 12 tiles | new decode-stage hazard class |
+
+### 8.5 Recommendation
+
+**Do (c1) and (c3'), and do not widen the instruction word.**  Concretely:
+
+1. **Repack to 8 / 5 / 5 / 5 / 8 with one spare bit**, absorbing `Arg3`.
+   `v_mad` and `v_dot4` become two-source accumulate-into-destination forms,
+   renamed `v_mac` and `v_dot4_acc` to make the destructive semantics obvious
+   at the call site.
+2. **Implement only 16 VGPRs in the first silicon.**  Bit 4 of every register
+   field must be written zero and is checked by the assembler.  `gpu4-tiny`
+   implements 8.  Nothing in section 7.3, 7.5 or 7.6 changes by a single
+   cycle, square micron or dollar.
+3. **Add the implicit-lane-stride mode bit to `v_ld16_g` / `v_st16_g`**, which
+   is what actually unblocks the `axpy` double-buffering, inside 16 registers,
+   for no bits and no area.
+4. **Revisit 32 VGPRs only when a benchmark demands it** - at which point the
+   encoding already allows it and the decision is a pure area trade, made with
+   measurements from tier 2 rather than from this document's estimates.
+
+The reasoning in one line: *the register file, not the encoding, is what 32
+registers cost; so buy the encoding now, because it is free, and defer the
+register file, because it is not.*
+
+This also disposes of the framing the question arrived in.  "Enlarge the word
+to fit the registers" assumes the encoding is the binding constraint.  It is
+not - the binding constraint is 0.55 mm2 of flip-flops on a 3.3 mm2 die, and
+widening the word adds 0.24 mm2 to that bill rather than removing anything
+from it.
+
+### 8.6 What I would have to be wrong about
+
+In rough order of how likely each is to actually bite:
+
+1. **That `v_mad`'s third operand is dead weight.**  This is the real risk in
+   (c1) and it is a claim about *future* kernels, which is the weakest kind of
+   claim in this document.  Two benchmarks is a thin basis.  If a
+   non-destructive three-operand multiply-add turns out to be wanted in an
+   inner loop, (c1) costs a `v_mov` per use, and the spare 31st bit will not
+   rescue it.  **Cheap insurance: write the stencil or FFT kernel as a paper
+   exercise before committing to (c1).**  That is an afternoon and it converts
+   the weakest assumption here into a measured one.
+2. **That section 7.3's 90.7% matrix utilisation is right.**  The whole
+   argument rests on GEMM being matrix-bound and `axpy` being port-bound.
+   Both come from the Model-A hand analysis in section 7.2, which section 7.4
+   exists precisely to falsify.  If tier 2 shows the GEMM main loop is
+   actually limited by fill register pressure, 32 registers stop being worth
+   5.5% and this recommendation is wrong.  It is testable before any of it is
+   built, which is the point of the ladder.
+3. **That the machine stays at 4 waves and int8.**  Sixteen VGPRs is
+   comfortable for this workload and would be tight for FP32, where every
+   value costs two registers, or for a deeper pipeline needing more in flight.
+   Note this failure mode *supports* the recommendation rather than
+   undermining it: it is the case where reserving the 5th bit now pays.
+4. **That (c3') is implementable as cheaply as claimed.**  The lane-stride
+   address generator is a shifter and an adder per lane, but it is a *second*
+   address path alongside the three-term one, and it lands in the address
+   coalescer - lumped into section 7.5's 0.30 mm2 "decode, scheduler,
+   scoreboard, coalescer" line, which is the least itemised number in the
+   area table.
+5. **That the area estimates are anywhere near right.**  They are
+   gate-count-times-density figures and could be off by 2x. But the
+   recommendation depends on a *ratio* - a per-instruction tax versus a
+   one-time register-file cost - and that ratio is robust to a common-mode
+   error in the density anchor.
+6. **That program memory is on-chip.**  It is assumed to be, and section 7.5
+   never listed it, which is a gap this section closes. If it were off-chip,
+   option (b) would get worse, not better: instruction fetch would then
+   compete for the pins that section 7.5 already identifies as the binding
+   constraint on real silicon.  The recommendation survives being wrong here.
+
+**Deliberately not decided.**  Whether to spend the spare 31st bit at all.  It
+is worth more unspent than it is worth as a flag nobody planned, and this
+document has already made the mistake once of describing a constraint in one
+section without checking it against the numbers in another.

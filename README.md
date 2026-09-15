@@ -423,6 +423,18 @@ stated architectural requirement.  The scalar unit is a widened
 before a tapeout.  ```s_waitcnt``` is split into ```s_waitcnt_g``` and
 ```s_waitcnt_l```.
 
+Revision 4 adds section 8, which answers a follow-up question: should the
+instruction word be enlarged to carry 5-bit register fields and a 32-entry
+vector register file?  The answer is no.  Checking the premise against the
+benchmark numbers shrank it - the kernel that argument rested on is already at
+94.5% of the global memory port, so the whole prize was 5.5% on one benchmark
+and nothing at all on GEMM, while widening the word would have cost more area
+in program memory than the extra registers cost by themselves and pushed the
+small configuration off the cheapest tapeout route.  The recommendation is to
+take the 5-bit fields for free instead, by absorbing an argument field that
+only two instructions use, implement 16 registers anyway, and solve the actual
+kernel problem with a bit that is already dead in ```v_ld16_g```.
+
 ## Removed modules
 
 Two modules were deleted rather than repaired, because neither could be given
