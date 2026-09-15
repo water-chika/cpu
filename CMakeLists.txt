@@ -20,6 +20,24 @@ target_compile_features(asm_core INTERFACE cxx_std_20)
 target_link_libraries(asm_core INTERFACE Threads::Threads)
 target_compile_options(asm_core INTERFACE -Wall -Wextra)
 
+# The ROCm/HIP backend is entirely optional.  Without hipcc the project still
+# configures, builds and tests; the "hip" backend simply reports itself
+# unavailable and the benchmark says so in its table.
+include(CheckLanguage)
+check_language(HIP)
+if(CMAKE_HIP_COMPILER)
+    enable_language(HIP)
+    add_library(asm_hip STATIC asm_hip.hip)
+    set_source_files_properties(asm_hip.hip PROPERTIES LANGUAGE HIP)
+    target_include_directories(asm_hip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(asm_hip PUBLIC ASM_HAVE_HIP)
+    target_compile_options(asm_hip PRIVATE -Wall -Wextra)
+    target_link_libraries(asm_core INTERFACE asm_hip)
+    message(STATUS "HIP found (${CMAKE_HIP_COMPILER}), building the GPU assembler backend")
+else()
+    message(STATUS "HIP not found, building without the GPU assembler backend")
+endif()
+
 add_executable(asm asm.cpp)
 target_link_libraries(asm PRIVATE asm_core)
 
