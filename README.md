@@ -28,6 +28,7 @@ straight away.
 | Test | Program | Checks |
 |------|---------|--------|
 | cpu8_sum | tests/cpu8_sum.s | 8 bit CPU sums 1..8 out of data memory into r2 |
+| cpu8_sum_list | cpu8_asm/sum.s | 8 bit CPU sums the whole of data.list (1..16) into r2 |
 | cpu8_label | tests/cpu8_label.s | 8 bit assembler resolves a label at address 75 and the CPU branches there |
 | cpu16_sum | tests/cpu16_sum.s | 16 bit CPU sums 1..8 out of data memory into r2 |
 | cpu16_count | cpu16_asm/test.s | 16 bit CPU counts to 4 and branches |
@@ -379,5 +380,4 @@ requirement.  Two questions are still open for review.
 ## Known gaps
 
 * ```memory_ramb18e1.v``` does not compile: it redeclares every port.
-* ```cpu8_asm/sum.s``` sums 32 words but ```data.list``` only holds 14, so it
-  reads uninitialised memory.  ```tests/cpu8_sum.s``` is the fixed version.
+* ```variables_to_registers``` is not implemented.
