@@ -3,20 +3,29 @@
 # The data file holds 1..8, so the expected result is 36 (0x24).
 #
 # Register use:
-#   r0  scratch / loaded value / constants
+#   r0  src1/dst1 scratch: loaded value, constants, and the "la" work register
 #   r1  index into data memory
 #   r2  accumulator
 #   r3  index - limit
 #   r4  limit (8)
-#   r6  address of the halt instruction
+#   r5  address of the loop body
+#   r6  address of the halt branch
+#
+# "la <dst> <label>" is the assembler pseudo instruction that loads a label's
+# address into a register.  It builds the address 3 bits at a time through
+# whichever register set_src1_dst1 last named, so that register must not be
+# the destination.
 
 set_src1_dst1 r4
 imm 1
 shl 3
 
 set_src1_dst1 r0
+la r5 loop
+la r6 halt
+set_b_target r5
 
-# loop start, address 4
+loop:
 set_data_address r1
 ld r0
 add r2
@@ -26,21 +35,10 @@ mov0 r1
 mov r3
 mov0 r4
 sub r3
-imm 4
 condition_nz r3
-set_b_target r0
 b b
 
-# Padding so that the halt branch below lands on address 24, which is the
-# only nearby address an "imm"/"shl" pair can build (3 << 3).  Once the
-# assembler grows label support this can go away.
-condition_1 condition_1
-condition_1 condition_1
-condition_1 condition_1
-
-# halt: spin on the branch at address 24 forever
-set_src1_dst1 r6
-imm 3
-shl 3
+# halt: spin on this branch forever
+halt:
 set_b_target r6
 b b

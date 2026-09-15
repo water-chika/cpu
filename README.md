@@ -28,8 +28,10 @@ straight away.
 | Test | Program | Checks |
 |------|---------|--------|
 | cpu8_sum | tests/cpu8_sum.s | 8 bit CPU sums 1..8 out of data memory into r2 |
+| cpu8_label | tests/cpu8_label.s | 8 bit assembler resolves a label at address 75 and the CPU branches there |
 | cpu16_sum | tests/cpu16_sum.s | 16 bit CPU sums 1..8 out of data memory into r2 |
 | cpu16_count | cpu16_asm/test.s | 16 bit CPU counts to 4 and branches |
+| cpu16_label | tests/cpu16_label.s | 16 bit assembler resolves a label at address 75 and the CPU branches there |
 
 To watch a program execute, run the simulation by hand and add ```+trace```:
 
@@ -43,9 +45,9 @@ vvp /tmp/sim16 +program=/tmp/program.list +data=tests/sum.data \
 ```+program_words=<n>``` and ```+data_words=<n>``` are optional and only stop
 ```$readmemh``` warning that the file is shorter than the whole memory.
 
-Since the assembler has no label support yet, every program has to end by
-branching to its own address to halt, and that address has to be built by
-hand out of an immediate and a shift.
+A program still halts by branching to its own address, but that address is
+now written as a label rather than built by hand out of an immediate and a
+shift.
 
 ## Instruction Set Architecture - 8 Bit
 
@@ -163,9 +165,55 @@ bnz r3
 
 ### Label Parse
 
-Not implemented.
+Both assemblers resolve labels in two passes, so a label may be used before it
+is defined.
 
-This library or executable will translate labels to memory address of instruction.
+A **label definition** is a token ending in ```:```.  It may be on a line of
+its own or in front of an instruction, and it names the address of the next
+instruction:
+
+```
+loop:
+add r1 r4 r1
+```
+
+A label is **used** through the one pseudo instruction, ```la```:
+
+```
+la <dst> <label>
+```
+
+which loads the 8 bit address of ```<label>``` into register ```<dst>```.
+That is what a branch needs, because on both CPUs the branch target lives in
+a register rather than in the instruction.  A typical program is now:
+
+```
+la r6 loop
+la r7 halt
+
+loop:
+...
+bnz r5 r6 0
+
+halt:
+b 0 r7 0
+```
+
+```la``` expands to a fixed number of real instructions whatever the address
+is - 3 on the 16 bit CPU, 10 on the 8 bit one - so the first pass can place
+every label without having to resolve anything, and no address is ever out of
+reach.
+
+On the 16 bit CPU the expansion is one ```imm``` and two ```imm_s```, one per
+3 bit group of the address.  The 8 bit CPU has no or-with-immediate, so there
+```la``` folds the address together 3 bits at a time through whichever
+register ```set_src1_dst1``` last named.  That register is therefore a
+scratch: it is clobbered, it must be set before the first ```la```, and it
+must not be the destination.  The assembler tracks it and refuses the program
+otherwise rather than emitting something that quietly does the wrong thing.
+
+Defining a label twice, using an undefined label, and a program that does not
+fit in 256 instructions are all hard errors.
 
 ### Variables To Register
 
@@ -330,8 +378,6 @@ requirement.  Two questions are still open for review.
 
 ## Known gaps
 
-* The assembler has no label support, so branch targets are built by hand out
-  of an immediate and a shift.
 * ```memory_ramb18e1.v``` does not compile: it redeclares every port.
 * ```cpu8_asm/sum.s``` sums 32 words but ```data.list``` only holds 14, so it
   reads uninitialised memory.  ```tests/cpu8_sum.s``` is the fixed version.
