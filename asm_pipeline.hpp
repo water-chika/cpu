@@ -453,7 +453,7 @@ inline bool asm_run_classify(const std::vector<char>& buf,
                              std::string* err) {
     out.reset(lines.size());
     if (opt.backend == asm_backend::hip) {
-        return asm_hip_classify(ISA::word_bytes == 1 ? 8 : 16, buf.data(), buf.size(),
+        return asm_hip_classify(ISA::isa_tag, buf.data(), buf.size(),
                                 lines.data(), lines.size(), out.data(), err);
     }
     unsigned threads = opt.backend == asm_backend::threads ? opt.threads : 1;
@@ -477,7 +477,7 @@ inline bool asm_run_encode(const asm_statement* statements, size_t n,
                            const asm_options& opt,
                            std::string* err) {
     if (opt.backend == asm_backend::hip) {
-        return asm_hip_encode(ISA::word_bytes == 1 ? 8 : 16, statements, n,
+        return asm_hip_encode(ISA::isa_tag, statements, n,
                               out.data(), out.size(), fmt, err);
     }
     unsigned threads = opt.backend == asm_backend::threads ? opt.threads : 1;

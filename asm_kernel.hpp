@@ -331,6 +331,10 @@ ASM_HD inline uint8_t asm_parse_fixed(const char* s, const asm_span* t, uint32_t
 struct asm_cpu8 {
     static constexpr const char* tool = "asm";
     static constexpr uint32_t word_bytes = 1;
+    // Which ISA this is, for the backends that dispatch at run time
+    // rather than at compile time - asm_hip.hip is compiled once and
+    // cannot be a template across the boundary.
+    static constexpr int isa_tag = 8;
     static constexpr uint32_t la_words = 10;
     static constexpr uint32_t insn_tokens = 2;   // "<op> <arg>"
     static constexpr uint32_t nargs = 1;
@@ -451,6 +455,10 @@ struct asm_cpu8 {
 struct asm_cpu16 {
     static constexpr const char* tool = "asm16";
     static constexpr uint32_t word_bytes = 2;
+    // Which ISA this is, for the backends that dispatch at run time
+    // rather than at compile time - asm_hip.hip is compiled once and
+    // cannot be a template across the boundary.
+    static constexpr int isa_tag = 16;
     static constexpr uint32_t la_words = 3;
     static constexpr uint32_t insn_tokens = 4;   // "<op> <arg0> <arg1> <arg2>"
     static constexpr uint32_t nargs = 3;
@@ -791,6 +799,10 @@ ASM_HD inline bool gpu16_reg(const char* s, uint32_t n, char prefix, int32_t* ou
 struct asm_gpu16 {
     static constexpr const char* tool = "asm_gpu16";
     static constexpr uint32_t word_bytes = 4;
+    // Which ISA this is, for the backends that dispatch at run time
+    // rather than at compile time - asm_hip.hip is compiled once and
+    // cannot be a template across the boundary.
+    static constexpr int isa_tag = 32;
     static constexpr uint32_t la_words = 1;      // one s_addpc
     static constexpr uint32_t insn_tokens = 0;   // per instruction, see parse()
     static constexpr uint32_t nargs = ASM_MAX_ARGS;

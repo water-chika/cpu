@@ -146,6 +146,9 @@ bool asm_hip_classify(int isa, const char* buf, size_t buf_bytes,
     if (isa == 8) {
         return classify<asm_cpu8>(buf, buf_bytes, lines, nlines, out, err);
     }
+    if (isa == 32) {
+        return classify<asm_gpu16>(buf, buf_bytes, lines, nlines, out, err);
+    }
     return classify<asm_cpu16>(buf, buf_bytes, lines, nlines, out, err);
 }
 
@@ -157,6 +160,9 @@ bool asm_hip_encode(int isa, const asm_statement* statements, size_t n,
     }
     if (isa == 8) {
         return encode<asm_cpu8>(statements, n, out, out_bytes, fmt, err);
+    }
+    if (isa == 32) {
+        return encode<asm_gpu16>(statements, n, out, out_bytes, fmt, err);
     }
     return encode<asm_cpu16>(statements, n, out, out_bytes, fmt, err);
 }

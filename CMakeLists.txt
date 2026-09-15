@@ -121,7 +121,7 @@ find_program(VVP_EXECUTABLE vvp)
 
 enable_testing()
 
-# The backends have to agree byte for byte, on both ISAs and both output
+# The backends have to agree byte for byte, on every ISA and both output
 # formats, or the parallel assembler is worthless.  These run whatever
 # backends the machine has: with no GPU the hip column simply says so.
 foreach(isa 8 16)
@@ -133,6 +133,20 @@ foreach(isa 8 16)
         set_tests_properties(backends_cpu${isa}_${format}
                              PROPERTIES FAIL_REGULAR_EXPRESSION "TEST FAIL")
     endforeach()
+endforeach()
+
+# And the same obligation for gpu16, whose --isa is 32 because the switch is
+# named after the instruction word as 8 and 16 are.  This one is worth more
+# than the other two: gpu16 is where the per line kernel got its typed
+# operands, its variable operand count and its comma separated syntax, so if
+# a backend is going to disagree with the others it will disagree here.
+foreach(format hex bin)
+    add_test(
+        NAME backends_gpu16_${format}
+        COMMAND asm_bench --isa 32 --lines 200000 --format ${format} --check
+    )
+    set_tests_properties(backends_gpu16_${format}
+                         PROPERTIES FAIL_REGULAR_EXPRESSION "TEST FAIL")
 endforeach()
 
 # The compiler has the same obligation twice over: every backend of a path

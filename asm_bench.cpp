@@ -52,6 +52,36 @@ const char* const cpu16_ops[] = {
     "srl", "srr", "sar", "ld", "st", "cl", "swap",
 };
 
+// gpu16's operands are typed, so the mnemonics are grouped by the shape of
+// the line they need rather than listed flat.  Between them these cover the
+// scalar and the vector register files, both immediate widths, the Mod
+// field and a four operand instruction, which is every path through the
+// gpu16 parser that a random program can reach.
+const char* const gpu16_sss[] = {           // op sD, sA, sB
+    "s_and", "s_or", "s_xor", "s_add", "s_sub", "s_mul",
+    "s_min", "s_max", "s_shl", "s_shr", "s_sar",
+};
+const char* const gpu16_vvv[] = {           // op vD, vA, vB
+    "v_and", "v_or", "v_xor", "v_add", "v_sub", "v_mul",
+    "v_min", "v_max", "v_shl", "v_shr", "v_sar", "v_bpermute",
+};
+const char* const gpu16_ss[] = {            // op sD, sA
+    "s_not", "s_neg", "s_mov",
+};
+const char* const gpu16_vv[] = {            // op vD, vA
+    "v_not", "v_neg", "v_mov",
+};
+const char* const gpu16_ssi[] = {           // op sD, sA, imm16
+    "s_addi", "s_muli", "s_andi", "s_ori", "s_xori",
+};
+const char* const gpu16_ssm[] = {           // op sD, sA, shift
+    "s_shli", "s_shri", "s_sari",
+};
+const char* const gpu16_mem[] = {           // op vD, vA, sB, offset
+    "v_ld_g", "v_ld_gs", "v_ld4_g", "v_st_g", "v_st4_g",
+    "v_ld_l", "v_ld4_l", "v_st_l", "v_st4_l",
+};
+
 // Build a program that looks like real source: instructions, comments, blank
 // lines, labels, and "la" references back to labels that already exist.
 std::vector<char> generate(int isa, size_t lines, uint64_t seed) {
@@ -66,6 +96,8 @@ std::vector<char> generate(int isa, size_t lines, uint64_t seed) {
     }
     text += "start:\n";
     labels = 1;
+    // gpu16 separates operands with commas and names its registers by file.
+    const char* sep = isa == 32 ? ", " : " ";
     for (size_t i = 0; i < lines; i++) {
         uint32_t roll = r.below(100);
         if (roll < 6) {
@@ -85,14 +117,57 @@ std::vector<char> generate(int isa, size_t lines, uint64_t seed) {
         if (roll < 16 && labels > 1) {
             // "la <dst> <label>", the one pseudo instruction.  r1 is the
             // scratch on cpu8, so never use it as the destination there.
-            text += "la r";
+            text += isa == 32 ? "la s" : "la r";
             text += static_cast<char>('2' + r.below(6));
-            text += " l";
-            text += std::to_string(1 + r.below(static_cast<uint32_t>(labels - 1)));
+            text += isa == 32 ? ", l" : " l";
+            // gpu16 reaches a label through one s_addpc, so the offset has to
+            // fit a signed 16 bit immediate.  Real programs are well inside
+            // that - gpu16.v only has 4096 words of program memory - but a
+            // benchmark runs for millions of lines, so it stays near home.
+            uint32_t reach = static_cast<uint32_t>(labels - 1);
+            if (isa == 32 && reach > 64) {
+                reach = 64;
+            }
+            text += std::to_string(labels - reach + r.below(reach));
             text += "\n";
             continue;
         }
-        if (isa == 8) {
+        if (isa == 32) {
+            auto reg = [&](char file) {
+                text += file;
+                text += static_cast<char>('0' + r.below(8));
+            };
+            auto pick = [&](const char* const* t, size_t n) {
+                text += t[r.below(static_cast<uint32_t>(n))];
+                text += ' ';
+            };
+#define BENCH_PICK(table) pick(table, sizeof(table) / sizeof(table[0]))
+            switch (r.below(7)) {
+            case 0: BENCH_PICK(gpu16_sss);
+                    reg('s'); text += sep; reg('s'); text += sep; reg('s');
+                    break;
+            case 1: BENCH_PICK(gpu16_vvv);
+                    reg('v'); text += sep; reg('v'); text += sep; reg('v');
+                    break;
+            case 2: BENCH_PICK(gpu16_ss);  reg('s'); text += sep; reg('s'); break;
+            case 3: BENCH_PICK(gpu16_vv);  reg('v'); text += sep; reg('v'); break;
+            case 4: BENCH_PICK(gpu16_ssi);
+                    reg('s'); text += sep; reg('s'); text += sep;
+                    text += std::to_string(r.below(65536));
+                    break;
+            case 5: BENCH_PICK(gpu16_ssm);
+                    reg('s'); text += sep; reg('s'); text += sep;
+                    text += std::to_string(r.below(32));
+                    break;
+            default: BENCH_PICK(gpu16_mem);
+                    reg('v'); text += sep; reg('v'); text += sep; reg('s');
+                    text += sep;
+                    text += std::to_string(r.below(256));
+                    break;
+            }
+#undef BENCH_PICK
+        }
+        else if (isa == 8) {
             text += cpu8_ops[r.below(sizeof(cpu8_ops) / sizeof(cpu8_ops[0]))];
             text += " r";
             text += static_cast<char>('0' + r.below(8));
@@ -189,7 +264,7 @@ bool same(const measurement& a, const measurement& b) {
 
 template <class ISA>
 int bench(size_t lines, uint64_t seed, int repeat, bool hex, unsigned threads, bool check_only) {
-    int isa = ISA::word_bytes == 1 ? 8 : 16;
+    int isa = ISA::isa_tag;
     std::vector<char> source = generate(isa, lines, seed);
 
     measurement serial = run<ISA>(source, asm_backend::serial, 1, hex, repeat);
@@ -211,8 +286,8 @@ int bench(size_t lines, uint64_t seed, int repeat, bool hex, unsigned threads, b
 
     bool identical = same(serial, parallel) && same(serial, gpu);
     if (check_only) {
-        std::printf("asm%d: %zu lines, %zu statements, %zu output bytes: serial %s, threads %s, hip %s\n",
-                    isa, serial.stats.lines, serial.stats.statements, serial.output.size(),
+        std::printf("%s: %zu lines, %zu statements, %zu output bytes: serial %s, threads %s, hip %s\n",
+                    ISA::tool, serial.stats.lines, serial.stats.statements, serial.output.size(),
                     "ok", parallel.ran ? "ok" : parallel.note.c_str(),
                     gpu.ran ? "ok" : gpu.note.c_str());
         if (!identical) {
@@ -293,6 +368,12 @@ int main(int argc, char* argv[]) {
     if (threads < 1) {
         threads = 1;
     }
-    return isa == 8 ? bench<asm_cpu8>(lines, seed, repeat, hex, threads, check_only)
-                    : bench<asm_cpu16>(lines, seed, repeat, hex, threads, check_only);
+    // 32 is gpu16: named after the instruction word, as 8 and 16 are.
+    if (isa == 8) {
+        return bench<asm_cpu8>(lines, seed, repeat, hex, threads, check_only);
+    }
+    if (isa == 32) {
+        return bench<asm_gpu16>(lines, seed, repeat, hex, threads, check_only);
+    }
+    return bench<asm_cpu16>(lines, seed, repeat, hex, threads, check_only);
 }
