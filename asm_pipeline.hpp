@@ -189,6 +189,7 @@ struct asm_error {
     uint32_t line_number = 0;
     std::string detail;   // the offending token, when the message names one
     uint32_t count = 0;   // the token count, when the message names one
+    std::string op;       // the instruction's own name, for the typed errors
 };
 
 template <class ISA>
@@ -198,8 +199,8 @@ inline std::string asm_error_text(const asm_error& e) {
     case ASM_ERR_LABEL_DUP:
         return std::format("{}: line {}: label '{}' defined twice\n", tool, e.line_number, e.detail);
     case ASM_ERR_TOO_BIG:
-        return std::format("{}: line {}: the program does not fit in 256 instructions\n",
-                           tool, e.line_number);
+        return std::format("{}: line {}: the program does not fit in {} instructions\n",
+                           tool, e.line_number, ISA::address_limit + 1);
     case ASM_ERR_LA_TOKENS:
         return std::format("{}: line {}: expected 'la <dst> <label>', got {} token(s)\n",
                            tool, e.line_number, e.count);
@@ -238,6 +239,35 @@ inline std::string asm_error_text(const asm_error& e) {
     case ASM_ERR_ARG_RANGE2:
         return std::format("{}: line {}: argument '{}' does not fit in 3 bits\n",
                            tool, e.line_number, e.detail);
+    // The typed operand diagnostics.  e.count is how many operands the
+    // instruction takes and e.detail names the one that was wrong.
+    case ASM_ERR_OPERANDS:
+        return std::format("{}: line {}: '{}' takes {} operand(s)\n",
+                           tool, e.line_number, e.detail, e.count);
+    case ASM_ERR_ARG_KIND:
+        return std::format("{}: line {}: operand {} of '{}' is '{}', which is not the "
+                           "kind of operand that goes there\n",
+                           tool, e.line_number, e.count + 1, e.op, e.detail);
+    case ASM_ERR_REG_RANGE:
+        return std::format("{}: line {}: register '{}' does not exist, "
+                           "this machine has sixteen of each file\n",
+                           tool, e.line_number, e.detail);
+    case ASM_ERR_IMM_RANGE:
+        return std::format("{}: line {}: immediate '{}' does not fit in 16 bits\n",
+                           tool, e.line_number, e.detail);
+    case ASM_ERR_MOD_RANGE:
+        return std::format("{}: line {}: '{}' is out of range for operand {} of '{}'\n",
+                           tool, e.line_number, e.detail, e.count + 1, e.op);
+    case ASM_ERR_QUAD_ALIGN:
+        return std::format("{}: line {}: '{}' does not start a VGPR quad, "
+                           "'{}' needs v0, v4, v8 or v12\n",
+                           tool, e.line_number, e.detail, e.op);
+    case ASM_ERR_LABEL_KIND:
+        return std::format("{}: line {}: '{}' is not a number, and '{}' does not take "
+                           "a label there\n", tool, e.line_number, e.detail, e.op);
+    case ASM_ERR_BRANCH_RANGE:
+        return std::format("{}: line {}: label '{}' is too far away to encode "
+                           "in 16 bits\n", tool, e.line_number, e.detail);
     default:
         return std::format("{}: line {}: internal error\n", tool, e.line_number);
     }
@@ -344,6 +374,7 @@ struct asm_relexed {
     std::vector<asm_span> tokens;
 };
 
+template <class ISA>
 inline void asm_relex(const std::vector<char>& buf, asm_span line, asm_relexed& out) {
     out.labels.clear();
     out.tokens.clear();
@@ -351,25 +382,42 @@ inline void asm_relex(const std::vector<char>& buf, asm_span line, asm_relexed& 
     uint32_t len = asm_code_length(s, line.len);
     uint32_t pos = 0;
     asm_span tok;
-    bool have = asm_next_token(s, len, &pos, &tok);
+    bool have = asm_next_token(s, len, &pos, &tok, ISA::comma_separated);
     while (have && asm_is_label_definition(s + tok.off, tok.len)) {
         out.labels.push_back(asm_span{line.off + tok.off, tok.len - 1});
-        have = asm_next_token(s, len, &pos, &tok);
+        have = asm_next_token(s, len, &pos, &tok, ISA::comma_separated);
     }
     while (have) {
         out.tokens.push_back(asm_span{line.off + tok.off, tok.len});
-        have = asm_next_token(s, len, &pos, &tok);
+        have = asm_next_token(s, len, &pos, &tok, ISA::comma_separated);
     }
 }
 
 // Fill in the token an error message wants to quote.
 template <class ISA>
-inline void asm_detail_from_line(const std::vector<char>& buf, asm_span line, asm_error& e) {
+inline void asm_detail_from_line(const std::vector<char>& buf, asm_span line,
+                                 const asm_line& l, asm_error& e) {
     asm_relexed r;
-    asm_relex(buf, line, r);
+    asm_relex<ISA>(buf, line, r);
     auto token = [&](size_t i) -> std::string {
         return i < r.tokens.size() ? std::string(asm_text(buf, r.tokens[i])) : std::string();
     };
+    // An ISA with typed operands reports which operand went wrong, so the
+    // parse left the index behind in arg[0] and the instruction's operand
+    // count in arg[1] rather than making this pass work them out again.
+    if constexpr (ISA::typed_operands) {
+        if (e.code == ASM_ERR_OPERANDS) {
+            e.detail = token(0);
+            e.count = static_cast<uint32_t>(l.arg[1]);
+            return;
+        }
+        if (e.code >= ASM_ERR_ARG_KIND && e.code <= ASM_ERR_LABEL_KIND) {
+            e.op = token(0);
+            e.count = static_cast<uint32_t>(l.arg[0]);
+            e.detail = token(1 + static_cast<size_t>(l.arg[0]));
+            return;
+        }
+    }
     switch (e.code) {
     case ASM_ERR_LA_DST:
     case ASM_ERR_SCRATCH_IS_DST:
@@ -528,7 +576,7 @@ inline size_t asm_scan(const std::vector<char>& buf,
                     // Re-lex and hash here, while the line is in this core's
                     // cache, so that the ordered insert below is arithmetic
                     // rather than a walk back over the source text.
-                    asm_relex(buf, lines[i], relexed);
+                    asm_relex<ISA>(buf, lines[i], relexed);
                     for (asm_span name : relexed.labels) {
                         sites[c].push_back(asm_label_site{
                             name, asm_hash(buf.data() + name.off, name.len), address,
@@ -542,12 +590,12 @@ inline size_t asm_scan(const std::vector<char>& buf,
                 s.line_index = static_cast<uint32_t>(i);
                 s.address = address;
                 s.target = 0;
-                s.arg[0] = l.arg[0];
-                s.arg[1] = l.arg[1];
-                s.arg[2] = l.arg[2];
+                for (uint32_t a = 0; a < ASM_MAX_ARGS; a++) {
+                    s.arg[a] = l.arg[a];
+                }
                 s.opcode = l.opcode;
-                s.is_la = l.is_la;
-                s.pad[0] = s.pad[1] = s.pad[2] = 0;
+                s.label_use = l.label_use;
+                s.pad[0] = s.pad[1] = 0;
                 address += asm_line_words<ISA>(l);
             }
         }
@@ -578,13 +626,13 @@ inline size_t asm_scan(const std::vector<char>& buf,
             }
             if (!labels.insert(site.name, site.hash, site.address)) {
                 result.error = asm_error{ASM_ERR_LABEL_DUP, site.line_number,
-                                         std::string(asm_text(buf, site.name)), 0};
+                                         std::string(asm_text(buf, site.name)), 0, {}};
                 return total;
             }
         }
     }
     if (too_big_line != 0) {
-        result.error = asm_error{ASM_ERR_TOO_BIG, too_big_line, {}, 0};
+        result.error = asm_error{ASM_ERR_TOO_BIG, too_big_line, {}, 0, {}};
     }
     return total;
 }
@@ -596,12 +644,13 @@ template <class ISA>
 inline uint8_t asm_check_statement(const std::vector<char>& buf,
                                    const asm_line& l,
                                    const asm_label_table& labels,
+                                   uint32_t statement_address,
                                    int32_t* scratch,
                                    int32_t* target) {
     if (l.error != ASM_OK) {
         return l.error;
     }
-    if (l.is_la) {
+    if (l.label_use != ASM_LABEL_NONE) {
         uint32_t address = 0;
         if (!labels.find(l.name, asm_hash(buf.data() + l.name.off, l.name.len), &address)) {
             return ASM_ERR_UNKNOWN_LABEL;
@@ -615,7 +664,7 @@ inline uint8_t asm_check_statement(const std::vector<char>& buf,
             }
         }
         *target = static_cast<int32_t>(address);
-        return ASM_OK;
+        return ISA::check_resolved(l, statement_address, *target);
     }
     if constexpr (ISA::has_scratch) {
         if (ISA::is_scratch_setter(l.opcode)) {
@@ -657,7 +706,8 @@ inline size_t asm_resolve(const std::vector<char>& buf,
                 int32_t value = -1;
                 for (size_t i = cut.begin(c); i < cut.end(c, n); i++) {
                     const asm_line& l = info[statements[i].line_index];
-                    if (!l.is_la && l.error == ASM_OK && ISA::is_scratch_setter(l.opcode)) {
+                    if (l.label_use == ASM_LABEL_NONE && l.error == ASM_OK &&
+                        ISA::is_scratch_setter(l.opcode)) {
                         value = l.arg[0];
                     }
                 }
@@ -677,7 +727,7 @@ inline size_t asm_resolve(const std::vector<char>& buf,
                 asm_statement& s = statements[i];
                 int32_t target = 0;
                 uint8_t code = asm_check_statement<ISA>(buf, info[s.line_index], labels,
-                                                        &scratch, &target);
+                                                        s.address, &scratch, &target);
                 if (code != ASM_OK) {
                     failure[c] = i;
                     break;
@@ -706,16 +756,16 @@ inline size_t asm_resolve(const std::vector<char>& buf,
     uint8_t code = ASM_OK;
     for (size_t i = cut.begin(c); i <= failed_at; i++) {
         code = asm_check_statement<ISA>(buf, info[statements[i].line_index], labels,
-                                        &scratch, &target);
+                                        statements[i].address, &scratch, &target);
     }
     const asm_line& l = info[statements[failed_at].line_index];
     uint32_t line_number = statements[failed_at].line_index + 1;
-    asm_error e{code, line_number, {}, l.ntokens};
-    if (code == ASM_ERR_UNKNOWN_LABEL) {
+    asm_error e{code, line_number, {}, l.ntokens, {}};
+    if (code == ASM_ERR_UNKNOWN_LABEL || code == ASM_ERR_BRANCH_RANGE) {
         e.detail = std::string(asm_text(buf, l.name));
     }
     else {
-        asm_detail_from_line<ISA>(buf, lines[statements[failed_at].line_index], e);
+        asm_detail_from_line<ISA>(buf, lines[statements[failed_at].line_index], l, e);
     }
     result.error = e;
     return failed_at;
@@ -736,7 +786,11 @@ inline void asm_write_debug(const std::vector<char>& buf,
         return i < r.tokens.size() ? asm_text(buf, r.tokens[i]) : std::string_view();
     };
     auto source_line = [&]() {
-        if constexpr (ISA::nargs == 1) {
+        if constexpr (ISA::typed_operands) {
+            out += std::format("{},{},{},{},{}\n", token(0), token(1), token(2),
+                               token(3), token(4));
+        }
+        else if constexpr (ISA::nargs == 1) {
             out += std::format("{},{}\n", token(0), token(1));
         }
         else {
@@ -746,13 +800,19 @@ inline void asm_write_debug(const std::vector<char>& buf,
     for (size_t k = 0; k < upto; k++) {
         const asm_statement& s = statements[k];
         const asm_line& l = info[s.line_index];
-        asm_relex(buf, lines[s.line_index], r);
-        if (l.is_la) {
+        asm_relex<ISA>(buf, lines[s.line_index], r);
+        if (l.label_use == ASM_LABEL_LA) {
             out += std::format("la {} {} -> {}\n", token(1), token(2), s.target);
             continue;
         }
         source_line();
-        if constexpr (ISA::nargs == 1) {
+        if constexpr (ISA::typed_operands) {
+            // Opcode, then the fields in the order the word packs them:
+            // Arg0, Arg1, Arg2, Arg3, Mod.
+            out += std::format("{},{},{},{},{},{}\n", static_cast<int>(l.opcode),
+                               l.arg[0], l.arg[1], l.arg[2], l.arg[3], l.arg[4]);
+        }
+        else if constexpr (ISA::nargs == 1) {
             out += std::format("{},{}\n", static_cast<int>(l.opcode), l.arg[0]);
         }
         else {
@@ -766,10 +826,12 @@ inline void asm_write_debug(const std::vector<char>& buf,
     // The statement that failed: the original printed the first of its two
     // debug lines before parsing the operands, so an operand error shows it.
     const asm_line& l = info[statements[upto].line_index];
-    if (l.error < ASM_ERR_ARG || l.error > ASM_ERR_ARG_RANGE2) {
+    bool operand_error = (l.error >= ASM_ERR_ARG && l.error <= ASM_ERR_ARG_RANGE2) ||
+                         (l.error >= ASM_ERR_ARG_KIND && l.error <= ASM_ERR_LABEL_KIND);
+    if (!operand_error) {
         return;
     }
-    asm_relex(buf, lines[statements[upto].line_index], r);
+    asm_relex<ISA>(buf, lines[statements[upto].line_index], r);
     source_line();
 }
 
@@ -796,7 +858,7 @@ inline asm_result asm_assemble(const std::vector<char>& buf, const asm_options& 
     asm_array<asm_line> info;
     std::string err;
     if (!asm_run_classify<ISA>(buf, lines, info, opt, &err)) {
-        result.error = asm_error{ASM_OK, 0, err, 0};
+        result.error = asm_error{ASM_OK, 0, err, 0, {}};
         result.ok = false;
         return result;
     }
@@ -830,7 +892,7 @@ inline asm_result asm_assemble(const std::vector<char>& buf, const asm_options& 
 
     result.output.reset(static_cast<size_t>(emit_words) * asm_bytes_per_word(fmt));
     if (!asm_run_encode<ISA>(statements.data(), failed_at, result.output, fmt, opt, &err)) {
-        result.error = asm_error{ASM_OK, 0, err, 0};
+        result.error = asm_error{ASM_OK, 0, err, 0, {}};
         result.output.reset(0);
         return result;
     }
@@ -897,6 +959,7 @@ inline std::vector<char> asm_read_all(std::FILE* f) {
 template <class ISA>
 inline int asm_main(int argc, const char* argv[]) {
     asm_options opt;
+    opt.address_limit = ISA::address_limit;
     for (int i = 1; i < argc; i++) {
         std::string_view a = argv[i];
         if (a == "--hex") {

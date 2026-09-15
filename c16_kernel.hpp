@@ -428,9 +428,11 @@ ASM_HD inline void c16_emit_binary(const c16_item& it, uint8_t* out, asm_format 
     s.arg[0] = it.arg[0];
     s.arg[1] = it.arg[1];
     s.arg[2] = it.arg[2];
+    s.arg[3] = 0;
+    s.arg[4] = 0;
     s.opcode = it.opcode;
-    s.is_la = it.kind == C16_ITEM_LA ? 1 : 0;
-    s.pad[0] = s.pad[1] = s.pad[2] = 0;
+    s.label_use = it.kind == C16_ITEM_LA ? ASM_LABEL_LA : ASM_LABEL_NONE;
+    s.pad[0] = s.pad[1] = 0;
     asm_encode_statement<asm_cpu16>(s, out, fmt);
 }
 

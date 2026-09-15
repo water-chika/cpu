@@ -40,7 +40,19 @@ struct asm_span {
 };
 
 enum : uint32_t {
-    ASM_MAX_WORDS = 10,  // the longest "la" expansion, cpu8's
+    ASM_MAX_WORDS = 10,   // the longest "la" expansion, cpu8's
+    ASM_MAX_ARGS = 5,     // gpu16's Arg0, Arg1, Arg2, Arg3 and Mod
+    ASM_MAX_TOKENS = 5,   // gpu16's "<op> <dst> <src0> <src1> <src2>"
+};
+
+// What a line does with a label, if anything.  "la" is the pseudo
+// instruction every ISA here has; gpu16 additionally lets a label stand in
+// for the immediate of the instructions that take a code address, which is
+// the same two pass machinery with a different encoding at the end of it.
+enum : uint8_t {
+    ASM_LABEL_NONE = 0,
+    ASM_LABEL_LA,     // the "la" pseudo instruction
+    ASM_LABEL_IMM,    // a label used as an instruction's immediate operand
 };
 
 // Errors that one line can diagnose on its own, in the order the original
@@ -61,6 +73,19 @@ enum : uint8_t {
     ASM_ERR_UNKNOWN_LABEL,
     ASM_ERR_NO_SCRATCH,
     ASM_ERR_SCRATCH_IS_DST,
+    // The rest belong to an ISA whose operands are not all the same kind,
+    // which so far means gpu16: an operand can be the wrong register file, a
+    // register the file is not big enough for, an immediate that does not
+    // fit, a misaligned VGPR quad, or a label somewhere a label means
+    // nothing.
+    ASM_ERR_OPERANDS,
+    ASM_ERR_ARG_KIND,
+    ASM_ERR_REG_RANGE,
+    ASM_ERR_IMM_RANGE,
+    ASM_ERR_MOD_RANGE,
+    ASM_ERR_QUAD_ALIGN,
+    ASM_ERR_LABEL_KIND,
+    ASM_ERR_BRANCH_RANGE,
 };
 
 // The result of lexing and parsing one line, kept deliberately small: the
@@ -72,14 +97,17 @@ enum : uint8_t {
 // them.
 //
 // arg[] is only meaningful when error == ASM_OK; an operand that failed to
-// parse or did not fit in 3 bits is reported from its source text instead.
+// parse or did not fit is reported from its source text instead.  On the
+// errors that name one operand out of several, arg[0] carries which operand
+// it was and arg[1] how many the instruction wanted, so that the message can
+// be built without re-deciding anything the parse already decided.
 struct asm_line {
     uint32_t nlabels;     // how many "label:" definitions the line opens with
     uint32_t ntokens;     // how many tokens follow them
-    asm_span name;        // the label operand of "la", when is_la
-    int8_t   arg[3];
+    asm_span name;        // the label operand, when label_use is not NONE
+    int32_t  arg[ASM_MAX_ARGS];
     uint8_t  opcode;      // the encoded opcode value, not an index
-    uint8_t  is_la;
+    uint8_t  label_use;   // ASM_LABEL_NONE, _LA or _IMM
     uint8_t  error;
     uint8_t  pad;
 };
@@ -89,17 +117,17 @@ struct asm_line {
 struct asm_statement {
     uint32_t line_index;
     uint32_t address;     // in instruction words
-    int32_t  target;      // resolved label address, "la" only
-    int8_t   arg[3];
+    int32_t  target;      // resolved label address, when label_use is not NONE
+    int32_t  arg[ASM_MAX_ARGS];
     uint8_t  opcode;
-    uint8_t  is_la;
-    uint8_t  pad[3];
+    uint8_t  label_use;
+    uint8_t  pad[2];
 };
 
 // How the words are laid out in the output buffer.
 struct asm_format {
     uint8_t hex;                       // text instead of raw little endian
-    uint8_t word_bytes;                // 1 for cpu8, 2 for cpu16
+    uint8_t word_bytes;                // 1 for cpu8, 2 for cpu16, 4 for gpu16
     char    sep;                       // ',' or '\n', hex only
     char    pad;
 };
@@ -146,10 +174,20 @@ ASM_HD inline uint32_t asm_code_length(const char* s, uint32_t len) {
     return len;
 }
 
-// Step to the next whitespace separated token.  Returns false at end of line.
-ASM_HD inline bool asm_next_token(const char* s, uint32_t len, uint32_t* pos, asm_span* out) {
+// What separates two tokens.  gpu16's syntax is the one documented in
+// docs/gpu_isa.md section 4.1, "op dst, src0, src1, src2", so for that ISA a
+// comma separates operands exactly as whitespace does; for cpu8 and cpu16 it
+// does not, and a comma stays part of whatever token it appears in, which is
+// what those two assemblers have always done.
+ASM_HD inline bool asm_is_separator(char c, bool commas) {
+    return asm_is_space(c) || (commas && c == ',');
+}
+
+// Step to the next separated token.  Returns false at end of line.
+ASM_HD inline bool asm_next_token(const char* s, uint32_t len, uint32_t* pos, asm_span* out,
+                                  bool commas = false) {
     uint32_t i = *pos;
-    while (i < len && asm_is_space(s[i])) {
+    while (i < len && asm_is_separator(s[i], commas)) {
         i++;
     }
     if (i >= len) {
@@ -157,7 +195,7 @@ ASM_HD inline bool asm_next_token(const char* s, uint32_t len, uint32_t* pos, as
         return false;
     }
     uint32_t begin = i;
-    while (i < len && !asm_is_space(s[i])) {
+    while (i < len && !asm_is_separator(s[i], commas)) {
         i++;
     }
     out->off = begin;
@@ -206,7 +244,87 @@ ASM_HD inline bool asm_register(const char* s, uint32_t len, int32_t* out) {
     return false;
 }
 
+// asm_parse_int plus hexadecimal, because a 16 bit immediate is far more
+// often written 0xabcd than 43981.  Unlike asm_parse_int this one rejects
+// trailing junk: "0x1g" is not a number, and an ISA that has labels needs to
+// be able to tell a number apart from a name rather than half accept one.
+ASM_HD inline bool asm_parse_number(const char* s, uint32_t len, int32_t* out) {
+    uint32_t i = 0;
+    bool negative = false;
+    if (i < len && (s[i] == '+' || s[i] == '-')) {
+        negative = s[i] == '-';
+        i++;
+    }
+    int64_t value = 0;
+    bool any = false;
+    if (i + 1 < len && s[i] == '0' && (s[i + 1] == 'x' || s[i + 1] == 'X')) {
+        i += 2;
+        for (; i < len; i++) {
+            int32_t digit;
+            if (asm_is_digit(s[i]))                 { digit = s[i] - '0'; }
+            else if (s[i] >= 'a' && s[i] <= 'f')    { digit = s[i] - 'a' + 10; }
+            else if (s[i] >= 'A' && s[i] <= 'F')    { digit = s[i] - 'A' + 10; }
+            else                                    { return false; }
+            value = value * 16 + digit;
+            any = true;
+            if (value > 4294967296LL) {
+                return false;
+            }
+        }
+    }
+    else {
+        for (; i < len; i++) {
+            if (!asm_is_digit(s[i])) {
+                return false;
+            }
+            value = value * 10 + (s[i] - '0');
+            any = true;
+            if (value > 4294967296LL) {
+                return false;
+            }
+        }
+    }
+    if (!any) {
+        return false;
+    }
+    int64_t signed_value = negative ? -value : value;
+    if (signed_value > 4294967295LL || signed_value < -2147483648LL) {
+        return false;
+    }
+    *out = static_cast<int32_t>(signed_value);
+    return true;
+}
+
 // ---------------------------------------------------------------- cpu8
+
+// The operand parse cpu8 and cpu16 share: a fixed number of tokens, every
+// operand the same kind, and every operand three bits wide.  gpu16 has none
+// of those three properties and brings its own parse.
+template <class ISA>
+ASM_HD inline uint8_t asm_parse_fixed(const char* s, const asm_span* t, uint32_t ntokens,
+                                      asm_line* out) {
+    if (ntokens != ISA::insn_tokens) {
+        return ASM_ERR_TOKENS;
+    }
+    if (!ISA::opcode(s + t[0].off, t[0].len, &out->opcode)) {
+        return ASM_ERR_OPCODE;
+    }
+    int32_t parsed[3] = {0, 0, 0};
+    for (uint32_t i = 0; i < ISA::nargs; i++) {
+        if (!ISA::arg(s + t[1 + i].off, t[1 + i].len, &parsed[i])) {
+            return ASM_ERR_ARG;
+        }
+    }
+    for (uint32_t i = 0; i < ISA::nargs; i++) {
+        if (parsed[i] < 0 || parsed[i] > 7) {
+            return static_cast<uint8_t>(ASM_ERR_ARG_RANGE0 + i);
+        }
+    }
+    for (uint32_t i = 0; i < ISA::nargs; i++) {
+        out->arg[i] = parsed[i];
+    }
+    return ASM_OK;
+}
 
 // The 8 bit ISA.  Instruction word: opcode in the top 5 bits, one 3 bit
 // operand below it.
@@ -217,6 +335,9 @@ struct asm_cpu8 {
     static constexpr uint32_t insn_tokens = 2;   // "<op> <arg>"
     static constexpr uint32_t nargs = 1;
     static constexpr bool has_scratch = true;    // "la" needs set_src1_dst1
+    static constexpr bool comma_separated = false;
+    static constexpr bool typed_operands = false;
+    static constexpr uint32_t address_limit = 255;
 
     ASM_HD static bool opcode(const char* s, uint32_t n, uint8_t* out) {
         switch (n) {
@@ -283,9 +404,25 @@ struct asm_cpu8 {
     // The opcode that hands "la" its scratch register.
     ASM_HD static bool is_scratch_setter(uint8_t op) { return op == 31; }
 
-    ASM_HD static uint32_t encode(const asm_statement& s, uint16_t* words) {
-        if (!s.is_la) {
-            words[0] = static_cast<uint16_t>((s.opcode << 3) | s.arg[0]);
+    ASM_HD static bool la_dst(const char* s, uint32_t n, int32_t* out) {
+        return asm_register(s, n, out);
+    }
+
+    ASM_HD static uint8_t parse(const char* s, uint32_t, const asm_span* t,
+                                uint32_t ntokens, asm_line* out) {
+        return asm_parse_fixed<asm_cpu8>(s, t, ntokens, out);
+    }
+
+    // No immediate can be out of range once a label is known: "la" builds the
+    // address out of 3 bit pieces and the program cannot be longer than the
+    // program memory the scan already checked.
+    ASM_HD static uint8_t check_resolved(const asm_line&, uint32_t, int32_t) {
+        return ASM_OK;
+    }
+
+    ASM_HD static uint32_t encode(const asm_statement& s, uint32_t* words) {
+        if (s.label_use != ASM_LABEL_LA) {
+            words[0] = static_cast<uint32_t>((s.opcode << 3) | s.arg[0]);
             return 1;
         }
         // The 8 bit CPU moves 3 bits of immediate at a time and has no
@@ -293,16 +430,16 @@ struct asm_cpu8 {
         // destination three bits at a time through the src1/dst1 scratch.
         int32_t dst = s.arg[0];
         int32_t t = s.target;
-        words[0] = static_cast<uint16_t>((11 << 3) | ((t >> 6) & 3));  // imm
-        words[1] = static_cast<uint16_t>((12 << 3) | 3);               // shl 3
-        words[2] = static_cast<uint16_t>(( 9 << 3) | dst);             // mov
-        words[3] = static_cast<uint16_t>((11 << 3) | ((t >> 3) & 7));  // imm
-        words[4] = static_cast<uint16_t>(( 1 << 3) | dst);             // or
-        words[5] = static_cast<uint16_t>((10 << 3) | dst);             // mov0
-        words[6] = static_cast<uint16_t>((12 << 3) | 3);               // shl 3
-        words[7] = static_cast<uint16_t>(( 9 << 3) | dst);             // mov
-        words[8] = static_cast<uint16_t>((11 << 3) | (t & 7));         // imm
-        words[9] = static_cast<uint16_t>(( 1 << 3) | dst);             // or
+        words[0] = static_cast<uint32_t>((11 << 3) | ((t >> 6) & 3));  // imm
+        words[1] = static_cast<uint32_t>((12 << 3) | 3);               // shl 3
+        words[2] = static_cast<uint32_t>(( 9 << 3) | dst);             // mov
+        words[3] = static_cast<uint32_t>((11 << 3) | ((t >> 3) & 7));  // imm
+        words[4] = static_cast<uint32_t>(( 1 << 3) | dst);             // or
+        words[5] = static_cast<uint32_t>((10 << 3) | dst);             // mov0
+        words[6] = static_cast<uint32_t>((12 << 3) | 3);               // shl 3
+        words[7] = static_cast<uint32_t>(( 9 << 3) | dst);             // mov
+        words[8] = static_cast<uint32_t>((11 << 3) | (t & 7));         // imm
+        words[9] = static_cast<uint32_t>(( 1 << 3) | dst);             // or
         return 10;
     }
 };
@@ -318,6 +455,9 @@ struct asm_cpu16 {
     static constexpr uint32_t insn_tokens = 4;   // "<op> <arg0> <arg1> <arg2>"
     static constexpr uint32_t nargs = 3;
     static constexpr bool has_scratch = false;
+    static constexpr bool comma_separated = false;
+    static constexpr bool typed_operands = false;
+    static constexpr uint32_t address_limit = 255;
 
     ASM_HD static bool opcode(const char* s, uint32_t n, uint8_t* out) {
         switch (n) {
@@ -379,18 +519,585 @@ struct asm_cpu16 {
 
     ASM_HD static bool is_scratch_setter(uint8_t) { return false; }
 
-    ASM_HD static uint32_t encode(const asm_statement& s, uint16_t* words) {
-        if (!s.is_la) {
-            words[0] = static_cast<uint16_t>((s.opcode << 9) | (s.arg[0] << 6) |
+    ASM_HD static bool la_dst(const char* s, uint32_t n, int32_t* out) {
+        return asm_register(s, n, out);
+    }
+
+    ASM_HD static uint8_t parse(const char* s, uint32_t, const asm_span* t,
+                                uint32_t ntokens, asm_line* out) {
+        return asm_parse_fixed<asm_cpu16>(s, t, ntokens, out);
+    }
+
+    ASM_HD static uint8_t check_resolved(const asm_line&, uint32_t, int32_t) {
+        return ASM_OK;
+    }
+
+    ASM_HD static uint32_t encode(const asm_statement& s, uint32_t* words) {
+        if (s.label_use != ASM_LABEL_LA) {
+            words[0] = static_cast<uint32_t>((s.opcode << 9) | (s.arg[0] << 6) |
                                              (s.arg[1] << 3) | s.arg[2]);
             return 1;
         }
         int32_t dst = s.arg[0];
         int32_t t = s.target;
-        words[0] = static_cast<uint16_t>((12 << 9) | (((t >> 6) & 3) << 6) | (6 << 3) | dst);
-        words[1] = static_cast<uint16_t>((13 << 9) | (((t >> 3) & 7) << 6) | (3 << 3) | dst);
-        words[2] = static_cast<uint16_t>((13 << 9) | (( t       & 7) << 6) | (0 << 3) | dst);
+        words[0] = static_cast<uint32_t>((12 << 9) | (((t >> 6) & 3) << 6) | (6 << 3) | dst);
+        words[1] = static_cast<uint32_t>((13 << 9) | (((t >> 3) & 7) << 6) | (3 << 3) | dst);
+        words[2] = static_cast<uint32_t>((13 << 9) | (( t       & 7) << 6) | (0 << 3) | dst);
         return 3;
+    }
+};
+
+// ---------------------------------------------------------------- gpu16
+
+// The gpu16 ISA of docs/gpu_isa.md, as committed: a 32 bit word laid out
+// 8 / 4 / 4 / 4 / 4 / 8 (section 4.1),
+//
+//   |1f .. 18|17 .. 14|13 .. 10|f .. c|b .. 8|7 .. 0|
+//   | Opcode |  Arg0  |  Arg1  | Arg2 | Arg3 |  Mod |
+//
+// with the immediate forms reinterpreting {Arg2, Arg3, Mod} as one 16 bit
+// immediate at [15:0].  Section 8 of that document *recommends* repacking
+// this to 8 / 5 / 5 / 5 / 8 in a later revision, and says in as many words
+// that it "does not change the encoding in sections 4.1 to 4.13"; this
+// assembler implements the encoding, not the recommendation.  Section 4.11's
+// twelve worked encodings are checked in as tests/gpu_encoding.expect32.
+//
+// Two things make this ISA need more than asm_parse_fixed:
+//
+//   * operands are typed.  "v_add_s v13, v13, s6" names two VGPRs and an
+//     SGPR, and putting an SGPR where a VGPR belongs is an error the
+//     assembler can see, not a different encoding.
+//   * the operand count is per instruction, from zero (s_endpgm) to four
+//     (v_mad, and every per lane memory access).
+//
+// Only the scalar half of this exists in gpu16.v today.  The vector, matrix,
+// LDS and exec instructions are assembled anyway - the ISA is what is being
+// implemented, not the subset of it that currently runs - and are covered by
+// encoding tests that compare bytes rather than by simulation.
+
+// What one operand may be.
+enum : uint8_t {
+    GPU16_K_SREG = 1,   // s0..s15
+    GPU16_K_VREG,       // v0..v15
+    GPU16_K_VQUAD,      // v0, v4, v8 or v12: the quad of v_ld16_g / v_st16_g
+    GPU16_K_ACCBLK,     // A0 or A1, an accumulator block
+    GPU16_K_IMM,        // a 16 bit immediate
+    GPU16_K_IMMA,       // ... which may be a label, meaning its word address
+    GPU16_K_IMMR,       // ... which may be a label, meaning a PC_next offset
+    GPU16_K_MOD,        // the whole 8 bit Mod field: a byte offset or a count
+    GPU16_K_SHIFT,      // a shift amount in Mod, 0..31
+    GPU16_K_LANE,       // a lane index in Mod, 0..15
+    GPU16_K_ACCIDX,     // an accumulator index in Mod, 0..31
+    GPU16_K_SYSREG,     // a system register number in Mod
+};
+
+// An operand is (kind, field), where the field is an index into
+// asm_line::arg, which holds {Arg0, Arg1, Arg2, Arg3, Mod}.  An immediate
+// lands in arg[2] and the encoder writes it across [15:0] whole.
+enum : uint8_t {
+    GPU16_S0 = (GPU16_K_SREG   << 4) | 0,
+    GPU16_S1 = (GPU16_K_SREG   << 4) | 1,
+    GPU16_S2 = (GPU16_K_SREG   << 4) | 2,
+    GPU16_V0 = (GPU16_K_VREG   << 4) | 0,
+    GPU16_V1 = (GPU16_K_VREG   << 4) | 1,
+    GPU16_V2 = (GPU16_K_VREG   << 4) | 2,
+    GPU16_V3 = (GPU16_K_VREG   << 4) | 3,
+    GPU16_Q0 = (GPU16_K_VQUAD  << 4) | 0,
+    GPU16_B0 = (GPU16_K_ACCBLK << 4) | 0,
+    GPU16_IM = (GPU16_K_IMM    << 4) | 2,
+    GPU16_IA = (GPU16_K_IMMA   << 4) | 2,
+    GPU16_IR = (GPU16_K_IMMR   << 4) | 2,
+    GPU16_MD = (GPU16_K_MOD    << 4) | 4,
+    GPU16_SH = (GPU16_K_SHIFT  << 4) | 4,
+    GPU16_LN = (GPU16_K_LANE   << 4) | 4,
+    GPU16_AI = (GPU16_K_ACCIDX << 4) | 4,
+    GPU16_SY = (GPU16_K_SYSREG << 4) | 4,
+};
+
+struct gpu16_sig {
+    uint8_t count;
+    uint8_t slot[4];
+};
+
+// The operand list of every documented instruction, from the per instruction
+// field table in section 4.2.
+ASM_HD inline gpu16_sig gpu16_signature(uint8_t op) {
+    switch (op) {
+    // scalar ALU, register-register
+    case 0x00: case 0x01: case 0x03: case 0x04: case 0x06: case 0x09:
+    case 0x14: case 0x15: case 0x16: case 0x17: case 0x18:
+        return gpu16_sig{3, {GPU16_S0, GPU16_S1, GPU16_S2}};
+    // scalar ALU, one source
+    case 0x02: case 0x08: case 0x0b:
+        return gpu16_sig{2, {GPU16_S0, GPU16_S1}};
+    // s_imm, whose immediate may be a label's word address
+    case 0x0c:
+        return gpu16_sig{2, {GPU16_S0, GPU16_IA}};
+    // scalar ALU with a 16 bit immediate
+    case 0x0d: case 0x1a: case 0x1b: case 0x1c: case 0x1d:
+        return gpu16_sig{3, {GPU16_S0, GPU16_S1, GPU16_IM}};
+    // scalar shift by Mod
+    case 0x0e: case 0x0f: case 0x12:
+        return gpu16_sig{3, {GPU16_S0, GPU16_S1, GPU16_SH}};
+    // s_addpc, the PC relative address that 'la' expands to
+    case 0x13:
+        return gpu16_sig{2, {GPU16_S0, GPU16_IR}};
+    // s_immh
+    case 0x19:
+        return gpu16_sig{2, {GPU16_S0, GPU16_IM}};
+    // s_rd_sys
+    case 0x1e:
+        return gpu16_sig{2, {GPU16_S0, GPU16_SY}};
+    // conditional branch to a register target
+    case 0x20: case 0x21: case 0x23: case 0x24:
+        return gpu16_sig{2, {GPU16_S1, GPU16_S2}};
+    // s_b
+    case 0x22:
+        return gpu16_sig{1, {GPU16_S2}};
+    // conditional relative branch
+    case 0x25: case 0x26:
+        return gpu16_sig{2, {GPU16_S1, GPU16_IR}};
+    // unconditional and exec relative branches
+    case 0x27: case 0x29: case 0x2a:
+        return gpu16_sig{1, {GPU16_IR}};
+    // s_call
+    case 0x28:
+        return gpu16_sig{2, {GPU16_S0, GPU16_IR}};
+    // s_rd_exec
+    case 0x30:
+        return gpu16_sig{1, {GPU16_S0}};
+    // s_wr_exec
+    case 0x31:
+        return gpu16_sig{1, {GPU16_S1}};
+    // the saveexec family
+    case 0x32: case 0x33: case 0x34:
+        return gpu16_sig{2, {GPU16_S0, GPU16_S1}};
+    // the instructions with no operands at all
+    case 0x35: case 0xb0: case 0xb3: case 0xbf:
+        return gpu16_sig{0, {0}};
+    // vector ALU, register-register
+    case 0x40: case 0x41: case 0x43: case 0x44: case 0x45: case 0x47:
+    case 0x49: case 0x4a: case 0x4b: case 0x54: case 0x55: case 0x5b:
+        return gpu16_sig{3, {GPU16_V0, GPU16_V1, GPU16_V2}};
+    // vector ALU, one source
+    case 0x42: case 0x46: case 0x4c:
+        return gpu16_sig{2, {GPU16_V0, GPU16_V1}};
+    // v_mad and v_dot4, the only users of Arg3
+    case 0x48: case 0x56:
+        return gpu16_sig{4, {GPU16_V0, GPU16_V1, GPU16_V2, GPU16_V3}};
+    // v_mov_s
+    case 0x4d:
+        return gpu16_sig{2, {GPU16_V0, GPU16_S1}};
+    // v_imm
+    case 0x4e:
+        return gpu16_sig{2, {GPU16_V0, GPU16_IM}};
+    // vector ALU with a scalar operand
+    case 0x4f: case 0x50:
+        return gpu16_sig{3, {GPU16_V0, GPU16_V1, GPU16_S2}};
+    // vector shift by Mod
+    case 0x51: case 0x52: case 0x53:
+        return gpu16_sig{3, {GPU16_V0, GPU16_V1, GPU16_SH}};
+    // v_lane_id
+    case 0x57:
+        return gpu16_sig{1, {GPU16_V0}};
+    // v_addi
+    case 0x58:
+        return gpu16_sig{3, {GPU16_V0, GPU16_V1, GPU16_IM}};
+    // v_readlane
+    case 0x59:
+        return gpu16_sig{3, {GPU16_S0, GPU16_V1, GPU16_LN}};
+    // v_writelane
+    case 0x5a:
+        return gpu16_sig{3, {GPU16_V0, GPU16_S1, GPU16_LN}};
+    // the compares, which write a mask into an SGPR
+    case 0x5c: case 0x5d: case 0x5e: case 0x5f:
+        return gpu16_sig{2, {GPU16_S0, GPU16_V1}};
+    // mma_i8 and mma_i8_z
+    case 0x70: case 0x74:
+        return gpu16_sig{3, {GPU16_B0, GPU16_V1, GPU16_V2}};
+    // acc_zero
+    case 0x71:
+        return gpu16_sig{1, {GPU16_B0}};
+    // acc_rd
+    case 0x72:
+        return gpu16_sig{2, {GPU16_V0, GPU16_AI}};
+    // acc_wr, whose source is Arg1
+    case 0x73:
+        return gpu16_sig{2, {GPU16_V1, GPU16_AI}};
+    // per lane memory
+    case 0x80: case 0x81: case 0x82: case 0x83: case 0x84: case 0xa0:
+    case 0xa1: case 0xa2: case 0xa3:
+        return gpu16_sig{4, {GPU16_V0, GPU16_V1, GPU16_S2, GPU16_MD}};
+    // s_ld_g
+    case 0x85:
+        return gpu16_sig{3, {GPU16_S0, GPU16_S2, GPU16_MD}};
+    // the wide accesses, whose VGPR must start a quad
+    case 0x86: case 0x87:
+        return gpu16_sig{4, {GPU16_Q0, GPU16_V1, GPU16_S2, GPU16_MD}};
+    // the two waitcnts
+    case 0xb1: case 0xb2:
+        return gpu16_sig{1, {GPU16_MD}};
+    default:
+        break;
+    }
+    return gpu16_sig{0, {0}};
+}
+
+// True when the instruction spends {Arg2, Arg3, Mod} on one 16 bit
+// immediate, which is the one thing the encoder has to know that the operand
+// list does not tell it directly.
+ASM_HD inline bool gpu16_has_imm(uint8_t op) {
+    gpu16_sig sig = gpu16_signature(op);
+    for (uint32_t i = 0; i < sig.count; i++) {
+        uint8_t kind = static_cast<uint8_t>(sig.slot[i] >> 4);
+        if (kind == GPU16_K_IMM || kind == GPU16_K_IMMA || kind == GPU16_K_IMMR) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// True when a label in that immediate means "this many words from PC_next"
+// rather than "this word address".
+ASM_HD inline bool gpu16_imm_is_relative(uint8_t op) {
+    gpu16_sig sig = gpu16_signature(op);
+    for (uint32_t i = 0; i < sig.count; i++) {
+        if (static_cast<uint8_t>(sig.slot[i] >> 4) == GPU16_K_IMMR) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// "s5" -> 5.  Out of range numbers still parse, so that s16 is reported as a
+// register that does not exist rather than as a token that is not a register:
+// section 8.5 requires the assembler to check that bit 4 is zero, and a
+// message saying so is the whole point of checking.
+ASM_HD inline bool gpu16_reg(const char* s, uint32_t n, char prefix, int32_t* out) {
+    if (n < 2 || n > 3 || s[0] != prefix) {
+        return false;
+    }
+    int32_t value = 0;
+    for (uint32_t i = 1; i < n; i++) {
+        if (!asm_is_digit(s[i])) {
+            return false;
+        }
+        value = value * 10 + (s[i] - '0');
+    }
+    *out = value;
+    return true;
+}
+
+struct asm_gpu16 {
+    static constexpr const char* tool = "asm_gpu16";
+    static constexpr uint32_t word_bytes = 4;
+    static constexpr uint32_t la_words = 1;      // one s_addpc
+    static constexpr uint32_t insn_tokens = 0;   // per instruction, see parse()
+    static constexpr uint32_t nargs = ASM_MAX_ARGS;
+    static constexpr bool has_scratch = false;
+    static constexpr bool comma_separated = true;
+    static constexpr bool typed_operands = true;
+    // Section 4.13: a 16 bit PC, and gpu16.v's program memory is
+    // PROGRAM_ADDR_WIDTH = 12 words of it.
+    static constexpr uint32_t address_limit = 4095;
+
+    ASM_HD static bool opcode(const char* s, uint32_t n, uint8_t* out) {
+        switch (n) {
+        case 3:
+            if (asm_tok_is(s, n, "s_b"))             { *out = 0x22; return true; }
+            break;
+        case 4:
+            if (asm_tok_is(s, n, "s_or"))            { *out = 0x01; return true; }
+            if (asm_tok_is(s, n, "s_bz"))            { *out = 0x21; return true; }
+            if (asm_tok_is(s, n, "v_or"))            { *out = 0x41; return true; }
+            break;
+        case 5:
+            if (asm_tok_is(s, n, "s_and"))           { *out = 0x00; return true; }
+            if (asm_tok_is(s, n, "s_not"))           { *out = 0x02; return true; }
+            if (asm_tok_is(s, n, "s_xor"))           { *out = 0x03; return true; }
+            if (asm_tok_is(s, n, "s_add"))           { *out = 0x04; return true; }
+            if (asm_tok_is(s, n, "s_sub"))           { *out = 0x06; return true; }
+            if (asm_tok_is(s, n, "s_neg"))           { *out = 0x08; return true; }
+            if (asm_tok_is(s, n, "s_mul"))           { *out = 0x09; return true; }
+            if (asm_tok_is(s, n, "s_mov"))           { *out = 0x0b; return true; }
+            if (asm_tok_is(s, n, "s_imm"))           { *out = 0x0c; return true; }
+            if (asm_tok_is(s, n, "s_ori"))           { *out = 0x0d; return true; }
+            if (asm_tok_is(s, n, "s_shl"))           { *out = 0x14; return true; }
+            if (asm_tok_is(s, n, "s_shr"))           { *out = 0x15; return true; }
+            if (asm_tok_is(s, n, "s_sar"))           { *out = 0x16; return true; }
+            if (asm_tok_is(s, n, "s_min"))           { *out = 0x17; return true; }
+            if (asm_tok_is(s, n, "s_max"))           { *out = 0x18; return true; }
+            if (asm_tok_is(s, n, "s_bnz"))           { *out = 0x20; return true; }
+            if (asm_tok_is(s, n, "s_blz"))           { *out = 0x23; return true; }
+            if (asm_tok_is(s, n, "s_bgz"))           { *out = 0x24; return true; }
+            if (asm_tok_is(s, n, "s_b_i"))           { *out = 0x27; return true; }
+            if (asm_tok_is(s, n, "v_and"))           { *out = 0x40; return true; }
+            if (asm_tok_is(s, n, "v_not"))           { *out = 0x42; return true; }
+            if (asm_tok_is(s, n, "v_xor"))           { *out = 0x43; return true; }
+            if (asm_tok_is(s, n, "v_add"))           { *out = 0x44; return true; }
+            if (asm_tok_is(s, n, "v_sub"))           { *out = 0x45; return true; }
+            if (asm_tok_is(s, n, "v_neg"))           { *out = 0x46; return true; }
+            if (asm_tok_is(s, n, "v_mul"))           { *out = 0x47; return true; }
+            if (asm_tok_is(s, n, "v_mad"))           { *out = 0x48; return true; }
+            if (asm_tok_is(s, n, "v_shl"))           { *out = 0x49; return true; }
+            if (asm_tok_is(s, n, "v_shr"))           { *out = 0x4a; return true; }
+            if (asm_tok_is(s, n, "v_sar"))           { *out = 0x4b; return true; }
+            if (asm_tok_is(s, n, "v_mov"))           { *out = 0x4c; return true; }
+            if (asm_tok_is(s, n, "v_imm"))           { *out = 0x4e; return true; }
+            if (asm_tok_is(s, n, "v_min"))           { *out = 0x54; return true; }
+            if (asm_tok_is(s, n, "v_max"))           { *out = 0x55; return true; }
+            if (asm_tok_is(s, n, "s_nop"))           { *out = 0xbf; return true; }
+            break;
+        case 6:
+            if (asm_tok_is(s, n, "s_shli"))          { *out = 0x0e; return true; }
+            if (asm_tok_is(s, n, "s_shri"))          { *out = 0x0f; return true; }
+            if (asm_tok_is(s, n, "s_sari"))          { *out = 0x12; return true; }
+            if (asm_tok_is(s, n, "s_immh"))          { *out = 0x19; return true; }
+            if (asm_tok_is(s, n, "s_addi"))          { *out = 0x1a; return true; }
+            if (asm_tok_is(s, n, "s_muli"))          { *out = 0x1b; return true; }
+            if (asm_tok_is(s, n, "s_andi"))          { *out = 0x1c; return true; }
+            if (asm_tok_is(s, n, "s_xori"))          { *out = 0x1d; return true; }
+            if (asm_tok_is(s, n, "s_bz_i"))          { *out = 0x26; return true; }
+            if (asm_tok_is(s, n, "s_call"))          { *out = 0x28; return true; }
+            if (asm_tok_is(s, n, "v_shli"))          { *out = 0x51; return true; }
+            if (asm_tok_is(s, n, "v_shri"))          { *out = 0x52; return true; }
+            if (asm_tok_is(s, n, "v_sari"))          { *out = 0x53; return true; }
+            if (asm_tok_is(s, n, "v_dot4"))          { *out = 0x56; return true; }
+            if (asm_tok_is(s, n, "v_addi"))          { *out = 0x58; return true; }
+            if (asm_tok_is(s, n, "mma_i8"))          { *out = 0x70; return true; }
+            if (asm_tok_is(s, n, "acc_rd"))          { *out = 0x72; return true; }
+            if (asm_tok_is(s, n, "acc_wr"))          { *out = 0x73; return true; }
+            if (asm_tok_is(s, n, "v_ld_g"))          { *out = 0x80; return true; }
+            if (asm_tok_is(s, n, "v_st_g"))          { *out = 0x83; return true; }
+            if (asm_tok_is(s, n, "s_ld_g"))          { *out = 0x85; return true; }
+            if (asm_tok_is(s, n, "v_ld_l"))          { *out = 0xa0; return true; }
+            if (asm_tok_is(s, n, "v_st_l"))          { *out = 0xa2; return true; }
+            break;
+        case 7:
+            if (asm_tok_is(s, n, "s_addpc"))         { *out = 0x13; return true; }
+            if (asm_tok_is(s, n, "s_bnz_i"))         { *out = 0x25; return true; }
+            if (asm_tok_is(s, n, "v_mov_s"))         { *out = 0x4d; return true; }
+            if (asm_tok_is(s, n, "v_add_s"))         { *out = 0x4f; return true; }
+            if (asm_tok_is(s, n, "v_mul_s"))         { *out = 0x50; return true; }
+            if (asm_tok_is(s, n, "v_cmp_z"))         { *out = 0x5d; return true; }
+            if (asm_tok_is(s, n, "v_ld_gs"))         { *out = 0x81; return true; }
+            if (asm_tok_is(s, n, "v_ld4_g"))         { *out = 0x82; return true; }
+            if (asm_tok_is(s, n, "v_st4_g"))         { *out = 0x84; return true; }
+            if (asm_tok_is(s, n, "v_ld4_l"))         { *out = 0xa1; return true; }
+            if (asm_tok_is(s, n, "v_st4_l"))         { *out = 0xa3; return true; }
+            break;
+        case 8:
+            if (asm_tok_is(s, n, "s_rd_sys"))        { *out = 0x1e; return true; }
+            if (asm_tok_is(s, n, "v_cmp_nz"))        { *out = 0x5c; return true; }
+            if (asm_tok_is(s, n, "v_cmp_lz"))        { *out = 0x5e; return true; }
+            if (asm_tok_is(s, n, "v_cmp_gz"))        { *out = 0x5f; return true; }
+            if (asm_tok_is(s, n, "acc_zero"))        { *out = 0x71; return true; }
+            if (asm_tok_is(s, n, "mma_i8_z"))        { *out = 0x74; return true; }
+            if (asm_tok_is(s, n, "v_ld16_g"))        { *out = 0x86; return true; }
+            if (asm_tok_is(s, n, "v_st16_g"))        { *out = 0x87; return true; }
+            if (asm_tok_is(s, n, "s_endpgm"))        { *out = 0xb3; return true; }
+            break;
+        case 9:
+            if (asm_tok_is(s, n, "s_rd_exec"))       { *out = 0x30; return true; }
+            if (asm_tok_is(s, n, "s_wr_exec"))       { *out = 0x31; return true; }
+            if (asm_tok_is(s, n, "v_lane_id"))       { *out = 0x57; return true; }
+            if (asm_tok_is(s, n, "s_barrier"))       { *out = 0xb0; return true; }
+            break;
+        case 10:
+            if (asm_tok_is(s, n, "s_exec_all"))      { *out = 0x35; return true; }
+            if (asm_tok_is(s, n, "v_readlane"))      { *out = 0x59; return true; }
+            if (asm_tok_is(s, n, "v_bpermute"))      { *out = 0x5b; return true; }
+            break;
+        case 11:
+            if (asm_tok_is(s, n, "s_cbr_execz"))     { *out = 0x29; return true; }
+            if (asm_tok_is(s, n, "v_writelane"))     { *out = 0x5a; return true; }
+            if (asm_tok_is(s, n, "s_waitcnt_g"))     { *out = 0xb1; return true; }
+            if (asm_tok_is(s, n, "s_waitcnt_l"))     { *out = 0xb2; return true; }
+            break;
+        case 12:
+            if (asm_tok_is(s, n, "s_cbr_execnz"))    { *out = 0x2a; return true; }
+            break;
+        case 13:
+            if (asm_tok_is(s, n, "s_or_saveexec"))   { *out = 0x33; return true; }
+            break;
+        case 14:
+            if (asm_tok_is(s, n, "s_and_saveexec"))  { *out = 0x32; return true; }
+            if (asm_tok_is(s, n, "s_xor_saveexec"))  { *out = 0x34; return true; }
+            break;
+        default:
+            break;
+        }
+        return false;
+    }
+
+    // "la s7, label" is one s_addpc: gpu16 has a PC relative address
+    // instruction, so the cpu8 and cpu16 trick of folding an address in
+    // three bits at a time is not needed here.
+    ASM_HD static bool la_dst(const char* s, uint32_t n, int32_t* out) {
+        return gpu16_reg(s, n, 's', out) && *out < 16;
+    }
+
+    // Parse one typed operand into *value, or return the error that says why
+    // it could not be.  A label sets up->label_use and up->name instead.
+    ASM_HD static uint8_t operand(const char* s, uint32_t line_off, asm_span tok,
+                                  uint8_t slot, asm_line* up, int32_t* value) {
+        const char* p = s + tok.off;
+        uint32_t n = tok.len;
+        uint8_t kind = static_cast<uint8_t>(slot >> 4);
+        int32_t v = 0;
+        switch (kind) {
+        case GPU16_K_SREG:
+            if (!gpu16_reg(p, n, 's', &v)) {
+                return ASM_ERR_ARG_KIND;
+            }
+            if (v > 15) {
+                return ASM_ERR_REG_RANGE;
+            }
+            break;
+        case GPU16_K_VREG:
+            if (!gpu16_reg(p, n, 'v', &v)) {
+                return ASM_ERR_ARG_KIND;
+            }
+            if (v > 15) {
+                return ASM_ERR_REG_RANGE;
+            }
+            break;
+        case GPU16_K_VQUAD:
+            if (!gpu16_reg(p, n, 'v', &v)) {
+                return ASM_ERR_ARG_KIND;
+            }
+            if (v > 15) {
+                return ASM_ERR_REG_RANGE;
+            }
+            // Section 4.8: the quad rule, "any other value is an encoding
+            // error the assembler rejects".
+            if ((v & 3) != 0) {
+                return ASM_ERR_QUAD_ALIGN;
+            }
+            break;
+        case GPU16_K_ACCBLK:
+            if (!gpu16_reg(p, n, 'A', &v) && !gpu16_reg(p, n, 'a', &v) &&
+                !asm_parse_number(p, n, &v)) {
+                return ASM_ERR_ARG_KIND;
+            }
+            // 32 accumulators in blocks of 16 is two blocks, A0 and A1.
+            if (v < 0 || v > 1) {
+                return ASM_ERR_REG_RANGE;
+            }
+            break;
+        case GPU16_K_IMM:
+        case GPU16_K_IMMA:
+        case GPU16_K_IMMR:
+            if (!asm_parse_number(p, n, &v)) {
+                if (kind == GPU16_K_IMM) {
+                    return ASM_ERR_LABEL_KIND;
+                }
+                up->label_use = ASM_LABEL_IMM;
+                up->name.off = line_off + tok.off;
+                up->name.len = tok.len;
+                v = 0;
+                break;
+            }
+            // Signed or unsigned, both spellings of the same sixteen bits.
+            if (v < -32768 || v > 65535) {
+                return ASM_ERR_IMM_RANGE;
+            }
+            break;
+        default:
+            if (!asm_parse_number(p, n, &v)) {
+                return ASM_ERR_ARG_KIND;
+            }
+            if (v < 0) {
+                return ASM_ERR_MOD_RANGE;
+            }
+            if (kind == GPU16_K_SHIFT && v > 31) {
+                return ASM_ERR_MOD_RANGE;       // a 32 bit register
+            }
+            if (kind == GPU16_K_LANE && v > 15) {
+                return ASM_ERR_MOD_RANGE;       // sixteen lanes, section 1.1
+            }
+            if (kind == GPU16_K_ACCIDX && v > 31) {
+                return ASM_ERR_MOD_RANGE;       // 32 accumulators, section 2.3
+            }
+            if (v > 255) {
+                return ASM_ERR_MOD_RANGE;       // Mod is eight bits
+            }
+            break;
+        }
+        *value = v;
+        return ASM_OK;
+    }
+
+    ASM_HD static uint8_t parse(const char* s, uint32_t line_off, const asm_span* t,
+                                uint32_t ntokens, asm_line* out) {
+        if (!opcode(s + t[0].off, t[0].len, &out->opcode)) {
+            return ASM_ERR_OPCODE;
+        }
+        gpu16_sig sig = gpu16_signature(out->opcode);
+        if (ntokens != sig.count + 1u) {
+            out->arg[1] = static_cast<int32_t>(sig.count);
+            return ASM_ERR_OPERANDS;
+        }
+        int32_t field[ASM_MAX_ARGS] = {0, 0, 0, 0, 0};
+        for (uint32_t i = 0; i < sig.count; i++) {
+            int32_t value = 0;
+            uint8_t code = operand(s, line_off, t[1 + i], sig.slot[i], out, &value);
+            if (code != ASM_OK) {
+                out->label_use = ASM_LABEL_NONE;
+                out->arg[0] = static_cast<int32_t>(i);
+                out->arg[1] = static_cast<int32_t>(sig.count);
+                return code;
+            }
+            field[sig.slot[i] & 0xf] = value;
+        }
+        for (uint32_t i = 0; i < ASM_MAX_ARGS; i++) {
+            out->arg[i] = field[i];
+        }
+        return ASM_OK;
+    }
+
+    // A label resolves to a word address; what goes in the instruction is
+    // either that address or its distance from PC_next, and either way it
+    // has to fit the sixteen bits the field has.
+    ASM_HD static uint8_t check_resolved(const asm_line& l, uint32_t address, int32_t target) {
+        if (l.label_use == ASM_LABEL_NONE) {
+            return ASM_OK;
+        }
+        bool relative = l.label_use == ASM_LABEL_LA || gpu16_imm_is_relative(l.opcode);
+        int32_t imm = relative ? target - static_cast<int32_t>(address + 1) : target;
+        if (imm < -32768 || imm > 65535) {
+            return ASM_ERR_BRANCH_RANGE;
+        }
+        return ASM_OK;
+    }
+
+    ASM_HD static uint32_t encode(const asm_statement& s, uint32_t* words) {
+        uint8_t op = s.opcode;
+        uint32_t a0 = static_cast<uint32_t>(s.arg[0]) & 0xf;
+        uint32_t a1 = static_cast<uint32_t>(s.arg[1]) & 0xf;
+        uint32_t a2 = static_cast<uint32_t>(s.arg[2]) & 0xf;
+        uint32_t a3 = static_cast<uint32_t>(s.arg[3]) & 0xf;
+        uint32_t mod = static_cast<uint32_t>(s.arg[4]) & 0xff;
+        int32_t imm = s.arg[2];
+        if (s.label_use == ASM_LABEL_LA) {
+            op = 0x13;                  // s_addpc
+            a1 = 0;
+            imm = s.target - static_cast<int32_t>(s.address + 1);
+        }
+        else if (s.label_use == ASM_LABEL_IMM) {
+            imm = gpu16_imm_is_relative(op)
+                  ? s.target - static_cast<int32_t>(s.address + 1)
+                  : s.target;
+        }
+        uint32_t word = (static_cast<uint32_t>(op) << 24) | (a0 << 20) | (a1 << 16);
+        if (gpu16_has_imm(op)) {
+            word |= static_cast<uint32_t>(imm) & 0xffff;
+        }
+        else {
+            word |= (a2 << 12) | (a3 << 8) | mod;
+        }
+        words[0] = word;
+        return 1;
     }
 };
 
@@ -407,99 +1114,80 @@ ASM_HD inline void asm_classify_line(const char* buf, asm_span line, asm_line* o
     out->ntokens = 0;
     out->name.off = 0;
     out->name.len = 0;
-    out->arg[0] = out->arg[1] = out->arg[2] = 0;
+    for (uint32_t i = 0; i < ASM_MAX_ARGS; i++) {
+        out->arg[i] = 0;
+    }
     out->opcode = 0;
-    out->is_la = 0;
+    out->label_use = ASM_LABEL_NONE;
     out->error = ASM_OK;
     out->pad = 0;
 
     uint32_t pos = 0;
     asm_span tok;
-    bool have = asm_next_token(s, len, &pos, &tok);
+    bool have = asm_next_token(s, len, &pos, &tok, ISA::comma_separated);
     // A label definition is a token ending in ':'.  It may sit on a line of
     // its own or in front of an instruction, and there may be several.
     while (have && asm_is_label_definition(s + tok.off, tok.len)) {
         out->nlabels++;
-        have = asm_next_token(s, len, &pos, &tok);
+        have = asm_next_token(s, len, &pos, &tok, ISA::comma_separated);
     }
     if (!have) {
         return;
     }
-    // Only the first four tokens can matter: cpu16's longest instruction is
-    // "<op> <arg0> <arg1> <arg2>", and any line with more than that is an
-    // error that names its token count rather than its tokens.
-    asm_span t[4];
+    // Only the first few tokens can matter: the longest instruction here is
+    // gpu16's "<op> <dst> <src0> <src1> <src2>", and any line with more than
+    // that is an error that names its token count rather than its tokens.
+    asm_span t[ASM_MAX_TOKENS];
     t[0] = tok;
-    t[1] = t[2] = t[3] = asm_span{0, 0};
+    for (uint32_t i = 1; i < ASM_MAX_TOKENS; i++) {
+        t[i] = asm_span{0, 0};
+    }
     out->ntokens = 1;
-    while (asm_next_token(s, len, &pos, &tok)) {
-        if (out->ntokens < 4) {
+    while (asm_next_token(s, len, &pos, &tok, ISA::comma_separated)) {
+        if (out->ntokens < ASM_MAX_TOKENS) {
             t[out->ntokens] = tok;
         }
         out->ntokens++;
     }
 
-    out->is_la = asm_tok_is(s + t[0].off, t[0].len, "la") ? 1 : 0;
-
-    if (out->is_la) {
+    // "la <dst> <label>" is the one pseudo instruction every ISA here has.
+    if (asm_tok_is(s + t[0].off, t[0].len, "la")) {
+        out->label_use = ASM_LABEL_LA;
         if (out->ntokens != 3) {
             out->error = ASM_ERR_LA_TOKENS;
             return;
         }
         int32_t dst;
-        if (!asm_register(s + t[1].off, t[1].len, &dst)) {
+        if (!ISA::la_dst(s + t[1].off, t[1].len, &dst)) {
             out->error = ASM_ERR_LA_DST;
             return;
         }
-        out->arg[0] = static_cast<int8_t>(dst);
+        out->arg[0] = dst;
         out->name.off = line.off + t[2].off;
         out->name.len = t[2].len;
         return;
     }
 
-    if (out->ntokens != ISA::insn_tokens) {
-        out->error = ASM_ERR_TOKENS;
-        return;
-    }
-    if (!ISA::opcode(s + t[0].off, t[0].len, &out->opcode)) {
-        out->error = ASM_ERR_OPCODE;
-        return;
-    }
-    int32_t parsed[3] = {0, 0, 0};
-    for (uint32_t i = 0; i < ISA::nargs; i++) {
-        if (!ISA::arg(s + t[1 + i].off, t[1 + i].len, &parsed[i])) {
-            out->error = ASM_ERR_ARG;
-            return;
-        }
-    }
-    for (uint32_t i = 0; i < ISA::nargs; i++) {
-        if (parsed[i] < 0 || parsed[i] > 7) {
-            out->error = static_cast<uint8_t>(ASM_ERR_ARG_RANGE0 + i);
-            return;
-        }
-    }
-    for (uint32_t i = 0; i < ISA::nargs; i++) {
-        out->arg[i] = static_cast<int8_t>(parsed[i]);
-    }
+    out->error = ISA::parse(s, line.off, t, out->ntokens, out);
 }
 
 // How many instruction words a classified line occupies.
 template <class ISA>
 ASM_HD inline uint32_t asm_line_words(const asm_line& l) {
-    return l.is_la ? ISA::la_words : 1u;
+    return l.label_use == ASM_LABEL_LA ? ISA::la_words : 1u;
 }
 
 // Place one statement's words in the output buffer.  The offset comes from
 // the statement's address alone, so every statement writes a disjoint slice
 // and no thread or lane has to agree with any other about where it goes.
 ASM_HD inline void asm_write_words(uint8_t* out, uint32_t address,
-                                   const uint16_t* words, uint32_t n,
+                                   const uint32_t* words, uint32_t n,
                                    asm_format fmt) {
     const char* digits = "0123456789abcdef";
     uint32_t stride = asm_bytes_per_word(fmt);
     uint8_t* p = out + static_cast<size_t>(address) * stride;
     for (uint32_t i = 0; i < n; i++) {
-        uint16_t w = words[i];
+        uint32_t w = words[i];
         if (fmt.hex) {
             for (uint32_t d = 0; d < 2u * fmt.word_bytes; d++) {
                 uint32_t shift = 4u * (2u * fmt.word_bytes - 1u - d);
@@ -518,7 +1206,7 @@ ASM_HD inline void asm_write_words(uint8_t* out, uint32_t address,
 // The whole encode stage for one statement.
 template <class ISA>
 ASM_HD inline void asm_encode_statement(const asm_statement& s, uint8_t* out, asm_format fmt) {
-    uint16_t words[ASM_MAX_WORDS];
+    uint32_t words[ASM_MAX_WORDS];
     uint32_t n = ISA::encode(s, words);
     asm_write_words(out, s.address, words, n, fmt);
 }

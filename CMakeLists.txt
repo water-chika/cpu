@@ -56,6 +56,9 @@ target_link_libraries(asm PRIVATE asm_core)
 add_executable(asm16 asm16.cpp)
 target_link_libraries(asm16 PRIVATE asm_core)
 
+add_executable(asm_gpu16 asm_gpu16.cpp)
+target_link_libraries(asm_gpu16 PRIVATE asm_core)
+
 add_executable(asm_bench asm_bench.cpp)
 target_link_libraries(asm_bench PRIVATE asm_core)
 
