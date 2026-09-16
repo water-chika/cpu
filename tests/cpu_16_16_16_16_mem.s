@@ -40,6 +40,12 @@ stb  r14, r13           # mem8[17] = 0x77, the high byte: word 8 is now 0x775a
 # A halfword access ignores bit 0 of the address, section 5, so 21 reads the
 # word at 20.  This load is also the last instruction before the halt: its
 # value arrives on the halting edge and still has to be written back.
+# A store whose value is the load immediately before it.  The M format read
+# side needs the forwarding path too, not only the ALU's: without it this
+# would store whatever r6 held before, which is 1.
+ld   r6, r1, 2          # mem16[4] = 0x00ff
+st   r6, r11, 6         # mem16[28] = 0x00ff, which is word 14
+
 movi r15, 21
 ld   r0, r15, 0         # mem16[20] = 0xbeef
 

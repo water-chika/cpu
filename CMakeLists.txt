@@ -339,7 +339,7 @@ if(IVERILOG_EXECUTABLE AND VVP_EXECUTABLE)
         tests/cpu_16_16_16_16_mem.s tests/cpu_16_16_16_16_mem.data16
         cpu_16_16_16_16_mem.expect 60
         +mexpect=${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu_16_16_16_16_mem.mexpect16
-        +mexpect_words=11)
+        +mexpect_words=15)
     add_cpu_16_16_16_16_test(cpu_16_16_16_16_sum
         tests/cpu_16_16_16_16_sum.s tests/cpu_16_16_16_16_sum.data16
         cpu_16_16_16_16_sum.expect 150

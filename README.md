@@ -929,6 +929,60 @@ take the 5-bit fields for free instead, by absorbing an argument field that
 only two instructions use, implement 16 registers anyway, and solve the actual
 kernel problem with a bit that is already dead in ```v_ld16_g```.
 
+## Instruction Set Architecture - 16/16/16/16
+
+[```docs/cpu_16_16_16_16.md```](docs/cpu_16_16_16_16.md) is the fourth core in
+the family, and its name is the family's own convention spelled out: a 16 bit
+instruction word, a 16 bit datapath, 16 registers and a 16 bit program
+counter, so 64 KiB of code and 64 KiB of data.  It is ```cpu_16_16_16_16.v```
+and it does not touch ```cpu8.v```, ```cpu16.v``` or ```gpu16*.v```.
+
+The interesting part of the design is that 16 registers cost four bits each,
+so a two register instruction has already spent half of the word before it
+has said what to do.  The answer is the same one ```cpu16.v``` reaches for and
+pushed further: instructions are two address, ```op rd, rs``` meaning
+```rd = rd op rs```, and the encoding is split by class in ```Inst[15:12]```.
+Class ```00xx``` gives the register format a full eight bit opcode, which is
+where the 35 register operations live; classes 4 to 7 and a to b give six
+immediate forms an eight bit immediate and one register; classes 8 and 9 give
+```ld```/```st``` a register pair and a four bit halfword offset; class c
+gives a branch a four bit condition and a signed eight bit word displacement;
+classes d and e give ```jmp``` and ```call``` a signed twelve bit one.  The
+immediates that had to be chosen carefully are ```movi```/```movih```, which
+build any 16 bit constant in two instructions, and ```andi```/```ori```, which
+zero extend where ```addi```/```cmpi``` sign extend - so a mask keeps its high
+bits clear and an addend can be negative.
+
+```asm_16_16_16_16``` is another ```asm_kernel.hpp``` struct and a three line
+```main```, so it inherits the serial, threads and HIP backends for free;
+```asm_bench --isa 1616``` reports all three producing identical output.  Two
+diagnostics that were previously hard coded in ```asm_pipeline.hpp``` are now
+per ISA strings, because "0-7" is not the register range here; the ```gpu16```
+and ```cpu8``` wording is unchanged to the byte, which ```gpu_reject``` checks.
+
+Seventeen tests cover it.  Four are assembler level - an encoding test whose
+expected words come from a second, independent Python encoder written from the
+document rather than from the assembler, a 36 case rejection test, a branch
+range test that walks both edges, and the two backend agreement tests.  Eleven
+are simulations written in assembler source with expectations computed by hand
+from the specification, never captured from the RTL; the ```branch``` one
+exercises all fifteen conditions against three different flag states, and
+```mem``` and ```sum``` check data memory as well as registers.
+
+Fifty mutations were run against the core and the assembler with
+[```tests/mutate_cpu_16_16_16_16.py```](tests/mutate_cpu_16_16_16_16.py), and
+the first run caught 44 of them.  The four that escaped were all the same kind
+of gap - a rule the tests asserted only where it did not matter.  ```mov```
+could be made to write flags because no test read a flag across a ```mov```;
+```cmp``` could be made to write its result back because every ```cmp``` in
+the tests was followed by a branch and never by a use of the destination; the
+read side forwarding path for ```ld```/```st``` could be deleted because no
+test ever stored the value it had just loaded; and ```andi``` could be made to
+sign extend because no test used a mask with bit 7 set.  Three lines added to
+```flags.s```, two blocks added to ```imm.s``` and a load-then-store pair in
+```mem.s``` closed all four, and a fifth mutation - the same sign extension
+bug in ```ori``` - was added at the same time.  The rerun catches all fifty.
+
 ## Putting it on an FPGA
 
 [```docs/fpga_bringup.md```](docs/fpga_bringup.md) is a plan, not a build:

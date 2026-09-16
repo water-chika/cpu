@@ -24,6 +24,16 @@ movih r7, 0xff
 ori   r7, 0x0f          # ori zero extends: 0xff0f
 andi  r7, 0x0f          # andi zero extends: 0x000f
 
+# andi and ori zero extend, which only shows when bit 7 of the immediate is
+# set: sign extension would make these 0xff80 instead of 0x0080.
+movi  r12, 0
+movih r12, 0xff
+ori   r12, 0xff         # 0xffff
+andi  r12, 0x80         # 0xffff & 0x0080 = 0x0080
+
+movi  r13, 0
+ori   r13, 0x80         # 0x0000 | 0x0080 = 0x0080
+
 la    r8, dest
 la    r9, dest2
 sub   r9, r8            # dest2 is one instruction later, so exactly 2 bytes

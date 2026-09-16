@@ -42,9 +42,13 @@ mov   r12, r11
 tst   r11, r12          # 0x8000: Z=0 N=1, C still 1
 rd_sys r13, 2           # 0b0110
 
-# mov writes nothing at all, so the read below must still be 0b0110.
-movi r14, 0
+# cmp writes flags and no register, so r0 is still 9 below.
+movi r0, 9
+cmp  r0, r1             # 9 - 5 = 4: Z=0 N=0 C=0 V=0
+
+# mov writes nothing at all - not even Z and N - so although the word it
+# moves is 0x8000, the read below must still be the cmp's 0b0000.
 mov  r14, r11
-rd_sys r15, 2           # 0b0110
+rd_sys r15, 2           # 0b0000
 
 halt
