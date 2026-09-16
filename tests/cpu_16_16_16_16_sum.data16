@@ -1,0 +1,11 @@
+// A count followed by that many 16 bit values, for cpu_16_16_16_16_sum.s.
+// 1 + 2 + ... + 8 = 36 = 0x24.
+0008
+0001
+0002
+0003
+0004
+0005
+0006
+0007
+0008

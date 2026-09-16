@@ -288,6 +288,64 @@ if(IVERILOG_EXECUTABLE AND VVP_EXECUTABLE)
     add_cpu_test(cpu16_adc   asm16 test16.v tests/cpu16_adc.s   -              cpu16_adc.expect   100)
     add_cpu_test(cpu16_ldp   asm16 test16.v tests/cpu16_ldp.s   -              cpu16_ldp.expect   100)
 
+    # cpu_16_16_16_16.  Each program is assembled by asm_16_16_16_16, has to
+    # reach `halt` inside its cycle budget, and has to match all sixteen
+    # registers - and, where the test stores anything, the data memory words
+    # themselves through +mexpect.  Every expectation was computed from
+    # docs/cpu_16_16_16_16.md by hand and none of it was read back from the
+    # simulator; the numbers and the arithmetic behind them are written out
+    # in the comments of each .s file.
+    function(add_cpu_16_16_16_16_test name program data expect cycles)
+        if(data STREQUAL "-")
+            set(data_arg "-")
+        else()
+            set(data_arg ${CMAKE_CURRENT_SOURCE_DIR}/${data})
+        endif()
+        add_test(
+            NAME ${name}
+            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_test_16_16_16_16.sh
+                    $<TARGET_FILE:asm_16_16_16_16>
+                    ${CMAKE_CURRENT_SOURCE_DIR}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/${program}
+                    ${data_arg}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/${expect}
+                    ${cycles}
+                    ${ARGN}
+        )
+        set_tests_properties(${name} PROPERTIES FAIL_REGULAR_EXPRESSION "TEST FAIL")
+    endfunction()
+
+    add_cpu_16_16_16_16_test(cpu_16_16_16_16_alu
+        tests/cpu_16_16_16_16_alu.s   - cpu_16_16_16_16_alu.expect   60)
+    add_cpu_16_16_16_16_test(cpu_16_16_16_16_arith
+        tests/cpu_16_16_16_16_arith.s - cpu_16_16_16_16_arith.expect 60)
+    add_cpu_16_16_16_16_test(cpu_16_16_16_16_shift
+        tests/cpu_16_16_16_16_shift.s - cpu_16_16_16_16_shift.expect 60)
+    add_cpu_16_16_16_16_test(cpu_16_16_16_16_flags
+        tests/cpu_16_16_16_16_flags.s - cpu_16_16_16_16_flags.expect 60)
+    add_cpu_16_16_16_16_test(cpu_16_16_16_16_branch
+        tests/cpu_16_16_16_16_branch.s - cpu_16_16_16_16_branch.expect 400)
+    add_cpu_16_16_16_16_test(cpu_16_16_16_16_imm
+        tests/cpu_16_16_16_16_imm.s   - cpu_16_16_16_16_imm.expect   60)
+    add_cpu_16_16_16_16_test(cpu_16_16_16_16_jump
+        tests/cpu_16_16_16_16_jump.s  - cpu_16_16_16_16_jump.expect  40)
+    add_cpu_16_16_16_16_test(cpu_16_16_16_16_call
+        tests/cpu_16_16_16_16_call.s  - cpu_16_16_16_16_call.expect  60)
+    add_cpu_16_16_16_16_test(cpu_16_16_16_16_sys
+        tests/cpu_16_16_16_16_sys.s   - cpu_16_16_16_16_sys.expect   60)
+
+    # The two that store, and so check the memory array itself.
+    add_cpu_16_16_16_16_test(cpu_16_16_16_16_mem
+        tests/cpu_16_16_16_16_mem.s tests/cpu_16_16_16_16_mem.data16
+        cpu_16_16_16_16_mem.expect 60
+        +mexpect=${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu_16_16_16_16_mem.mexpect16
+        +mexpect_words=11)
+    add_cpu_16_16_16_16_test(cpu_16_16_16_16_sum
+        tests/cpu_16_16_16_16_sum.s tests/cpu_16_16_16_16_sum.data16
+        cpu_16_16_16_16_sum.expect 150
+        +mexpect=${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu_16_16_16_16_sum.mexpect16
+        +mexpect_words=17)
+
     # The gpu16 scalar unit.  Each program is assembled by asm_gpu16 and then
     # has to reach s_endpgm and match all sixteen scalar registers.  The
     # expectation files were written against hand encoded hex before the

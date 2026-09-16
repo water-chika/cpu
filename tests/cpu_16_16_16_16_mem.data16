@@ -1,0 +1,7 @@
+// Four 16 bit words of data memory for cpu_16_16_16_16_mem.s.  The word at
+// index w covers byte addresses 2w and 2w+1, and the low byte is the even
+// one - section 5, endianness is little.
+1234
+abcd
+00ff
+8000
