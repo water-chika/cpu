@@ -1,4 +1,5 @@
 `include "gpu16.v"
+`include "gpu16_matrix.v"
 
 // gpu16_cu: one compute unit - the workgroup of four waves that docs/
 // gpu_isa.md describes, rather than the single wave gpu16.v is.
@@ -88,6 +89,11 @@ wire [255:0] w_l_byte_enable;   // 4 x 64
 wire [2047:0] w_l_wdata;        // 4 x 512
 wire [3:0] w_barrier_wait;
 wire [127:0] w_bytes_add;       // 4 x 32
+wire [3:0] w_m_request;
+wire [127:0] w_m_a;             // 4 x 32
+wire [2047:0] w_m_b;            // 4 x 512
+wire [2047:0] w_m_acc;          // 4 x 512
+wire [3:0] w_m_zero;
 
 // ---------------------------------------------------------------- issue
 //
@@ -201,6 +207,72 @@ end
 wire [511:0] g_rdata;
 wire [511:0] l_rdata;
 
+// ------------------------------------------------- the shared matrix unit
+//
+// Section 4.7's 64 int8 MACs, one array for the workgroup.  Section 7.3
+// prices a workgroup iteration at "1024 matrix cycles" for four waves of 16
+// `mma_i8`, i.e. 4 x 256, which is the arithmetic of four waves sharing one
+// array; four private arrays would have made it 256 and the matrix unit would
+// not have been the limiter the whole section says it is.
+//
+// The grant rotates rather than going to the lowest numbered asker, which is
+// the one place this module departs from the fixed priority the memory ports
+// use, and for a reason the ports do not have: a memory access asks for at
+// most sixteen cycles and then stops, while a wave in a GEMM inner loop can
+// re-arm its request the cycle after it finishes one `mma_i8` and would hold
+// a fixed priority arbiter indefinitely.  Round robin here is the same rule
+// the issue slot already uses, and is what makes matrix utilisation a
+// property of the workgroup rather than of wave 0.
+reg [1:0] mrr;
+reg [3:0] m_grant;
+reg [1:0] m_pick;
+integer km;
+reg [1:0] midx;
+reg found_m;
+always @* begin
+    m_grant = 4'b0;
+    m_pick = 2'b0;
+    found_m = 1'b0;
+    for (km = 0; km < WAVES; km = km + 1) begin
+        midx = mrr + km[1:0];
+        if (~found_m & w_m_request[midx]) begin
+            found_m = 1'b1;
+            m_pick = midx;
+            m_grant[midx] = 1'b1;
+        end
+    end
+end
+
+reg [31:0] m_a;
+reg [511:0] m_b;
+reg [511:0] m_acc;
+reg m_zero;
+integer kms;
+always @* begin
+    m_a = 32'b0;
+    m_b = 512'b0;
+    m_acc = 512'b0;
+    m_zero = 1'b0;
+    for (kms = 0; kms < WAVES; kms = kms + 1) begin
+        if (m_grant[kms]) begin
+            m_a = w_m_a[32*kms+:32];
+            m_b = w_m_b[512*kms+:512];
+            m_acc = w_m_acc[512*kms+:512];
+            m_zero = w_m_zero[kms];
+        end
+    end
+end
+
+wire [511:0] m_result;
+
+gpu16_matrix matrix (
+    .a_frag(m_a),
+    .b_frag(m_b),
+    .acc_in(m_acc),
+    .zero_acc(m_zero),
+    .acc_out(m_result)
+);
+
 gpu16_gmem #(
     .WORD_INDEX_WIDTH(DATA_INDEX_WIDTH)
 ) data (
@@ -240,6 +312,7 @@ gpu16_lds lds (
 reg [31:0] perf_gmem_bytes;
 reg [31:0] perf_gmem_trans;
 reg [31:0] perf_lds_cycles;
+reg [31:0] perf_mma_busy;
 
 reg [31:0] bytes_this_cycle;
 integer kb;
@@ -253,13 +326,18 @@ end
 always @(posedge clk or posedge reset) begin
     if (reset) begin
         rr <= 2'b0;
+        mrr <= 2'b0;
         perf_gmem_bytes <= 32'b0;
         perf_gmem_trans <= 32'b0;
         perf_lds_cycles <= 32'b0;
+        perf_mma_busy <= 32'b0;
     end
     else begin
         if (|issue_grant) begin
             rr <= issue_pick + 2'b1;
+        end
+        if (|m_grant) begin
+            mrr <= m_pick + 2'b1;
         end
         perf_gmem_bytes <= perf_gmem_bytes + bytes_this_cycle;
         if (|g_grant) begin
@@ -267,6 +345,16 @@ always @(posedge clk or posedge reset) begin
         end
         if (|l_grant) begin
             perf_lds_cycles <= perf_lds_cycles + 1;
+        end
+        // Section 4.3, system register 10: "cycles the matrix unit has been
+        // busy".  One per cycle the array does work, which is one per cycle
+        // it is granted - the counter is the port, exactly as it is for the
+        // two memory counters above.  `acc_zero` does not appear here: it
+        // walks the accumulator file's write port but asks nothing of the
+        // multipliers, and section 7.2's matrix utilisation is about the
+        // multipliers.
+        if (|m_grant) begin
+            perf_mma_busy <= perf_mma_busy + 1;
         end
     end
 end
@@ -306,10 +394,18 @@ generate
             .l_grant(l_grant[w]),
             .barrier_wait(w_barrier_wait[w]),
             .barrier_release(barrier_release),
+            .m_request(w_m_request[w]),
+            .m_a(w_m_a[32*w+:32]),
+            .m_b(w_m_b[512*w+:512]),
+            .m_acc(w_m_acc[512*w+:512]),
+            .m_zero(w_m_zero[w]),
+            .m_result(m_result),
+            .m_grant(m_grant[w]),
             .gmem_bytes_add(w_bytes_add[32*w+:32]),
             .perf_gmem_bytes_in(perf_gmem_bytes),
             .perf_gmem_trans_in(perf_gmem_trans),
             .perf_lds_cycles_in(perf_lds_cycles),
+            .perf_mma_busy_in(perf_mma_busy),
             .halted(w_halted[w])
         );
     end

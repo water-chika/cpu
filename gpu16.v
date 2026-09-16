@@ -24,10 +24,12 @@
 //
 // SCOPE.  Sections 4.3 (scalar ALU), 4.4 (scalar control flow, including the
 // two exec-mask branches), 4.5 (exec mask control), 4.6 (vector ALU, in
-// gpu16_vector.v), 4.8 (global memory, whole), 4.9 (LDS, whole) and 4.10's
-// wave control.  There is still no matrix unit (4.7), so 0x70 to 0x74 fall
-// through to the `unknown opcode` arm rather than guessing at their
-// behaviour.
+// gpu16_vector.v), 4.7 (the matrix unit: the accumulator file is in
+// gpu16_vector.v with the rest of the per lane state, the row sequencer is
+// here, and the 64 MACs are shared by the workgroup in gpu16_matrix.v),
+// 4.8 (global memory, whole), 4.9 (LDS, whole) and 4.10's wave control.  The
+// whole ISA is implemented; nothing falls through to the `unknown opcode`
+// arm any more.
 //
 // SIMT, in one always block.  Section 1.1 gives the wave one PC, one fetch
 // and one decode driving sixteen copies of the datapath, so the vector unit
@@ -93,6 +95,20 @@ module gpu16 #(
     input [511:0] l_rdata,
     input l_grant,
 
+    // The matrix unit's 64 MACs, section 4.7.  Shared by the workgroup like
+    // the two memory ports and asked for the same way: section 7.3 counts
+    // "1024 matrix cycles per workgroup iteration" for four waves issuing 16
+    // `mma_i8` each, which is 4 x 256 and therefore one array the four waves
+    // queue for.  What stays in the wave is the accumulator file - section
+    // 2.3 makes it per lane - and the sixteen-cycle row sequencer below.
+    output m_request,
+    output [31:0] m_a,
+    output [511:0] m_b,
+    output [511:0] m_acc,
+    output m_zero,
+    input [511:0] m_result,
+    input m_grant,
+
     // Section 3.3's barrier.  High while this wave is sitting on an
     // `s_barrier` it has not been let through yet.
     output barrier_wait,
@@ -106,6 +122,7 @@ module gpu16 #(
     input [31:0] perf_gmem_bytes_in,
     input [31:0] perf_gmem_trans_in,
     input [31:0] perf_lds_cycles_in,
+    input [31:0] perf_mma_busy_in,
 
     // High once s_endpgm has retired, or immediately for an unlaunched slot.
     output halted
@@ -298,11 +315,77 @@ reg gmem_read;
 // waiting must get through on the strength of that one release.
 reg bar_done;
 wire at_barrier = (opcode == 8'hb0);
+
+// ---------------------------------------------------------------- matrix unit
+//
+// Section 4.7's sixteen cycle walk, and the third thing in this file that
+// takes more than one cycle.  The state is small because the work is
+// regular: which two VGPRs hold the fragments, which accumulator block, which
+// row is being walked, and the exec mask as it was when the instruction
+// issued.
+//
+//   * `mma_i8` / `mma_i8_z` walk sixteen rows, one per cycle, each row asking
+//     the compute unit for the shared multiplier array and advancing only
+//     when granted;
+//   * `acc_zero` walks the same sixteen rows writing zeroes.  It does not ask
+//     for the array - there is nothing to multiply - but it does occupy the
+//     accumulator file's one write port for sixteen cycles, which is the
+//     honest cost of section 2.3's "one read and one write port at one row
+//     per cycle".  A block zeroed in a single cycle would need a 256-word
+//     write port that nothing else in the design has.
+//
+// The A operand is *not* latched, only its register number is: section 4.7
+// has the unit read `vA` from lane `m` on the cycle it walks row `m`, through
+// a 16:1 multiplexer.  Latching all sixteen A values at issue would be the
+// 16x32-bit read - a crossbar in disguise - that the section says this
+// design avoids, and the area numbers in 7.5 rest on it not happening.
+reg mat_busy;
+reg mat_fill;             // acc_zero rather than a multiply
+reg mat_zacc;             // mma_i8_z: overwrite rather than accumulate
+reg mat_blk;
+reg [3:0] mat_row;
+reg [3:0] mat_areg;
+reg [3:0] mat_breg;
+reg [15:0] mat_mask;
+
+assign m_request = mat_busy & ~mat_fill;
+assign m_zero = mat_zacc;
+// The cycle a row actually moves: for a multiply, the cycle the array is
+// granted; for a fill, every cycle, since it needs nothing shared.
+wire mat_go = mat_busy & (mat_fill | m_grant);
+wire mat_last = mat_go & (mat_row == 4'hf);
+wire [4:0] mat_idx = {mat_blk, mat_row};
+wire [511:0] mat_wdata = mat_fill ? 512'b0 : m_result;
+
+// The interlock, section 1.4: "`acc_rd` after `mma_i8` is safe with no manual
+// wait", and Model-A's "a wave issuing a second `mma` stalls until the unit
+// frees".  Both are this, and the two halves are deliberately not the same
+// strictness:
+//
+//   * another `mma_i8` or `acc_zero` may issue on the *last* walking cycle.
+//     The row in flight is written on that cycle's edge with this
+//     instruction's own index and mask, and the newcomer's first row is read
+//     on the next cycle, after that write has landed.  This is what makes a
+//     stream of `mma_i8` cost sixteen cycles each rather than seventeen, and
+//     therefore what makes section 7.3's 1024 cycles per workgroup iteration
+//     achievable instead of 1088.
+//   * `acc_rd` and `acc_wr` may not.  They read or write the accumulator file
+//     in the cycle they issue, so issuing one on the last walking cycle would
+//     read the row the matrix unit is writing on that same edge and get the
+//     value from before it.
+//   * `s_endpgm` may not either: a wave that retired with a walk in flight
+//     would leave sixteen accumulator rows in an order the ISA does not
+//     describe.
+wire op_matrix = (opcode == 8'h70) | (opcode == 8'h71) | (opcode == 8'h74);
+wire op_accmove = (opcode == 8'h72) | (opcode == 8'h73);
+wire mat_stall = (op_matrix & mat_busy & ~mat_last)
+               | ((op_accmove | (opcode == 8'hb3)) & mat_busy);
+
 wire wave_ready = (bubble == 2'b0) & ~halted_r & launch
                 & (mem_state == MEM_IDLE) & ~gmem_read;
 
 assign barrier_wait = wave_ready & at_barrier & ~bar_done;
-assign issue_request = wave_ready & (~at_barrier | bar_done);
+assign issue_request = wave_ready & (~at_barrier | bar_done) & ~mat_stall;
 wire issue = issue_request & issue_grant;
 
 // Which resource the access in flight is against, and how wide it is.  LDS
@@ -537,7 +620,17 @@ gpu16_vector #(
     .mem_write(mem_write),
     .mem_reg(mem_wb_reg),
     .mem_mask(mem_exec),
-    .mem_data(mem_wb_data)
+    .mem_data(mem_wb_data),
+    .mat_areg(mat_areg),
+    .mat_breg(mat_breg),
+    .mat_row(mat_row),
+    .mat_idx(mat_idx),
+    .mat_a(m_a),
+    .mat_b(m_b),
+    .mat_acc(m_acc),
+    .mat_write(mat_go),
+    .mat_mask(mat_mask),
+    .mat_wdata(mat_wdata)
 );
 
 // ---------------------------------------------------------------- system registers
@@ -556,13 +649,18 @@ always @* begin
         8'd5: sys_value = LDS_SIZE;
         8'd8: sys_value = perf_cycles;
         8'd9: sys_value = perf_instrs;
-        // perf_mma_busy reads zero because the matrix unit does not exist
-        // yet.  perf_gmem_bytes counts the bytes the program asked for, which
-        // is section 7.2's "Bytes" metric - four for an s_ld_g, and the
-        // access width times the number of enabled lanes for a per lane
-        // access.  It counts *global* bytes only, which is what section 7.2
-        // says it is; LDS traffic is not memory traffic.
-        8'd10: sys_value = 32'b0;
+        // Section 7.2's matrix utilisation is `perf_mma_busy / cycles`, so
+        // this counts cycles of the *shared* array - one per granted matrix
+        // cycle, wherever in the workgroup it was granted - exactly as
+        // registers 11 to 13 count the shared memory system.  A wave reading
+        // it sees the workgroup's matrix unit, which is the only matrix unit
+        // there is.
+        8'd10: sys_value = perf_mma_busy_in;
+        // perf_gmem_bytes counts the bytes the program asked for, which is
+        // section 7.2's "Bytes" metric - four for an s_ld_g, and the access
+        // width times the number of enabled lanes for a per lane access.  It
+        // counts *global* bytes only, which is what section 7.2 says it is;
+        // LDS traffic is not memory traffic.
         8'd11: sys_value = perf_gmem_bytes_in;
         // Section 7.2's LDS cost is "1 issue cycle + 1 port cycle per
         // conflict way", and this is the second half: one per cycle the LDS
@@ -608,6 +706,14 @@ always @(posedge clk or posedge reset) begin
         lane_addr <= 384'b0;
         stage <= 2048'b0;
         st_reg <= 4'b0;
+        mat_busy <= 1'b0;
+        mat_fill <= 1'b0;
+        mat_zacc <= 1'b0;
+        mat_blk <= 1'b0;
+        mat_row <= 4'b0;
+        mat_areg <= 4'b0;
+        mat_breg <= 4'b0;
+        mat_mask <= 16'b0;
         // Section 4.12: s0 is the kernel argument pointer, s1 and s2 are the
         // workgroup indices and "every other register is undefined".  Zero is
         // a legal choice for undefined and a far easier one to test against.
@@ -728,6 +834,21 @@ always @(posedge clk or posedge reset) begin
             end
             default: ;
         endcase
+
+        // ---- the matrix unit's row walk
+        //
+        // One accumulator row per granted cycle, sixteen of them, and then
+        // the unit is free.  This sits before the issue block so that an
+        // `mma_i8` issuing on the last walking cycle - which the interlock
+        // above allows - overrides the clear rather than racing it: the row
+        // in flight is still written this cycle, off the state these two
+        // assignments are about to replace.
+        if (mat_go) begin
+            mat_row <= mat_row + 4'b1;
+            if (mat_row == 4'hf) begin
+                mat_busy <= 1'b0;
+            end
+        end
 
         if (issue) begin
             PC <= PC_next;
@@ -867,6 +988,43 @@ always @(posedge clk or posedge reset) begin
                 8'h48, 8'h49, 8'h4a, 8'h4b, 8'h4c, 8'h4d, 8'h4e, 8'h4f,
                 8'h50, 8'h51, 8'h52, 8'h53, 8'h54, 8'h55, 8'h56, 8'h57,
                 8'h58, 8'h5a, 8'h5b: ;
+
+                // ------------------------------------------ 4.7 matrix unit
+                //
+                // Every one of the five is sixteen rows or one row of the
+                // accumulator file, and none of them is a scalar register
+                // write, so what happens here is only the latching of what
+                // the row walk needs.  `acc_rd` and `acc_wr` are single row
+                // moves and happen in the vector unit, where the file is.
+                //
+                // Arg0 names an accumulator *block* (section 4.2), of which
+                // there are two, so it is one bit of a four bit field.
+                8'h70, 8'h74: begin
+                    mat_busy <= 1'b1;
+                    mat_fill <= 1'b0;
+                    mat_zacc <= (opcode == 8'h74);
+                    mat_blk <= arg0[0];
+                    mat_row <= 4'b0;
+                    mat_areg <= arg1;
+                    mat_breg <= arg2;
+                    // Section 4.7: the accumulators of disabled lanes are not
+                    // updated, and the mask that decides is the one in force
+                    // when the instruction issued, not sixteen cycles later.
+                    mat_mask <= exec;
+                end
+                8'h71: begin
+                    mat_busy <= 1'b1;
+                    mat_fill <= 1'b1;
+                    mat_zacc <= 1'b0;
+                    mat_blk <= arg0[0];
+                    mat_row <= 4'b0;
+                    // Section 4.7 does not restate the exec rule for
+                    // `acc_zero`, so section 1.2's applies unchanged: a
+                    // disabled lane's registers are not written.  Every per
+                    // lane write in this machine obeys one rule.
+                    mat_mask <= exec;
+                end
+                8'h72, 8'h73: ;
 
                 // --------------------------------------- 4.8 global memory
                 //

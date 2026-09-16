@@ -11,10 +11,16 @@
 // SCOPE.  Section 4.6, plus the register file side of the per lane memory
 // accesses of sections 4.8 and 4.9 - the cross lane address read, the store
 // data read and the load return path, all of which are ports on this file
-// driven by the memory unit in `gpu16.v`.  The matrix unit (4.7) is
-// deliberately absent; its opcodes are not decoded here and still fall
-// through to `gpu16.v`'s `unknown opcode` arm, so nothing silently pretends
-// to implement it.
+// driven by the memory unit in `gpu16.v`.
+//
+// Section 4.7's accumulator file is here too, for the reason section 2.3
+// gives: `a[m]` in lane `n` is `C[m][n]`, so the accumulators are per lane
+// state and belong beside the per lane state that already exists.  What is
+// *not* here is the multiplier array, which section 7.3's arithmetic makes
+// one per compute unit rather than one per wave - it is `gpu16_matrix.v`,
+// instantiated once in `gpu16_cu.v` and arbitrated like the memory ports.
+// This file supplies it operands and takes back one accumulator row, and
+// `gpu16.v` holds the sixteen-cycle sequencer that walks the rows.
 //
 // THE REGISTER FILE is one flat array rather than sixteen separate ones:
 //
@@ -91,7 +97,35 @@ module gpu16_vector #(
     input mem_write,
     input [3:0] mem_reg,
     input [15:0] mem_mask,
-    input [511:0] mem_data
+    input [511:0] mem_data,
+
+    // ------------------------------------------------ the matrix unit's ports
+    //
+    // Section 4.7.  `gpu16.v` holds the sequencer - which row `m` of which
+    // block is being walked this cycle, and whether the array granted it a
+    // cycle - and these are the register file ports that sequencer drives.
+    //
+    // `mat_areg` names the A fragment VGPR and `mat_row` the lane to read it
+    // from, and the two together are one 16:1 multiplexer over a contiguous
+    // run of the file, exactly as `v_readlane` already is.  That is section
+    // 4.7's structural claim - "because the unit walks one m per cycle, this
+    // is a 16:1 multiplexer on a 32-bit value, not a crossbar" - and it is
+    // the reason `mat_a` is 32 bits wide and not 512.
+    input [3:0] mat_areg,
+    input [3:0] mat_breg,
+    input [3:0] mat_row,
+    // Which of the 32 accumulators, i.e. {block, row}.
+    input [4:0] mat_idx,
+    output [31:0] mat_a,
+    output [511:0] mat_b,
+    output [511:0] mat_acc,
+    // The row coming back, and the one cycle it is written in.  `mat_mask`
+    // is the exec mask latched when the instruction issued: section 4.7 says
+    // the A fragment rows of disabled lanes still participate but their
+    // accumulators are not updated.
+    input mat_write,
+    input [15:0] mat_mask,
+    input [511:0] mat_wdata
 );
 
 wire [7:0] opcode = inst[31:24];
@@ -102,6 +136,21 @@ wire [3:0] arg3 = inst[11:8];
 wire [7:0] mod = inst[7:0];
 
 reg [31:0] vregs[0:255];
+
+// Section 2.3's accumulator file: 32 registers per lane, `a[m]` in lane `n`
+// holding `C[m][n]`.  Accumulator major for the same reason the VGPRs are
+// register major - the sixteen lanes of one accumulator are the *row* the
+// matrix unit reads and writes whole, once per cycle, which is architectural
+// requirement A1.
+//
+//     accs[{idx, lane}]   =   a[idx] in lane `lane`
+//
+// It is a separate array and not a slice of `vregs` because section 2.3 says
+// so and gives the reason: this file needs one read and one write of a whole
+// 16-lane row every cycle while the VGPR file is simultaneously feeding the
+// same instruction its A and B fragments, and one file cannot do both
+// without more ports than either needs alone.
+reg [31:0] accs[0:511];
 
 // ------------------------------------------------------------ cross lane reads
 //
@@ -127,8 +176,18 @@ generate
                           : (opcode == 8'h5e) ? ($signed(xlane[g]) < 0)
                           : (opcode == 8'h5f) ? ($signed(xlane[g]) > 0)
                                               : 1'b0;
+        // The matrix unit's two per lane reads: lane n's B fragment, and
+        // lane n's word of the accumulator row being walked.
+        assign mat_b[32*g+:32] = vregs[{mat_breg, LANE}];
+        assign mat_acc[32*g+:32] = accs[{mat_idx, LANE}];
     end
 endgenerate
+
+// Section 4.7's cross lane A read, and the only place in the design where a
+// value leaves the lane it lives in other than `v_readlane` and `v_bpermute`.
+// One 32-bit word selected out of sixteen by the row counter: a 16:1
+// multiplexer, which is the structural claim the area numbers rest on.
+assign mat_a = vregs[{mat_areg, mat_row}];
 
 // Section 4.6: the mask a compare writes is `exec & lanes(condition)`.  A
 // disabled lane is therefore never reported as passing, whatever it holds.
@@ -157,6 +216,13 @@ always @(posedge clk or posedge reset) begin
         // against, which is the same call gpu16.v makes for the SGPRs.
         for (i = 0; i < 256; i = i + 1) begin
             vregs[i] <= 32'b0;
+        end
+        // The accumulators are launch state too, and section 4.12's "every
+        // other register is undefined" covers them; zero is the choice a
+        // test can be written against.  A kernel that means it still says
+        // `acc_zero` or `mma_i8_z`.
+        for (i = 0; i < 512; i = i + 1) begin
+            accs[i] <= 32'b0;
         end
     end
     else begin
@@ -218,6 +284,13 @@ always @(posedge clk or posedge reset) begin
                 // matter; the destination lane's does.
                 8'h5b: result = vregs[{arg1, src1[3:0]}];
 
+                // acc_rd (section 4.7): one accumulator into a VGPR, this
+                // lane's word of it.  `Mod` names one of the 32, so the
+                // 16-entry Arg fields are not involved.  No wait is needed
+                // before it, because gpu16.v does not issue it while the
+                // matrix unit is still walking - section 1.4's interlock.
+                8'h72: result = accs[{mod[4:0], l[3:0]}];
+
                 // v_readlane (0x59) and the four compares (0x5c-0x5f) write a
                 // scalar register, which is gpu16.v's file, not this one.
                 // Everything else - the matrix unit, the memory instructions,
@@ -239,6 +312,33 @@ always @(posedge clk or posedge reset) begin
             for (l = 0; l < WAVE_WIDTH; l = l + 1) begin
                 if (mem_mask[l[3:0]]) begin
                     vregs[{mem_reg, l[3:0]}] <= mem_data[32*l+:32];
+                end
+            end
+        end
+
+        // The accumulator file's one write port, section 2.3.  Two customers
+        // and never both in the same cycle: the matrix unit writing the row
+        // it walked this cycle, and `acc_wr` writing one row out of a VGPR.
+        // gpu16.v does not issue an accumulator instruction while the matrix
+        // unit is busy, so the `else` is a statement of that fact rather than
+        // a priority.
+        //
+        // Both honour exec, which for `mma_i8` is section 4.7's sharp edge
+        // written out: the A fragment row of a disabled lane still
+        // participates - it was read through the cross lane mux, which knows
+        // nothing about exec - but the accumulator of a disabled lane is not
+        // updated.
+        if (mat_write) begin
+            for (l = 0; l < WAVE_WIDTH; l = l + 1) begin
+                if (mat_mask[l[3:0]]) begin
+                    accs[{mat_idx, l[3:0]}] <= mat_wdata[32*l+:32];
+                end
+            end
+        end
+        else if (issue & (opcode == 8'h73)) begin
+            for (l = 0; l < WAVE_WIDTH; l = l + 1) begin
+                if (exec[l[3:0]]) begin
+                    accs[{mod[4:0], l[3:0]}] <= vregs[{arg1, l[3:0]}];
                 end
             end
         end

@@ -312,6 +312,54 @@ if(IVERILOG_EXECUTABLE AND VVP_EXECUTABLE)
     # waves other than this one, and are unfalsifiable with a single wave.
     add_gpu_test(gpu_wg tests/gpu_wg.s - gpu_wg.expect 1500 +waves=4)
 
+    # The matrix unit, sections 2.3 and 4.7 - the instruction the whole design
+    # exists for, and the one where a wrong answer looks like a right one.
+    # All of them share tests/gpu_mma.data32, and every expectation file is
+    # computed by tests/gen_mma_expect.py from section 4.7's own loop rather
+    # than captured from the simulator.
+    #
+    #   gpu_mma      acc_wr seeds a tile, two mma_i8 accumulate two K steps
+    #                onto it, acc_rd reads all sixteen rows back;
+    #   gpu_mma_z    acc_zero and mma_i8_z both erase a poisoned block, and
+    #                the machine subtracts the two results itself;
+    #   gpu_mma_sym  the symmetric control, which a transposed matrix unit
+    #                still passes - it is here to make the next line mean
+    #                something;
+    #   gpu_mma_map  the same program with an asymmetric product, which pins
+    #                the lane-to-row mapping and section 4.7's claim that the
+    #                A fragment is the operand that crosses lanes;
+    #   gpu_mma_exec section 4.7's sharp edge: disabled lanes keep their
+    #                accumulators but still supply their A row;
+    #   gpu_mma_perf the sixteen cycles, perf_mma_busy and the interlock,
+    #                none of which any computed value can see;
+    #   gpu_mma_wg   four waves queueing for one 64-MAC array, which is
+    #                section 7.3's 4 x 256 arithmetic.
+    add_gpu_test(gpu_mma tests/gpu_mma.s
+                 tests/gpu_mma.data32 gpu_mma.expect 400
+                 +vexpect=${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_mma.vexpect)
+
+    add_gpu_test(gpu_mma_z tests/gpu_mma_z.s
+                 tests/gpu_mma.data32 gpu_mma_z.expect 600
+                 +vexpect=${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_mma_z.vexpect)
+
+    add_gpu_test(gpu_mma_sym tests/gpu_mma_sym.s
+                 tests/gpu_mma.data32 gpu_mma_sym.expect 300
+                 +vexpect=${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_mma_sym.vexpect)
+
+    add_gpu_test(gpu_mma_map tests/gpu_mma_map.s
+                 tests/gpu_mma.data32 gpu_mma_map.expect 300
+                 +vexpect=${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_mma_map.vexpect)
+
+    add_gpu_test(gpu_mma_exec tests/gpu_mma_exec.s
+                 tests/gpu_mma.data32 gpu_mma_exec.expect 400
+                 +vexpect=${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_mma_exec.vexpect)
+
+    add_gpu_test(gpu_mma_perf tests/gpu_mma_perf.s
+                 tests/gpu_mma.data32 gpu_mma_perf.expect 400)
+
+    add_gpu_test(gpu_mma_wg tests/gpu_mma_wg.s
+                 tests/gpu_mma.data32 gpu_mma_wg.expect 2000 +waves=4)
+
     # What the five tests above cannot reach.  gpu16.v is the scalar unit, so
     # simulation covers about a third of the ISA; the vector ALU, the matrix
     # unit, LDS and the exec mask are pinned by their encodings instead, which
@@ -337,6 +385,25 @@ if(IVERILOG_EXECUTABLE AND VVP_EXECUTABLE)
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_reject.cases
     )
     set_tests_properties(gpu_reject PROPERTIES FAIL_REGULAR_EXPRESSION "TEST FAIL")
+
+    # ... and the same argument one level further back for the matrix unit's
+    # expectation files, which are generated rather than written.  An
+    # expectation is only worth what its provenance is worth, so this re-runs
+    # the generator and fails if a checked-in file has drifted from what the
+    # ISA document says - which is what pasting in a simulator's output to
+    # make a test pass would look like.
+    find_package(Python3 COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(
+            NAME gpu_mma_expect
+            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_gen_check.sh
+                    ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        )
+        set_tests_properties(gpu_mma_expect PROPERTIES FAIL_REGULAR_EXPRESSION "TEST FAIL")
+    else()
+        message(WARNING "python3 not found, the matrix expectation check is disabled")
+    endif()
 
     # The compiler's tests go one step further than the assembler's: they
     # compile the program down both output paths, diff the machine words, and
