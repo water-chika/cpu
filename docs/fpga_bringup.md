@@ -679,3 +679,245 @@ Now the honest part.
   speedup ratio in 7.3 is against a machine no one has built. Running the
   real `cpu16.v` on the board measures the real cpu16, which is a different
   and much smaller claim.
+
+## 5. Troubleshooting
+
+First bring-up failures, in roughly the order they tend to appear. Each entry
+says what it looks like, what to do, and - the point of the section - **what
+would have caught it at the desk**, because most of these should never reach
+a bench.
+
+### 5.1 Implementation finishes suspiciously fast, utilisation is near zero
+
+**Symptom.** Synthesis reports a few hundred LUTs for a design that should
+cost thousands; the timing report closes trivially; on the device nothing
+happens.
+
+**Cause.** Section 2.2(a): the program memory is never written and never
+initialised, so `Inst` is a constant and the tool trimmed the decoder, the
+ALU and the register file behind it.
+
+**Fix.** The program memory write port. It is not optional.
+
+*Caught by:* a **synthesis run at the desk**, reading the utilisation report
+before making a bitstream. Not caught by any simulation, because
+`testgpu.v`'s hierarchical `$readmemh` fills an array that hardware has no
+way to fill. This is the single most likely way to waste a first board
+session.
+
+### 5.2 `DONE` never asserts / the device does not configure
+
+**Symptom.** The hardware manager programs the device and reports failure, or
+`DONE` stays low.
+
+**Causes, in order of likelihood.** Wrong part selected (4.1 exists to
+prevent this); a bitstream built for a different speed grade or package; the
+configuration mode pins set for flash rather than JTAG; an unconstrained or
+wrongly-constrained clock input pin; power.
+
+*Caught by:* nothing in simulation - this is section 3.3, genuinely
+hardware-only. Mitigate by making the *first* bitstream `cpu8.v` (section
+4.3): if `cpu8` configures and runs, configuration is not the problem.
+
+### 5.3 The wave halts immediately, in zero or one cycle
+
+**Symptom.** `halted` is high the moment reset releases; the cycle counter
+reads 0 or 1; registers read as their reset values.
+
+**Causes.** The program memory did not load (check by reading it back through
+the same window - the loader should always verify its writes); the loader
+wrote the wrong wave's copy, or only one of four; the instruction word
+endianness or nibble order differs between the hex file and what the write
+port assembles; reset is stuck asserted, or released with the wrong polarity.
+
+*Caught by:* section 2.3's bus-driven testbench, which loads and reads back
+the program through the same address map. A read-after-write check on the
+loader is worth writing once and running always.
+
+### 5.4 The wave never halts
+
+**Symptom.** `halted` stays low until the host timeout.
+
+**Causes.** A wave waiting on a grant that never arrives (the arbiter, the
+LDS or the global port); `s_barrier` waiting for waves that were never
+launched - check that `waves` matches the program's expectation, which is
+exactly the `+waves` plusarg `testgpu.v` defaults to 1; a branch to an
+address outside a shrunken program memory after L1, which wraps and executes
+garbage.
+
+**What to do.** This is what the ILA is for: capture `PC`, `Inst`, `bubble`,
+`exec`, the request/grant signals and `halted`, triggered on a long stall.
+A wave stuck on a grant and a wave looping over three instructions look
+completely different and are distinguished in one capture.
+
+*Caught by:* the equivalent simulation, in most cases - `testgpu.v` already
+fails a program that does not reach `s_endpgm` within `+cycles`. The
+hardware-only version of this failure is the one caused by L1's smaller
+program memory, which is why every cut-down must be re-validated in
+simulation with the same parameters (section 4.3's rule).
+
+### 5.5 Every test passes, then the second one fails
+
+**Symptom.** Run the suite and the first test passes; run it again and it
+fails, or later tests fail in an order-dependent way.
+
+**Cause.** State that reset does not clear. `gpu16_vector.v:212` resets
+`vregs` and `accs`, and the scalar registers are reset too - but **memory
+arrays are deliberately not reset** (`memory.v:6-9`), so the LDS and the
+global memory keep whatever the previous test left in them. In simulation
+this can never happen: every test is a fresh `vvp` process with a fresh,
+`$readmemh`-filled memory.
+
+**Fix.** The host runner must clear global memory and the LDS between tests,
+which means the debug wrapper needs write access to both - the LDS has no
+external write port today, so either it gains one or a small clearing kernel
+is run before each test.
+
+*Caught by:* **nothing in the current simulation setup, structurally.** This
+is the most interesting hardware-only failure mode in the list, and it can be
+caught at the desk only by deliberately writing a simulation that runs two
+programs back to back in one process.
+
+### 5.6 Tests pass at a slow clock and fail at a fast one
+
+**Symptom.** Green at 12.5 MHz, wrong answers or hangs at 50 MHz.
+
+**Cause.** Timing not met. Vivado will happily produce a bitstream with
+negative slack; the failure is silent and looks like a logic bug.
+
+**What to do.** Read `report_timing_summary` *before* believing any hardware
+result. Never run a bitstream whose WNS is negative. Then follow section
+3.1: find the limiting path, and check it against the candidate list - if it
+is the fetch path, take L1; if it is the matrix unit, a pipeline register
+there is an ISA-visible change, not a tuning knob.
+
+*Caught by:* static timing analysis at the desk. There is no excuse for
+discovering this on a board.
+
+### 5.7 Results are intermittent - same program, different answers
+
+**Symptom.** Non-deterministic failures, sometimes off by one cycle.
+
+**Causes.** Reset released asynchronously, so different flops start in
+different cycles (section 4.4); a genuine marginal timing path, which is
+temperature- and voltage-dependent and therefore intermittent; the register
+readback window being sampled while the design is still running - the runner
+must poll `halted` before reading, and the wrapper should ideally refuse to
+report registers while `running` is high.
+
+*Caught by:* the `halted`-before-read discipline can be modelled in the 2.3
+testbench. The reset-release race cannot: an event simulator has no
+metastability and no clock skew, which is why 4.4's synchroniser has to be
+designed in rather than debugged in.
+
+### 5.8 Hardware disagrees with simulation, deterministically
+
+**Symptom.** A test passes under `iverilog` and fails on the device the same
+way every time.
+
+**Causes, in order.** X-optimism: simulation resolved an uninitialised or
+don't-care value in a way hardware did not - the `.expect` files' `xxxxxxxx`
+entries are exactly the places this can hide, and the `+data` tests are
+exactly the programs that depend on an array simulation filled and hardware
+did not. Then: an inferred latch in one of the nine `always @*` blocks, which
+`iverilog -Wall` does not flag. Then: a trimmed or restructured array.
+
+**What to do.** Bisect with section 4.6's ordered test list, then read the
+synthesis warnings for that module. A post-synthesis functional simulation of
+the failing test, run at the desk, distinguishes "synthesis changed the
+design" from "the board is wrong" without touching the board again.
+
+### 5.9 Cycle counts differ between hardware and simulation
+
+Treat as a bug, never as a measurement - section 3.4. The design is fully
+deterministic and has no external inputs, so the counts must match exactly.
+The usual cause is the debug wrapper: a stall inserted by the readback logic,
+a reset that releases a cycle early or late, or a cycle counter that counts
+from the wrong edge.
+
+*Caught by:* section 2.3's bus-driven testbench, if it also compares cycle
+counts against the plain `testgpu.v` run. It should.
+
+### 5.10 The JTAG connection itself misbehaves
+
+**Symptom.** Transactions time out, the chain scan finds a varying number of
+devices, the cable disappears mid-run.
+
+**Causes.** TCK too fast for the board's routing or for a long/unshielded
+cable; a hub or USB power issue; `hw_server` left running from a previous
+session and holding the target; another tool (`openFPGALoader`, `xsdb`) still
+attached.
+
+**What to do.** Lower the TCK frequency first - it is one property and it
+costs only speed. Record what it had to be lowered to, per 4.1.
+
+*Caught by:* nothing. Section 3.3.
+
+## 6. Verified locally vs untested until hardware exists
+
+The distinction this whole document turns on.
+
+### Verified locally, today
+
+* All **68 CTest tests pass** on this checkout, including 23 gpu16 RTL
+  simulations, 8 CPU RTL simulations, 9 RTL-vs-C++ cross-checks and a
+  fuzzer.
+* Every `.v` file compiles standalone under `iverilog -Wall` with **zero
+  messages** (`tests/lint_verilog.sh`, CTest #17).
+* The RTL has **real resets and no `initial` blocks**; the only unreset state
+  is memory arrays, deliberately.
+* gpu16's **functional behaviour** - scalar unit, exec mask, divergence,
+  lanes, LDS banking, global coalescing, the matrix unit and the four-wave
+  workgroup - against checked-in expectations.
+* The **perf counters exist and are asserted** by `gpu_mma_perf`.
+
+### Asserted here by reading the RTL, and not yet confirmed by any tool
+
+Everything in section 2.2 and section 4.2 falls here. In particular:
+
+* that the program memory would be **optimised away** (2.2a);
+* that **no array in the design can infer as BRAM** (2.2b), which contradicts
+  `gpu_isa.md` 7.5's "8 BRAM18";
+* that `vregs`/`accs` **may become flip-flops** (2.2c);
+* every LUT, FF and DSP number in the 4.2 table;
+* the critical-path candidates in 3.1.
+
+These are falsifiable at the desk, by installing Vivado and running
+synthesis. **That is the next action this document recommends**, ahead of
+acquiring or connecting anything.
+
+### Untested until hardware exists
+
+* **Fmax** - no frequency claim in this repo is currently justified.
+* **Fit** on a real part, and therefore whether any cut-down in 4.3 is
+  needed.
+* **Configuration, JTAG behaviour, cable throughput** (3.3).
+* **Reset release and metastability** (4.4, 5.7).
+* **Cross-test state persistence** (5.5) - hardware-only by construction.
+* **Wall-clock performance**, the only genuinely new number a board produces.
+
+### Untestable on this hardware, at any point, without new RTL
+
+* All six **section 7 benchmark kernels**, because global memory is 4 KiB
+  on-chip with no external memory interface (4.7).
+* Everything **sky130** - section 7.5's area budget and 7.6's cost and power.
+* The **cpu16w baseline** that section 7's speedups are measured against; it
+  is a fiction with 32-bit registers that `cpu16.v` does not have.
+
+### The order of work this implies
+
+1. Install Vivado; synthesise `gpu16_cu` as-is; read the utilisation and
+   timing reports. Confirm or refute section 2.2. *(No board.)*
+2. Write the program-memory write port and the debug wrapper; write the
+   bus-driven testbench; get the 23 gpu tests green through it, in
+   simulation. *(No board.)*
+3. Take L1 unconditionally; re-run all 68 tests. *(No board.)*
+4. Identify the device (4.1). *(Board, no bitstream.)*
+5. Build and run `cpu8.v`, then a single `gpu16` wave, then the full
+   `gpu16_cu`, at a deliberately slow clock. *(Board.)*
+6. Run the ordered hardware test set (4.6), comparing cycle counts and perf
+   counters against simulation.
+7. Raise the clock until timing stops closing; report Fmax and the limiting
+   path.
+8. Only then consider what a global memory worth the name would take, which
+   is the work that makes section 7 measurable at all.
