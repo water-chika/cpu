@@ -1,0 +1,69 @@
+# Programs asm_16_16_16_16 has to refuse, and why.  Tab separated: source,
+# then a substring the diagnostic must contain.
+#
+# An assembler that accepts nonsense is worse than one that is missing,
+# because its output is not something anyone reads back.  These are the
+# rules docs/cpu_16_16_16_16.md states that no hardware enforces: the
+# hardware simply takes the low bits of whatever field it is given.
+
+# Section 2: the register fields are four bits, so there are sixteen.
+add r16, r1	register 'r16' does not exist
+mov r1, r16	register 'r16' does not exist
+jmpr r99	register 'r99' does not exist
+
+# Section 9: a register slot takes a register and an immediate slot takes a
+# number.  Neither is quietly reinterpreted as the other.
+add r1, 5	not the kind of operand that goes there
+movi r1, r2	not the kind of operand that goes there
+ld r1, 4, 0	not the kind of operand that goes there
+
+# Section 3.2: the immediate field is eight bits, written either way round.
+movi r1, 256	does not fit this instruction's eight bit immediate
+movi r1, -129	does not fit this instruction's eight bit immediate
+andi r1, 0x1ff	does not fit this instruction's eight bit immediate
+
+# ... and addi and cmpi sign extend theirs, so 128 to 255 would be a lie:
+# the hardware would read them as -128 to -1.
+addi r1, 128	does not fit this instruction's eight bit immediate
+cmpi r1, 200	does not fit this instruction's eight bit immediate
+
+# Section 3.1 and 3.3: the shift amount and the load displacement share the
+# four bit rs field.
+shli r1, 16	out of range
+rori r1, 99	out of range
+ld r1, r2, 16	out of range
+st r1, r2, 20	out of range
+
+# Section 7: there are three system registers, and 3 to 15 read as nothing
+# in particular, so they are refused rather than assembled into a load of
+# whatever the hardware leaves on the bus.
+rd_sys r1, 3	out of range
+rd_sys r1, 15	out of range
+
+# The operand count is per instruction, from zero to three.
+add r1	takes 2 operand(s)
+add r1, r2, r3	takes 2 operand(s)
+not r1	takes 2 operand(s)
+halt r1	takes 0 operand(s)
+ret r15	takes 0 operand(s)
+ld r1, r2	takes 3 operand(s)
+jmpr	takes 1 operand(s)
+beq a, b	takes 1 operand(s)
+
+# Section 6: a branch and a jump take a label, never a bare displacement.
+# A word offset nobody can count is not a thing this assembler accepts.
+beq 4	unknown label '4'
+jmp 0	unknown label '0'
+call -1	unknown label '-1'
+br nowhere	unknown label 'nowhere'
+
+# Section 8: "la" needs a destination register and a label.
+la r1	expected 'la <dst> <label>'
+la 4, start	'la' destination '4' is not a register
+la r1, start	unknown label 'start'
+
+# And an opcode that does not exist is not silently a nop.
+frob r1, r2	unknown opcode 'frob'
+subi r1, 4	unknown opcode 'subi'
+xori r1, 4	unknown opcode 'xori'
+push r1	unknown opcode 'push'

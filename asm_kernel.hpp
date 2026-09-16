@@ -329,6 +329,9 @@ ASM_HD inline uint8_t asm_parse_fixed(const char* s, const asm_span* t, uint32_t
 // The 8 bit ISA.  Instruction word: opcode in the top 5 bits, one 3 bit
 // operand below it.
 struct asm_cpu8 {
+    static constexpr const char* reg_range_text = "this machine has sixteen of each file";
+    static constexpr const char* imm_range_text = "does not fit in 16 bits";
+    static constexpr const char* branch_range_text = "is too far away to encode in 16 bits";
     static constexpr const char* tool = "asm";
     static constexpr uint32_t word_bytes = 1;
     // Which ISA this is, for the backends that dispatch at run time
@@ -453,6 +456,9 @@ struct asm_cpu8 {
 // The 16 bit ISA.  Instruction word: opcode in the top 7 bits, three 3 bit
 // operands below it.
 struct asm_cpu16 {
+    static constexpr const char* reg_range_text = "this machine has sixteen of each file";
+    static constexpr const char* imm_range_text = "does not fit in 16 bits";
+    static constexpr const char* branch_range_text = "is too far away to encode in 16 bits";
     static constexpr const char* tool = "asm16";
     static constexpr uint32_t word_bytes = 2;
     // Which ISA this is, for the backends that dispatch at run time
@@ -797,6 +803,9 @@ ASM_HD inline bool gpu16_reg(const char* s, uint32_t n, char prefix, int32_t* ou
 }
 
 struct asm_gpu16 {
+    static constexpr const char* reg_range_text = "this machine has sixteen of each file";
+    static constexpr const char* imm_range_text = "does not fit in 16 bits";
+    static constexpr const char* branch_range_text = "is too far away to encode in 16 bits";
     static constexpr const char* tool = "asm_gpu16";
     static constexpr uint32_t word_bytes = 4;
     // Which ISA this is, for the backends that dispatch at run time
@@ -1116,6 +1125,364 @@ struct asm_gpu16 {
             word |= (a2 << 12) | (a3 << 8) | mod;
         }
         words[0] = word;
+        return 1;
+    }
+};
+
+// ---------------------------------------------------------------- cpu_16_16_16_16
+
+// The ISA of docs/cpu_16_16_16_16.md: a 16 bit word over a 16 bit data path,
+// sixteen registers and a 16 bit PC.  Sixteen bits cannot name three of
+// sixteen registers and an opcode, so the instruction is two address and the
+// word is split six different ways depending on Inst[15:12], the class:
+//
+//   |f e d c|b a 9 8|7 6 5 4|3 2 1 0|
+// R |0 0 op6        |  rs   |  rd   |   classes 0x0-0x3, opcode = Inst[15:8]
+// I |class  |    imm8       |  rd   |   classes 0x4-0x7, 0xa, 0xb
+// M |class  |  rd   |  rs   | off4  |   classes 0x8, 0x9
+// B |1 1 0 0| cond  |    disp8      |   class 0xc
+// J |1 1 0 1|      disp12           |   class 0xd  (jmp)
+// J |1 1 1 0|      disp12           |   class 0xe  (call)
+//
+// Like gpu16 and unlike cpu8 and cpu16, the operands are typed and their
+// number is per instruction, so this description brings its own parse rather
+// than using asm_parse_fixed.
+//
+// The internal opcode number an asm_line carries is *not* always the encoded
+// one, because the encoded one is not unique across formats: an R
+// instruction is identified by its 0x00-0x22 opcode byte, everything else by
+// 0x80 | class, and a branch by 0xc0 | cond.  encode() puts each back where
+// the hardware reads it.
+
+enum : uint8_t {
+    CPU1616_K_RD = 1,    // destination register, in the Arg0 slot
+    CPU1616_K_RS,        // source register, in the Arg1 slot
+    CPU1616_K_IMM8,      // -128..255, both spellings of eight bits
+    CPU1616_K_IMM8S,     // -128..127: sign extended, so 128..255 would lie
+    CPU1616_K_OFF4,      // 0..15, a displacement in halfwords
+    CPU1616_K_SHIFT,     // 0..15, a shift amount, encoded in the rs field
+    CPU1616_K_SYS,       // 0..2, a system register, encoded in the rs field
+    CPU1616_K_LAB8,      // a label, reached by a signed 8 bit word offset
+    CPU1616_K_LAB12,     // a label, reached by a signed 12 bit word offset
+};
+
+// An operand is (kind, field), where the field indexes asm_line::arg.
+enum : uint8_t {
+    CPU1616_RD  = (CPU1616_K_RD    << 4) | 0,
+    CPU1616_RS  = (CPU1616_K_RS    << 4) | 1,
+    CPU1616_IM  = (CPU1616_K_IMM8  << 4) | 2,
+    CPU1616_IS  = (CPU1616_K_IMM8S << 4) | 2,
+    CPU1616_OF  = (CPU1616_K_OFF4  << 4) | 2,
+    CPU1616_SH  = (CPU1616_K_SHIFT << 4) | 1,
+    CPU1616_SY  = (CPU1616_K_SYS   << 4) | 1,
+    CPU1616_L8  = (CPU1616_K_LAB8  << 4) | 3,
+    CPU1616_L12 = (CPU1616_K_LAB12 << 4) | 3,
+};
+
+struct cpu1616_sig {
+    uint8_t count;
+    uint8_t slot[3];
+};
+
+// The operand list of every instruction, from docs/cpu_16_16_16_16.md
+// section 9's table of shapes.
+ASM_HD inline cpu1616_sig cpu1616_signature(uint8_t op) {
+    switch (op) {
+    // R format, two registers: rd is read as well as written.
+    case 0x00: case 0x01: case 0x02: case 0x03: case 0x04: case 0x05:
+    case 0x06: case 0x07: case 0x08: case 0x09: case 0x0a: case 0x0b:
+    case 0x0c: case 0x0d: case 0x0e: case 0x0f: case 0x10: case 0x11:
+    case 0x12: case 0x18: case 0x19: case 0x1a: case 0x1b: case 0x1c:
+        return cpu1616_sig{2, {CPU1616_RD, CPU1616_RS, 0}};
+    // shli/shri/sari/roli/rori: the rs field is a shift amount.
+    case 0x13: case 0x14: case 0x15: case 0x16: case 0x17:
+        return cpu1616_sig{2, {CPU1616_RD, CPU1616_SH, 0}};
+    // jmpr/callr name one register and leave rd zero.
+    case 0x1d: case 0x1e:
+        return cpu1616_sig{1, {CPU1616_RS, 0, 0}};
+    // rd_sys: the rs field is a system register number.
+    case 0x1f:
+        return cpu1616_sig{2, {CPU1616_RD, CPU1616_SY, 0}};
+    // halt, nop, ret.
+    case 0x20: case 0x21: case 0x22:
+        return cpu1616_sig{0, {0, 0, 0}};
+    // movi, movih, andi, ori.
+    case 0x84: case 0x85: case 0x8a: case 0x8b:
+        return cpu1616_sig{2, {CPU1616_RD, CPU1616_IM, 0}};
+    // addi, cmpi, whose immediate is sign extended.
+    case 0x86: case 0x87:
+        return cpu1616_sig{2, {CPU1616_RD, CPU1616_IS, 0}};
+    // ld, st.
+    case 0x88: case 0x89:
+        return cpu1616_sig{3, {CPU1616_RD, CPU1616_RS, CPU1616_OF}};
+    // jmp, call.
+    case 0x8d: case 0x8e:
+        return cpu1616_sig{1, {CPU1616_L12, 0, 0}};
+    // and 0xc0..0xce, the fifteen branches.
+    default:
+        return cpu1616_sig{1, {CPU1616_L8, 0, 0}};
+    }
+}
+
+// jmp and call reach further than a conditional branch does.
+ASM_HD inline bool cpu1616_is_long_jump(uint8_t op) {
+    return op == 0x8d || op == 0x8e;
+}
+
+struct asm_cpu_16_16_16_16 {
+    static constexpr const char* tool = "asm_16_16_16_16";
+    static constexpr uint32_t word_bytes = 2;
+    // Which ISA this is, for the backends that dispatch at run time rather
+    // than at compile time.  The other three tags are named after the
+    // instruction word - 8, 16 and 32 - and this ISA's word is also sixteen
+    // bits, so it is spelled with the first two numbers of its name instead.
+    static constexpr int isa_tag = 1616;
+    static constexpr uint32_t la_words = 2;      // movi then movih
+    static constexpr uint32_t insn_tokens = 0;   // per instruction, see parse()
+    static constexpr uint32_t nargs = ASM_MAX_ARGS;
+    static constexpr bool has_scratch = false;
+    static constexpr bool comma_separated = true;
+    static constexpr bool typed_operands = true;
+    // A 16 bit byte addressed PC over instruction words, so 32768 of them.
+    static constexpr uint32_t address_limit = 32767;
+
+    static constexpr const char* reg_range_text = "this machine has sixteen registers";
+    static constexpr const char* imm_range_text =
+        "does not fit this instruction's eight bit immediate";
+    static constexpr const char* branch_range_text = "is too far away for this branch";
+
+    ASM_HD static bool opcode(const char* s, uint32_t n, uint8_t* out) {
+        switch (n) {
+        case 2:
+            if (asm_tok_is(s, n, "or"))     { *out = 0x01; return true; }
+            if (asm_tok_is(s, n, "ld"))     { *out = 0x88; return true; }
+            if (asm_tok_is(s, n, "st"))     { *out = 0x89; return true; }
+            if (asm_tok_is(s, n, "br"))     { *out = 0xce; return true; }
+            break;
+        case 3:
+            if (asm_tok_is(s, n, "and"))    { *out = 0x00; return true; }
+            if (asm_tok_is(s, n, "not"))    { *out = 0x02; return true; }
+            if (asm_tok_is(s, n, "xor"))    { *out = 0x03; return true; }
+            if (asm_tok_is(s, n, "add"))    { *out = 0x04; return true; }
+            if (asm_tok_is(s, n, "adc"))    { *out = 0x05; return true; }
+            if (asm_tok_is(s, n, "sub"))    { *out = 0x06; return true; }
+            if (asm_tok_is(s, n, "sbb"))    { *out = 0x07; return true; }
+            if (asm_tok_is(s, n, "neg"))    { *out = 0x08; return true; }
+            if (asm_tok_is(s, n, "mul"))    { *out = 0x09; return true; }
+            if (asm_tok_is(s, n, "div"))    { *out = 0x0a; return true; }
+            if (asm_tok_is(s, n, "mov"))    { *out = 0x0b; return true; }
+            if (asm_tok_is(s, n, "cmp"))    { *out = 0x0c; return true; }
+            if (asm_tok_is(s, n, "tst"))    { *out = 0x0d; return true; }
+            if (asm_tok_is(s, n, "shl"))    { *out = 0x0e; return true; }
+            if (asm_tok_is(s, n, "shr"))    { *out = 0x0f; return true; }
+            if (asm_tok_is(s, n, "sar"))    { *out = 0x10; return true; }
+            if (asm_tok_is(s, n, "rol"))    { *out = 0x11; return true; }
+            if (asm_tok_is(s, n, "ror"))    { *out = 0x12; return true; }
+            if (asm_tok_is(s, n, "ldb"))    { *out = 0x18; return true; }
+            if (asm_tok_is(s, n, "stb"))    { *out = 0x19; return true; }
+            if (asm_tok_is(s, n, "sxb"))    { *out = 0x1a; return true; }
+            if (asm_tok_is(s, n, "min"))    { *out = 0x1b; return true; }
+            if (asm_tok_is(s, n, "max"))    { *out = 0x1c; return true; }
+            if (asm_tok_is(s, n, "nop"))    { *out = 0x21; return true; }
+            if (asm_tok_is(s, n, "ret"))    { *out = 0x22; return true; }
+            if (asm_tok_is(s, n, "ori"))    { *out = 0x8b; return true; }
+            if (asm_tok_is(s, n, "jmp"))    { *out = 0x8d; return true; }
+            if (asm_tok_is(s, n, "beq"))    { *out = 0xc0; return true; }
+            if (asm_tok_is(s, n, "bne"))    { *out = 0xc1; return true; }
+            if (asm_tok_is(s, n, "blo"))    { *out = 0xc2; return true; }
+            if (asm_tok_is(s, n, "bhs"))    { *out = 0xc3; return true; }
+            if (asm_tok_is(s, n, "bmi"))    { *out = 0xc4; return true; }
+            if (asm_tok_is(s, n, "bpl"))    { *out = 0xc5; return true; }
+            if (asm_tok_is(s, n, "bvs"))    { *out = 0xc6; return true; }
+            if (asm_tok_is(s, n, "bvc"))    { *out = 0xc7; return true; }
+            if (asm_tok_is(s, n, "bhi"))    { *out = 0xc8; return true; }
+            if (asm_tok_is(s, n, "bls"))    { *out = 0xc9; return true; }
+            if (asm_tok_is(s, n, "bge"))    { *out = 0xca; return true; }
+            if (asm_tok_is(s, n, "blt"))    { *out = 0xcb; return true; }
+            if (asm_tok_is(s, n, "bgt"))    { *out = 0xcc; return true; }
+            if (asm_tok_is(s, n, "ble"))    { *out = 0xcd; return true; }
+            break;
+        case 4:
+            if (asm_tok_is(s, n, "shli"))   { *out = 0x13; return true; }
+            if (asm_tok_is(s, n, "shri"))   { *out = 0x14; return true; }
+            if (asm_tok_is(s, n, "sari"))   { *out = 0x15; return true; }
+            if (asm_tok_is(s, n, "roli"))   { *out = 0x16; return true; }
+            if (asm_tok_is(s, n, "rori"))   { *out = 0x17; return true; }
+            if (asm_tok_is(s, n, "jmpr"))   { *out = 0x1d; return true; }
+            if (asm_tok_is(s, n, "halt"))   { *out = 0x20; return true; }
+            if (asm_tok_is(s, n, "movi"))   { *out = 0x84; return true; }
+            if (asm_tok_is(s, n, "addi"))   { *out = 0x86; return true; }
+            if (asm_tok_is(s, n, "cmpi"))   { *out = 0x87; return true; }
+            if (asm_tok_is(s, n, "andi"))   { *out = 0x8a; return true; }
+            if (asm_tok_is(s, n, "call"))   { *out = 0x8e; return true; }
+            break;
+        case 5:
+            if (asm_tok_is(s, n, "callr"))  { *out = 0x1e; return true; }
+            if (asm_tok_is(s, n, "movih"))  { *out = 0x85; return true; }
+            break;
+        case 6:
+            if (asm_tok_is(s, n, "rd_sys")) { *out = 0x1f; return true; }
+            break;
+        default:
+            break;
+        }
+        return false;
+    }
+
+    // "la rd, label" is movi then movih carrying the label's *byte* address,
+    // which reaches the whole 64 KiB - against cpu16's three word expansion
+    // and cpu8's ten word one.
+    ASM_HD static bool la_dst(const char* s, uint32_t n, int32_t* out) {
+        return gpu16_reg(s, n, 'r', out) && *out < 16;
+    }
+
+    ASM_HD static bool is_scratch_setter(uint8_t) { return false; }
+
+    ASM_HD static uint8_t operand(const char* s, uint32_t line_off, asm_span tok,
+                                  uint8_t slot, asm_line* up, int32_t* value) {
+        const char* p = s + tok.off;
+        uint32_t n = tok.len;
+        uint8_t kind = static_cast<uint8_t>(slot >> 4);
+        int32_t v = 0;
+        switch (kind) {
+        case CPU1616_K_RD:
+        case CPU1616_K_RS:
+            if (!gpu16_reg(p, n, 'r', &v)) {
+                return ASM_ERR_ARG_KIND;
+            }
+            if (v > 15) {
+                return ASM_ERR_REG_RANGE;
+            }
+            break;
+        case CPU1616_K_IMM8:
+            if (!asm_parse_number(p, n, &v)) {
+                return ASM_ERR_ARG_KIND;
+            }
+            // Signed or unsigned, both spellings of the same eight bits.
+            if (v < -128 || v > 255) {
+                return ASM_ERR_IMM_RANGE;
+            }
+            break;
+        case CPU1616_K_IMM8S:
+            if (!asm_parse_number(p, n, &v)) {
+                return ASM_ERR_ARG_KIND;
+            }
+            // This one really is signed: the hardware sign extends it, so
+            // 200 would quietly mean -56 and is refused instead.
+            if (v < -128 || v > 127) {
+                return ASM_ERR_IMM_RANGE;
+            }
+            break;
+        case CPU1616_K_OFF4:
+        case CPU1616_K_SHIFT:
+            if (!asm_parse_number(p, n, &v)) {
+                return ASM_ERR_ARG_KIND;
+            }
+            if (v < 0 || v > 15) {
+                return ASM_ERR_MOD_RANGE;
+            }
+            break;
+        case CPU1616_K_SYS:
+            if (!asm_parse_number(p, n, &v)) {
+                return ASM_ERR_ARG_KIND;
+            }
+            // Section 7: three system registers, and 3-15 read as nothing in
+            // particular, so they are refused rather than assembled into a
+            // load of whatever the hardware leaves on the bus.
+            if (v < 0 || v > 2) {
+                return ASM_ERR_MOD_RANGE;
+            }
+            break;
+        default:
+            // A branch target is a label and only a label.  A bare number
+            // there would be a word displacement nobody can read back.
+            up->label_use = ASM_LABEL_IMM;
+            up->name.off = line_off + tok.off;
+            up->name.len = tok.len;
+            v = 0;
+            break;
+        }
+        *value = v;
+        return ASM_OK;
+    }
+
+    ASM_HD static uint8_t parse(const char* s, uint32_t line_off, const asm_span* t,
+                                uint32_t ntokens, asm_line* out) {
+        if (!opcode(s + t[0].off, t[0].len, &out->opcode)) {
+            return ASM_ERR_OPCODE;
+        }
+        cpu1616_sig sig = cpu1616_signature(out->opcode);
+        if (ntokens != sig.count + 1u) {
+            out->arg[1] = static_cast<int32_t>(sig.count);
+            return ASM_ERR_OPERANDS;
+        }
+        int32_t field[ASM_MAX_ARGS] = {0, 0, 0, 0, 0};
+        for (uint32_t i = 0; i < sig.count; i++) {
+            int32_t value = 0;
+            uint8_t code = operand(s, line_off, t[1 + i], sig.slot[i], out, &value);
+            if (code != ASM_OK) {
+                out->label_use = ASM_LABEL_NONE;
+                out->arg[0] = static_cast<int32_t>(i);
+                out->arg[1] = static_cast<int32_t>(sig.count);
+                return code;
+            }
+            field[sig.slot[i] & 0xf] = value;
+        }
+        for (uint32_t i = 0; i < ASM_MAX_ARGS; i++) {
+            out->arg[i] = field[i];
+        }
+        return ASM_OK;
+    }
+
+    // A branch displacement is counted in instruction words from the
+    // following instruction, and has to fit the 8 or 12 bits the format
+    // leaves for it.  "la" cannot fail: every word address in a program the
+    // scan already accepted doubles into sixteen bits.
+    ASM_HD static uint8_t check_resolved(const asm_line& l, uint32_t address, int32_t target) {
+        if (l.label_use != ASM_LABEL_IMM) {
+            return ASM_OK;
+        }
+        int32_t disp = target - static_cast<int32_t>(address + 1);
+        int32_t limit = cpu1616_is_long_jump(l.opcode) ? 2048 : 128;
+        if (disp < -limit || disp > limit - 1) {
+            return ASM_ERR_BRANCH_RANGE;
+        }
+        return ASM_OK;
+    }
+
+    ASM_HD static uint32_t encode(const asm_statement& s, uint32_t* words) {
+        uint32_t rd = static_cast<uint32_t>(s.arg[0]) & 0xf;
+        uint32_t rs = static_cast<uint32_t>(s.arg[1]) & 0xf;
+        uint32_t imm = static_cast<uint32_t>(s.arg[2]) & 0xff;
+        uint32_t off = static_cast<uint32_t>(s.arg[2]) & 0xf;
+        uint8_t op = s.opcode;
+
+        if (s.label_use == ASM_LABEL_LA) {
+            uint32_t byte_address = static_cast<uint32_t>(s.target) * 2u;
+            words[0] = (4u << 12) | ((byte_address & 0xffu) << 4) | rd;
+            words[1] = (5u << 12) | (((byte_address >> 8) & 0xffu) << 4) | rd;
+            return 2;
+        }
+        if (op < 0x80) {
+            words[0] = (static_cast<uint32_t>(op) << 8) | (rs << 4) | rd;
+            return 1;
+        }
+        int32_t disp = s.target - static_cast<int32_t>(s.address + 1);
+        if (op >= 0xc0) {
+            words[0] = 0xc000u | ((static_cast<uint32_t>(op) & 0xfu) << 8) |
+                       (static_cast<uint32_t>(disp) & 0xffu);
+            return 1;
+        }
+        uint32_t cls = static_cast<uint32_t>(op) & 0xfu;
+        if (cls == 8 || cls == 9) {
+            words[0] = (cls << 12) | (rd << 8) | (rs << 4) | off;
+        }
+        else if (cls == 0xd || cls == 0xe) {
+            words[0] = (cls << 12) | (static_cast<uint32_t>(disp) & 0xfffu);
+        }
+        else {
+            words[0] = (cls << 12) | (imm << 4) | rd;
+        }
         return 1;
     }
 };

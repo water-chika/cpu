@@ -59,6 +59,9 @@ target_link_libraries(asm16 PRIVATE asm_core)
 add_executable(asm_gpu16 asm_gpu16.cpp)
 target_link_libraries(asm_gpu16 PRIVATE asm_core)
 
+add_executable(asm_16_16_16_16 asm_16_16_16_16.cpp)
+target_link_libraries(asm_16_16_16_16 PRIVATE asm_core)
+
 add_executable(asm_bench asm_bench.cpp)
 target_link_libraries(asm_bench PRIVATE asm_core)
 
@@ -148,6 +151,69 @@ foreach(format hex bin)
     set_tests_properties(backends_gpu16_${format}
                          PROPERTIES FAIL_REGULAR_EXPRESSION "TEST FAIL")
 endforeach()
+
+# The fourth ISA, cpu_16_16_16_16.  Its words are sixteen bits like asm16's,
+# but its statements are typed and comma separated like gpu16's, so it is the
+# one combination the two blocks above do not already cover.
+foreach(format hex bin)
+    add_test(
+        NAME backends_cpu_16_16_16_16_${format}
+        COMMAND asm_bench --isa 1616 --lines 200000 --format ${format} --check
+    )
+    set_tests_properties(backends_cpu_16_16_16_16_${format}
+                         PROPERTIES FAIL_REGULAR_EXPRESSION "TEST FAIL")
+endforeach()
+
+# The fourth ISA's assembler is tested on its own, without any simulator:
+# what the encodings are, what the assembler refuses, and where the branch
+# range ends.  The core's behaviour is tested separately, by simulation.
+add_test(
+    NAME cpu_16_16_16_16_encoding
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_encoding_test.sh
+            $<TARGET_FILE:asm_16_16_16_16>
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu_16_16_16_16_encoding.s
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu_16_16_16_16_encoding.expect16
+)
+set_tests_properties(cpu_16_16_16_16_encoding
+                     PROPERTIES FAIL_REGULAR_EXPRESSION "TEST FAIL")
+
+add_test(
+    NAME cpu_16_16_16_16_reject
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_reject_test.sh
+            $<TARGET_FILE:asm_16_16_16_16>
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu_16_16_16_16_reject.cases
+)
+set_tests_properties(cpu_16_16_16_16_reject
+                     PROPERTIES FAIL_REGULAR_EXPRESSION "TEST FAIL")
+
+# ... and the same argument one level further back for that expectation
+# file, which is generated from the document by a second encoder rather than
+# written out by hand.  If someone ever "fixes" a failing encoding test by
+# pasting in what the assembler printed, this is what notices.
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+    add_test(
+        NAME cpu_16_16_16_16_encoding_expect
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_cpu_16_16_16_16_gen_check.sh
+                ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests
+    )
+    set_tests_properties(cpu_16_16_16_16_encoding_expect
+                         PROPERTIES FAIL_REGULAR_EXPRESSION "TEST FAIL")
+else()
+    message(WARNING "python3 not found, the cpu_16_16_16_16 encoding expectation check is disabled")
+endif()
+
+# A range check is only worth anything if it is exact, so this assembles the
+# furthest program that must work and the nearest one that must not, in both
+# directions, for both branch formats.
+add_test(
+    NAME cpu_16_16_16_16_range
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_cpu_16_16_16_16_range.sh
+            $<TARGET_FILE:asm_16_16_16_16>
+)
+set_tests_properties(cpu_16_16_16_16_range
+                     PROPERTIES FAIL_REGULAR_EXPRESSION "TEST FAIL")
 
 # The compiler has the same obligation twice over: every backend of a path
 # has to agree byte for byte, and the two paths have to agree with each

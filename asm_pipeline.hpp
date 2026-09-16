@@ -239,6 +239,9 @@ inline std::string asm_error_text(const asm_error& e) {
     case ASM_ERR_ARG_RANGE2:
         return std::format("{}: line {}: argument '{}' does not fit in 3 bits\n",
                            tool, e.line_number, e.detail);
+    // The three range messages end in wording only the ISA knows - how many
+    // registers it has, how wide its immediate field is - so each ISA
+    // description carries its own tail for them.
     // The typed operand diagnostics.  e.count is how many operands the
     // instruction takes and e.detail names the one that was wrong.
     case ASM_ERR_OPERANDS:
@@ -249,12 +252,11 @@ inline std::string asm_error_text(const asm_error& e) {
                            "kind of operand that goes there\n",
                            tool, e.line_number, e.count + 1, e.op, e.detail);
     case ASM_ERR_REG_RANGE:
-        return std::format("{}: line {}: register '{}' does not exist, "
-                           "this machine has sixteen of each file\n",
-                           tool, e.line_number, e.detail);
+        return std::format("{}: line {}: register '{}' does not exist, {}\n",
+                           tool, e.line_number, e.detail, ISA::reg_range_text);
     case ASM_ERR_IMM_RANGE:
-        return std::format("{}: line {}: immediate '{}' does not fit in 16 bits\n",
-                           tool, e.line_number, e.detail);
+        return std::format("{}: line {}: immediate '{}' {}\n",
+                           tool, e.line_number, e.detail, ISA::imm_range_text);
     case ASM_ERR_MOD_RANGE:
         return std::format("{}: line {}: '{}' is out of range for operand {} of '{}'\n",
                            tool, e.line_number, e.detail, e.count + 1, e.op);
@@ -266,8 +268,8 @@ inline std::string asm_error_text(const asm_error& e) {
         return std::format("{}: line {}: '{}' is not a number, and '{}' does not take "
                            "a label there\n", tool, e.line_number, e.detail, e.op);
     case ASM_ERR_BRANCH_RANGE:
-        return std::format("{}: line {}: label '{}' is too far away to encode "
-                           "in 16 bits\n", tool, e.line_number, e.detail);
+        return std::format("{}: line {}: label '{}' {}\n",
+                           tool, e.line_number, e.detail, ISA::branch_range_text);
     default:
         return std::format("{}: line {}: internal error\n", tool, e.line_number);
     }
