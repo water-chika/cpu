@@ -60,7 +60,54 @@ module gpu16 #(
     input [31:0] group_id_y,
     input [31:0] wave_id,
 
-    // High once s_endpgm has retired.  The wave issues nothing more.
+    // Low for a wave slot the workgroup does not fill.  An unlaunched slot
+    // reports itself halted and issues nothing, which is how a workgroup of
+    // fewer than NUM_WAVES waves is expressed.
+    input launch,
+
+    // Section 7.2's Model-A issues "one instruction per cycle per compute
+    // unit, round-robin over ready waves", so which wave issues is not this
+    // module's decision.  It says what it *could* issue and is told whether
+    // it may.
+    output issue_request,
+    input issue_grant,
+
+    // The global port, section 3.1: 64 B per cycle, aligned, shared by the
+    // whole workgroup.  The wave asks for it and spends a cycle on it only
+    // when granted.
+    output g_request,
+    output [17:0] g_block,
+    output g_write,
+    output [63:0] g_byte_enable,
+    output [511:0] g_wdata,
+    input [511:0] g_rdata,
+    input g_grant,
+
+    // The LDS port, section 3.2: sixteen banks, also shared by the whole
+    // workgroup.  One row per bank, already conflict-free.
+    output l_request,
+    output [15:0] l_bank_write,
+    output [111:0] l_bank_row,
+    output [63:0] l_byte_enable,
+    output [511:0] l_wdata,
+    input [511:0] l_rdata,
+    input l_grant,
+
+    // Section 3.3's barrier.  High while this wave is sitting on an
+    // `s_barrier` it has not been let through yet.
+    output barrier_wait,
+    input barrier_release,
+
+    // Section 4.3's three shared counters are counted once for the whole
+    // workgroup, which is what "by this workgroup" in the s_rd_sys table
+    // means, so they live in the compute unit.  What a wave contributes is
+    // the bytes its own instruction asked for.
+    output [31:0] gmem_bytes_add,
+    input [31:0] perf_gmem_bytes_in,
+    input [31:0] perf_gmem_trans_in,
+    input [31:0] perf_lds_cycles_in,
+
+    // High once s_endpgm has retired, or immediately for an unlaunched slot.
     output halted
 );
 
@@ -74,7 +121,7 @@ parameter LDS_SIZE = 8192;
 
 reg [15:0] PC;
 reg halted_r;
-assign halted = halted_r;
+assign halted = halted_r | ~launch;
 
 // Section 1.4 and 4.4: a taken branch costs a fixed 3 cycle bubble.  This is
 // the analogue of cpu16's `stall`, done with a counter rather than a flag
@@ -231,10 +278,32 @@ reg [383:0] lane_addr;    // sixteen 24 bit effective addresses
 reg [2047:0] stage;       // sixteen lanes x four words, the unit's own buffer
 reg [3:0] st_reg;
 
+// `s_ld_g`'s own two cycle path: latch the address, and select its word out
+// of the block the cycle the port is granted.
+reg [23:0] gmem_address;
+reg [3:0] gmem_dst;
+reg gmem_read;
+
 // A wave issues nothing while the memory unit is still working through an
-// access, which is the second of the two reasons this machine stalls - the
-// first being a taken branch's bubble.
-wire issue = (bubble == 2'b0) & ~halted_r & (mem_state == MEM_IDLE);
+// access, which is the second of the three reasons this machine stalls - the
+// first being a taken branch's bubble and the third a barrier.
+//
+// `bar_done` is how a barrier is passed exactly once.  `s_barrier` is not
+// executed and then waited on; it is *not issued* until the compute unit
+// says every wave has arrived, which is what makes the arrival condition
+// stable - a wave that had already issued its barrier and run on would stop
+// counting as arrived and strand the others.  The release is latched rather
+// than used directly for the same reason: the release lasts one cycle, the
+// round robin lets only one wave issue per cycle, and every wave that was
+// waiting must get through on the strength of that one release.
+reg bar_done;
+wire at_barrier = (opcode == 8'hb0);
+wire wave_ready = (bubble == 2'b0) & ~halted_r & launch
+                & (mem_state == MEM_IDLE) & ~gmem_read;
+
+assign barrier_wait = wave_ready & at_barrier & ~bar_done;
+assign issue_request = wave_ready & (~at_barrier | bar_done);
+wire issue = issue_request & issue_grant;
 
 // Which resource the access in flight is against, and how wide it is.  LDS
 // has no 1 byte sign extending load and no 16 byte access: section 4.9 is
@@ -353,28 +422,23 @@ always @* begin
     end
 end
 
-reg [23:0] gmem_address;
-reg [3:0] gmem_dst;
-reg gmem_read;
-wire [511:0] gmem_out_block;
+wire [511:0] gmem_out_block = g_rdata;
 
 wire mem_active = (mem_state == MEM_GATHER) | (mem_state == MEM_SCATTER);
+// The cycle this access is actually spending on the port.  Without a grant
+// the unit simply does not advance: another wave has the port.
+wire port_go = mem_active & (mem_lds ? l_grant : g_grant);
 wire [17:0] port_block = mem_active ? cur_block : gmem_address[23:6];
-wire port_write = (mem_state == MEM_SCATTER) & ~mem_lds & any_unserved;
+wire port_write = (mem_state == MEM_SCATTER) & ~mem_lds & any_unserved & g_grant;
 
-gpu16_gmem #(
-    .WORD_INDEX_WIDTH(DATA_INDEX_WIDTH)
-) data (
-    .clk(clk),
-    // The data address is a 24 bit *byte* address and a block is 64 bytes,
-    // so the block index drops the low six.  This instance implements only
-    // the low DATA_INDEX_WIDTH words of that space.
-    .block_index(port_block[DATA_INDEX_WIDTH-5:0]),
-    .write_enable(port_write),
-    .byte_enable(gmem_be),
-    .in_block(gmem_wdata),
-    .out_block(gmem_out_block)
-);
+// The memory itself belongs to the compute unit, not to the wave: section
+// 3.1's port and section 3.2's banks are shared by the whole workgroup, so
+// what leaves here is a request and what comes back is a grant.
+assign g_block = port_block;
+assign g_write = port_write;
+assign g_byte_enable = gmem_be;
+assign g_wdata = gmem_wdata;
+assign g_request = (mem_active & ~mem_lds & any_unserved) | gmem_read;
 
 // `s_ld_g`'s word, selected out of the block its address lands in.
 wire [31:0] gmem_word = gmem_out_block[32*gmem_address[5:2]+:32];
@@ -410,17 +474,14 @@ always @* begin
     end
 end
 
-wire lds_write = (mem_state == MEM_SCATTER) & mem_lds & any_unserved;
-wire [511:0] lds_out;
+wire lds_write = (mem_state == MEM_SCATTER) & mem_lds & any_unserved & l_grant;
+wire [511:0] lds_out = l_rdata;
 
-gpu16_lds lds (
-    .clk(clk),
-    .bank_row(lds_row),
-    .bank_write(lds_claimed & {16{lds_write}}),
-    .byte_enable(lds_be),
-    .in_data(lds_wdata),
-    .out_data(lds_out)
-);
+assign l_bank_row = lds_row;
+assign l_bank_write = lds_claimed & {16{lds_write}};
+assign l_byte_enable = lds_be;
+assign l_wdata = lds_wdata;
+assign l_request = mem_active & mem_lds & any_unserved;
 
 wire [23:0] gmem_effective = src1_value[23:0] + {16'b0, mod};
 
@@ -445,6 +506,14 @@ always @* begin
     end
 end
 wire [31:0] op_bytes_moved = {26'b0, exec_count} * {26'b0, op_bytes};
+
+// What this wave adds to the workgroup's perf_gmem_bytes this cycle: section
+// 7.2's "Bytes", the traffic the program asked for, counted at issue.
+wire op_perlane = (opcode[7:4] == 4'h8) & (opcode != 8'h85);
+assign gmem_bytes_add = ~issue ? 32'b0
+                      : (opcode == 8'h85) ? 32'd4
+                      : op_perlane ? op_bytes_moved
+                      : 32'b0;
 
 gpu16_vector #(
     .WAVE_WIDTH(WAVE_WIDTH)
@@ -475,9 +544,6 @@ gpu16_vector #(
 
 reg [31:0] perf_cycles;
 reg [31:0] perf_instrs;
-reg [31:0] perf_gmem_bytes;
-reg [31:0] perf_gmem_trans;
-reg [31:0] perf_lds_cycles;
 
 reg [31:0] sys_value;
 always @* begin
@@ -497,12 +563,12 @@ always @* begin
         // access.  It counts *global* bytes only, which is what section 7.2
         // says it is; LDS traffic is not memory traffic.
         8'd10: sys_value = 32'b0;
-        8'd11: sys_value = perf_gmem_bytes;
+        8'd11: sys_value = perf_gmem_bytes_in;
         // Section 7.2's LDS cost is "1 issue cycle + 1 port cycle per
         // conflict way", and this is the second half: one per cycle the LDS
         // banks are busy, so a conflict-free wave-wide access adds one and a
         // 4-way conflicting one adds four.
-        8'd12: sys_value = perf_lds_cycles;
+        8'd12: sys_value = perf_lds_cycles_in;
         // Section 4.3, system register 13: global transactions issued, in
         // section 3.1's sense of the word - one per distinct aligned 64 byte
         // block per access.  Section 3.1 is the rule the whole memory system
@@ -513,7 +579,7 @@ always @* begin
         // coalesced - section 3.1's own worked example is a fill that runs at
         // 50% transaction efficiency - so the transaction count is its own
         // counter rather than something a test has to infer from cycles.
-        8'd13: sys_value = perf_gmem_trans;
+        8'd13: sys_value = perf_gmem_trans_in;
         default: sys_value = 32'b0;
     endcase
 end
@@ -532,9 +598,7 @@ always @(posedge clk or posedge reset) begin
         gmem_read <= 1'b0;
         perf_cycles <= 32'b0;
         perf_instrs <= 32'b0;
-        perf_gmem_bytes <= 32'b0;
-        perf_gmem_trans <= 32'b0;
-        perf_lds_cycles <= 32'b0;
+        bar_done <= 1'b0;
         mem_state <= MEM_IDLE;
         mem_op <= 8'b0;
         mem_reg <= 4'b0;
@@ -563,15 +627,19 @@ always @(posedge clk or posedge reset) begin
             bubble <= bubble - 2'b1;
         end
 
-        gmem_read <= 1'b0;
-        if (gmem_read) begin
+        if (gmem_read & g_grant) begin
             registers[gmem_dst] <= gmem_word;
+            gmem_read <= 1'b0;
+        end
+
+        if (barrier_release) begin
+            bar_done <= 1'b1;
         end
 
         // ---- the per lane memory unit, one state per phase of an access
         case (mem_state)
             MEM_GATHER: begin
-                if (any_unserved) begin
+                if (any_unserved & port_go) begin
                     for (l = 0; l < 16; l = l + 1) begin
                         if (match[l]) begin
                             gather_off = lane_addr[24*l+:6];
@@ -611,18 +679,12 @@ always @(posedge clk or posedge reset) begin
                         end
                     end
                     served <= served | match;
-                    if (mem_lds) begin
-                        perf_lds_cycles <= perf_lds_cycles + 1;
-                    end
-                    else begin
-                        perf_gmem_trans <= perf_gmem_trans + 1;
-                    end
                     if ((served | match) == 16'hffff) begin
                         mem_state <= MEM_RETURN;
                         mem_j <= 2'b0;
                     end
                 end
-                else begin
+                else if (~any_unserved) begin
                     // exec was zero: no lane reads, and the destination quad
                     // is left alone because MEM_RETURN's mask is mem_exec.
                     mem_state <= MEM_RETURN;
@@ -654,19 +716,13 @@ always @(posedge clk or posedge reset) begin
             MEM_SCATTER: begin
                 // The write to memory is the port_write / gmem_be / gmem_wdata
                 // the block above drives; what is left is the bookkeeping.
-                if (any_unserved) begin
+                if (any_unserved & port_go) begin
                     served <= served | match;
-                    if (mem_lds) begin
-                        perf_lds_cycles <= perf_lds_cycles + 1;
-                    end
-                    else begin
-                        perf_gmem_trans <= perf_gmem_trans + 1;
-                    end
                     if ((served | match) == 16'hffff) begin
                         mem_state <= MEM_IDLE;
                     end
                 end
-                else begin
+                else if (~any_unserved) begin
                     mem_state <= MEM_IDLE;
                 end
             end
@@ -838,9 +894,6 @@ always @(posedge clk or posedge reset) begin
                     mem_j <= 2'b0;
                     st_reg <= arg0;
                     mem_state <= op_store ? MEM_READ : MEM_GATHER;
-                    if (~op_lds) begin
-                        perf_gmem_bytes <= perf_gmem_bytes + op_bytes_moved;
-                    end
                 end
 
                 8'h85:
@@ -848,7 +901,6 @@ always @(posedge clk or posedge reset) begin
                     gmem_address <= gmem_effective;
                     gmem_dst <= arg0;
                     gmem_read <= 1'b1;
-                    perf_gmem_bytes <= perf_gmem_bytes + 4;
                 end
 
                 // ------------------------------------ 4.10 wave control
@@ -860,6 +912,12 @@ always @(posedge clk or posedge reset) begin
                 // 3.3 requires `s_waitcnt_l` before a barrier for exactly the
                 // reason that a machine with a real queue would need it.
                 8'hb1, 8'hb2: ;
+                // Section 3.3.  Reaching this arm at all means the compute
+                // unit has already seen every wave arrive: `issue_request`
+                // is low while `bar_done` is, so the instruction simply does
+                // not issue until then.  What is left to do is spend the
+                // permission, so that the next barrier waits again.
+                8'hb0: bar_done <= 1'b0;
                 8'hb3: halted_r <= 1'b1;
                 8'hbf: ;
 

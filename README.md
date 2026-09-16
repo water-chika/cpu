@@ -636,9 +636,38 @@ cycles, which section 6.4 lists as an open question - "much less confident
 that a real LDS implementation will actually resolve a 2-way conflict in
 exactly 2 cycles rather than 4" - so that question now has an answer in RTL.
 
-The matrix unit (4.7) is still absent, and so is ```s_barrier``` - a barrier
-needs more than one resident wave to mean anything, and this is one wave.
-Both still report ```unknown opcode``` rather than guessing.
+```gpu16_cu.v``` is the compute unit, and it exists because three things in
+the ISA are statements about waves other than this one.  Section 3.2's LDS is
+"shared by the 4 waves of a workgroup"; section 3.3's ```s_barrier``` waits
+until all of them have arrived; section 7.2's Model-A issues "one instruction
+per cycle per compute unit, round-robin over ready waves".  None of the three
+can be implemented, or falsified, one wave at a time - a private scratchpad
+passes every single-wave value test ever written, and a barrier with nobody
+to wait for is a no-op.
+
+So the compute unit owns everything shared - the global memory, the LDS, the
+issue slot, the barrier and the three workgroup performance counters - and
+```gpu16.v``` is now only a wave: a PC, registers, an exec mask and a memory
+unit that *asks* for a port rather than containing one.  A wave whose request
+is not granted does not advance that cycle, which is the whole contention
+model and is why a workgroup does not simply take four times as long as a
+wave.  The issue slot rotates, as Model-A says; each memory port goes to the
+lowest numbered wave asking for it, which cannot starve anyone because every
+request is for at most sixteen port cycles and then stops.
+
+```s_barrier``` is not executed and then waited on - it is *not issued* until
+the unit has seen every wave arrive.  That is what makes the arrival
+condition stable: a wave that had already issued its barrier and run on would
+stop counting as arrived and strand the others.  A wave that has ended counts
+as arrived, so a workgroup whose waves do not all reach the same number of
+barriers does not deadlock on the dead one.
+
+Only ```tests/gpu_wg.s``` launches more than one wave; every other test runs
+with one, in which configuration each grant is unopposed and the machine
+behaves cycle for cycle as it did before the unit existed.
+
+The matrix unit (4.7) is still absent and still reports ```unknown opcode```
+rather than guessing.
 
 The one thing added to the ISA rather than implemented from it is system
 register 13, ```perf_gmem_trans```: the transaction count.  Section 4.3's
@@ -664,8 +693,12 @@ in for an address anywhere the ISA takes one, not only after ```la``` -
 ```s_addpc```, because unlike cpu8 this machine can add to its own PC.
 
 ```testgpu.v``` is its testbench, modelled on ```test16.v```, and the
-fifteen ```gpu_*``` CTests assemble a program with ```asm_gpu16```, run it on
-```gpu16.v``` and check all sixteen scalar registers.  A gpu16 program must
+sixteen ```gpu_*``` CTests assemble a program with ```asm_gpu16```, run it on
+a ```gpu16_cu``` compute unit and check all sixteen scalar registers of wave
+0.  ```+waves``` says how many of the four wave slots to launch and defaults
+to one; a multi wave program that wants to say something about wave 3 has to
+get the answer to wave 0 through memory, which is a more honest test than
+reaching into another wave's register file from the testbench.  A gpu16 program must
 reach ```s_endpgm```: unlike cpu16, running off the end is a failure even if
 the registers look right.  The five scalar programs' ```.expect``` files were
 written when the programs were hand encoded hex and have not been touched
@@ -728,6 +761,39 @@ on either side, a big-endian quad, both address truncations removed, a byte
 store that writes the whole word, and a ```v_ld_gs``` that zero extends - and
 every one of them fails at least one test.
 
+```gpu_wg``` is the only test that launches four waves, and it is the only
+one that can say anything about the three things that need more than one.
+Every wave runs the same program and is told apart only by ```s_rd_sys 0```.
+Each poisons its own LDS slot, a barrier makes that complete, wave 3 is then
+sent round a long delay loop before it writes the real value, and every wave
+sums all four slots after a second barrier - so a private scratchpad, or a
+barrier that does not wait, reads the poison and gets 0x33 instead of 0x46.
+The same argument is then made through global memory, where wave 0 reads back
+with ```s_ld_g``` a word only wave 3 ever wrote.
+
+Two sections then turn all sixteen lanes on and put both ports under load
+from all four waves at once, bounded by a barrier at each end: sixteen lanes
+at a 64 byte stride are one bank sixteen ways over in the LDS and sixteen
+distinct blocks in global memory, so the workgroup's counters must read 64
+port cycles, 64 transactions and 256 bytes.  Each would read 16, 16 and 64 if
+a port served every wave in the same cycle, or if the counters had stayed per
+wave rather than per workgroup as section 4.3's "by this workgroup" says.
+
+The last section measures round-robin issue, which no value can see because
+every schedule runs the same instructions: with four waves ready wave 0 gets
+one cycle in four, so a sixteen instruction stretch costs it about 64 cycles
+against 16 for a unit that let it run to completion first, and the test keeps
+whether the figure cleared 32.  Twelve mutations were run against the wave
+and the compute unit - the barrier release tied high, a barrier that waits
+only for wave 0, permission that is never spent so one barrier passes
+forever, a wave that does not wait at a barrier at all, a memory unit that
+advances without a grant, round robin replaced by fixed priority, two waves
+issuing in the same cycle, either port granted to every requester at once,
+each of the three counters reverted to counting one wave, and ```launch```
+ignored so that every test runs four waves - and every one of them fails a
+test.  Eleven fail ```gpu_wg```; the twelfth, ```launch```, falls to the
+single-wave counter tests, which is the right answer for it.
+
 Simulation can only reach the part of the ISA that ```gpu16.v``` implements,
 so ```gpu_encoding``` covers the rest: it assembles all 97 instructions and
 compares the words against ```tests/gpu_encoding.expect32```, which needs no
@@ -783,10 +849,8 @@ compiles every ```*.v``` on its own with ```-Wall``` and fails on any message.
   ```unknown opcode``` for them.  Only ```cpu16.v``` has the second program
   memory port they need.
 * ```variables_to_registers``` is not implemented.
-* ```gpu16``` has no matrix unit, and one resident wave rather than a
-  workgroup of four, so ```s_barrier``` has nothing to synchronise and none of
-  section 7.4's kernels can run yet.  ```asm_gpu16``` assembles the
-  instructions they would need,
+* ```gpu16``` has no matrix unit, so none of section 7.4's kernels can run
+  yet.  ```asm_gpu16``` assembles the instructions they would need,
   but nothing can execute them, so those are held down by ```gpu_encoding```
   rather than by simulation.  Global accesses complete before the next
   instruction issues, so ```s_waitcnt_g``` is architecturally required but

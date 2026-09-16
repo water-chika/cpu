@@ -1,0 +1,18 @@
+// gpu16 workgroup, four waves: what wave 0 is left holding.
+// Derived from docs/gpu_isa.md sections 3.2, 3.3 and 7.2, not from the RTL.
+00000000    // s0  wave id: the checked wave is wave 0
+xxxxxxxx    // s1
+00000100    // s2  bytes asked for: 4 waves x 16 lanes x 4 bytes
+00000020    // s3  0x20 + wave_id, wave 0's global payload
+xxxxxxxx    // s4
+00000100    // s5  256 + 64*wave_id, wave 0's global slot
+xxxxxxxx    // s6
+xxxxxxxx    // s7
+00000040    // s8  LDS port cycles: 4 waves x a 16-way bank conflict
+00000013    // s9  the last slot read: what wave 3 wrote, after barrier B
+00000046    // s10 0x10+0x11+0x12+0x13, all four LDS slots
+00000001    // s11 wave 0 shared the issue slot with the other three waves
+xxxxxxxx    // s12
+xxxxxxxx    // s13
+00000023    // s14 0x20 + 3, read out of global memory, written by wave 3
+00000040    // s15 global transactions: 4 waves x 16 distinct 64-byte blocks

@@ -305,6 +305,13 @@ if(IVERILOG_EXECUTABLE AND VVP_EXECUTABLE)
 
     add_gpu_test(gpu_bank tests/gpu_bank.s - gpu_bank.expect 400)
 
+    # The workgroup, sections 3.2, 3.3 and 7.2.  The only test that launches
+    # more than one wave, and the only one that can say anything at all about
+    # `s_barrier`, about the LDS and the global port being shared rather than
+    # private, or about round-robin issue - all four are statements about
+    # waves other than this one, and are unfalsifiable with a single wave.
+    add_gpu_test(gpu_wg tests/gpu_wg.s - gpu_wg.expect 1500 +waves=4)
+
     # What the five tests above cannot reach.  gpu16.v is the scalar unit, so
     # simulation covers about a third of the ISA; the vector ALU, the matrix
     # unit, LDS and the exec mask are pinned by their encodings instead, which

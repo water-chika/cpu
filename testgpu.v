@@ -1,11 +1,24 @@
-`include "gpu16.v"
+`include "gpu16_cu.v"
 
 // Self checking testbench for gpu16, modelled on test16.v.
+//
+// What is instantiated is a whole compute unit, because that is the unit the
+// ISA describes: the LDS and the global port are shared by the workgroup and
+// `s_barrier` is a statement about waves other than this one.  +waves says
+// how many of the four wave slots to launch and defaults to 1, which is the
+// configuration every single-wave test runs in and in which every grant is
+// unopposed - so a one wave program behaves, cycle for cycle, exactly as it
+// did when gpu16.v contained its own memory.
+//
+// The registers that are checked are wave 0's.  A multi wave program that
+// wants to say something about wave 3 has to get the answer to wave 0, which
+// is what the LDS and global memory are for and is a more honest test than
+// reaching into another wave's register file from the testbench.
 //
 //   vvp simgpu +program=<hex file> +expect=<hex file> [+vexpect=<hex file>]
 //              [+data=<hex file>]
 //              [+cycles=<n>] [+arg_ptr=<n>] [+group_x=<n>] [+group_y=<n>]
-//              [+wave_id=<n>] [+trace]
+//              [+wave_id=<n>] [+waves=<n>] [+trace]
 //
 // The program file holds 32 bit instructions as 8 digit hex words and the
 // expect file holds the 16 expected scalar registers (s0 first) as 8 digit
@@ -56,8 +69,9 @@ reg [31:0] vexpected[0:255];
 integer has_vexpect;
 integer lane;
 integer vreg;
+integer waves;
 
-gpu16 #(
+gpu16_cu #(
     .PROGRAM_ADDR_WIDTH(PROGRAM_ADDR_WIDTH),
     .DATA_INDEX_WIDTH(DATA_INDEX_WIDTH)
 ) U0 (
@@ -66,7 +80,8 @@ gpu16 #(
     .kernel_arg_ptr(arg_ptr[31:0]),
     .group_id_x(group_x[31:0]),
     .group_id_y(group_y[31:0]),
-    .wave_id(wave[31:0]),
+    .wave_id_base(wave[31:0]),
+    .waves(waves[2:0]),
     .halted()
 );
 
@@ -113,12 +128,23 @@ initial begin
     if (!$value$plusargs("wave_id=%d", wave)) begin
         wave = 0;
     end
+    if (!$value$plusargs("waves=%d", waves)) begin
+        waves = 1;
+    end
 
+    // Every wave runs the same program; section 3.3's workgroup is one
+    // kernel over four waves, told apart by `s_wave_id`, not four programs.
     if (program_words > 0) begin
-        $readmemh(program_file, U0.program.mem, 0, program_words - 1);
+        $readmemh(program_file, U0.wg[0].w_inst.program.mem, 0, program_words - 1);
+        $readmemh(program_file, U0.wg[1].w_inst.program.mem, 0, program_words - 1);
+        $readmemh(program_file, U0.wg[2].w_inst.program.mem, 0, program_words - 1);
+        $readmemh(program_file, U0.wg[3].w_inst.program.mem, 0, program_words - 1);
     end
     else begin
-        $readmemh(program_file, U0.program.mem);
+        $readmemh(program_file, U0.wg[0].w_inst.program.mem);
+        $readmemh(program_file, U0.wg[1].w_inst.program.mem);
+        $readmemh(program_file, U0.wg[2].w_inst.program.mem);
+        $readmemh(program_file, U0.wg[3].w_inst.program.mem);
     end
     if (has_data) begin
         if (data_words > 0) begin
@@ -135,9 +161,9 @@ initial begin
 
     if ($test$plusargs("trace")) begin
         $monitor("%g\tPC=%04h inst=%08h bubble=%b halt=%b exec=%04h | s0=%08h s1=%08h s2=%08h s3=%08h s4=%08h s5=%08h s6=%08h s7=%08h",
-            $time, U0.PC, U0.Inst, U0.bubble, U0.halted, U0.exec,
-            U0.registers[0], U0.registers[1], U0.registers[2], U0.registers[3],
-            U0.registers[4], U0.registers[5], U0.registers[6], U0.registers[7]);
+            $time, U0.wg[0].w_inst.PC, U0.wg[0].w_inst.Inst, U0.wg[0].w_inst.bubble, U0.halted, U0.wg[0].w_inst.exec,
+            U0.wg[0].w_inst.registers[0], U0.wg[0].w_inst.registers[1], U0.wg[0].w_inst.registers[2], U0.wg[0].w_inst.registers[3],
+            U0.wg[0].w_inst.registers[4], U0.wg[0].w_inst.registers[5], U0.wg[0].w_inst.registers[6], U0.wg[0].w_inst.registers[7]);
     end
 
     // reset is asynchronous, and the pulse is over before the first rising
@@ -162,8 +188,8 @@ initial begin
 
     for (i = 0; i < 16; i = i + 1) begin
         if (^expected[i] !== 1'bx) begin
-            if (U0.registers[i] !== expected[i]) begin
-                $display("  MISMATCH: s%0d = %08h, expected %08h", i, U0.registers[i], expected[i]);
+            if (U0.wg[0].w_inst.registers[i] !== expected[i]) begin
+                $display("  MISMATCH: s%0d = %08h, expected %08h", i, U0.wg[0].w_inst.registers[i], expected[i]);
                 errors = errors + 1;
             end
             else begin
@@ -177,9 +203,9 @@ initial begin
             for (lane = 0; lane < 16; lane = lane + 1) begin
                 i = vreg * 16 + lane;
                 if (^vexpected[i] !== 1'bx) begin
-                    if (U0.vector.vregs[i] !== vexpected[i]) begin
+                    if (U0.wg[0].w_inst.vector.vregs[i] !== vexpected[i]) begin
                         $display("  MISMATCH: v%0d lane %0d = %08h, expected %08h",
-                            vreg, lane, U0.vector.vregs[i], vexpected[i]);
+                            vreg, lane, U0.wg[0].w_inst.vector.vregs[i], vexpected[i]);
                         errors = errors + 1;
                     end
                     else begin
