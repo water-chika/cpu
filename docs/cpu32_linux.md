@@ -272,29 +272,277 @@ Nothing has been attempted, so this is a reading, not a measurement.*
 
 ## 3. What Linux actually requires
 
-Every item marked PREREQUISITE (the kernel will not boot without it) or
-OPTIONAL (nice, or needed only by a fuller configuration), with what the
-repository has today beside it.
+Each item is marked **PREREQUISITE** (the kernel does not boot without it) or
+**OPTIONAL** (a fuller configuration wants it; a first boot does not), with
+what exists today beside it. Where the mark depends on the configuration, it
+says which configuration, because "Linux needs an MMU" is false and "Linux
+needs no MMU" is misleading.
+
+The target this section is written against is deliberately the *cheapest one
+that is still honestly Linux*: **32-bit, uniprocessor, nommu, initramfs, no
+swap, no networking, a serial console and a shell.** Every relaxation is
+named where it is taken.
 
 ### 3.1 A 32-bit word and a real register file
 
+**PREREQUISITE.** The kernel's `long`, its pointers and its `unsigned long`
+bitmaps are all the machine word, and the vast majority of the tree assumes
+that word is at least 32 bits. This is not negotiable and not emulable.
+
+**Register count is a separate PREREQUISITE, and cpu16's 8 fails it.** The
+hard floor is set by the compiler, not by the kernel: a C compiler needs
+enough registers to hold a stack pointer, a frame pointer, a link register, a
+few argument registers, some callee-saved registers and a couple of
+scratch. Every 32-bit Linux architecture that shipped has 16 or 32 general
+registers - m68k and SuperH have 16, ARM has 16, RISC-V, MIPS and PowerPC
+have 32. **16 is the floor, 32 is comfortable.**
+
+*Today:* gpu16's scalar unit has 16 x 32-bit. That meets the floor. cpu16's
+8 x 8-bit fails on both axes. Widening to 32 registers later costs one bit in
+three operand fields, which the 32-bit instruction word does not have spare -
+so **this is a decision to take before writing any code, not after**, and it
+is the single most consequential encoding choice in the plan.
+`gpu_isa.md` section 8 is a worked precedent for exactly this argument.
+
 ### 3.2 Byte, halfword and word load/store, and the alignment rules
+
+**PREREQUISITE, all three widths, signed and unsigned for the narrow two.**
+The kernel is full of `char`, `u8`, `u16`, packed structures and byte-wise
+string functions. A machine that can only load a 32-bit word makes every
+`char` access a shift-and-mask sequence the compiler has to synthesise;
+possible, and ruinous both for code size and for the compiler port.
+
+**Alignment.** Two self-consistent positions, either acceptable:
+
+1. Natural alignment required; a misaligned access raises a precise
+   exception. This is what a first implementation should do. It is what
+   most RISC machines did, Linux copes, and `get_unaligned()` exists for the
+   handful of places that need it.
+2. Hardware handles misaligned access. More logic, no kernel benefit worth
+   the gates at this scale. **OPTIONAL and not recommended.**
+
+Position 1 is only coherent *once exceptions exist* (3.3) - until then a
+misaligned access has nowhere to go. That ordering constraint shapes
+section 4.
+
+*Today:* cpu16 has byte load/store into 256 bytes. gpu16's scalar side has
+**word load only and no store at all**, and it is block-shaped. The whole
+scalar load/store unit is new work under either candidate of section 2, and
+it is the first real piece of RTL the plan asks for.
 
 ### 3.3 Exceptions and interrupts
 
+**PREREQUISITE, and this is the largest single gap in the repository.**
+Neither cpu16 nor gpu16 has any of it: `grep -i "interrupt\|exception\|trap"`
+over every `.v` file in this repo returns nothing. `gpu_isa.md` 4.3 even
+notes the absence approvingly - a carry flag would be "a piece of
+architectural state with its own save/restore question the moment anything
+resembling an interrupt appears".
+
+The minimum, itemised, because "add exceptions" is not one task:
+
+| Piece | Mark | What it is |
+|---|---|---|
+| A trap-taking mechanism | PREREQUISITE | on a fault or interrupt, hardware saves the PC, records a cause, and redirects the PC to a vector |
+| Saved-PC state | PREREQUISITE | an `EPC`-equivalent, readable and writable |
+| A cause and a fault-address register | PREREQUISITE | the handler has to know *what* and, for a memory fault, *where* |
+| A trap vector base | PREREQUISITE | writable, so the kernel installs its own handlers |
+| A return-from-trap instruction | PREREQUISITE | restores PC and the interrupt-enable state **atomically**; doing it in two instructions is a race and a classic new-port bug |
+| A global interrupt-enable bit | PREREQUISITE | this is also how a UP kernel gets its atomics for free - see 3.8 |
+| At least one external interrupt input | PREREQUISITE | the timer needs it; the console wants it |
+| A system-call instruction | PREREQUISITE | user code must be able to enter the kernel deliberately |
+| Precise exceptions | PREREQUISITE | the faulting instruction must not have half-committed. Cheap here: cpu16/gpu16 are effectively single-issue in-order with a short pipeline, so this is nearly free - and would not be on anything deeper |
+| Nested/prioritised interrupts, an interrupt controller with many lines | OPTIONAL | one line and software demux is enough to boot |
+| Vectored (per-cause) entry points | OPTIONAL | one entry point and a cause dispatch is enough |
+
+`s_rd_sys` is architecturally the right shape for the state above - a
+numbered read of non-GPR state - but it is **read-only** and its values are
+hardwired. A real CSR mechanism needs a matching write and a defined set of
+writable numbers. That is a small extension of something already designed,
+which is the practical payoff of the section 2 recommendation.
+
 ### 3.4 Privilege levels
+
+**PREREQUISITE for a system you would trust; OPTIONAL for the first boot,
+with a caveat.**
+
+Honest version: Linux can be brought up on a machine with one privilege level
+- that is what nommu Linux effectively is on several architectures. Userspace
+runs with the same powers as the kernel, any process can scribble on the
+kernel, and `fork()` does not exist. That is a genuine, historically shipped
+configuration (uClinux and its descendants), and it is a legitimate **first**
+target because it removes an entire axis of debugging.
+
+What is *not* optional even then is the **system-call trap** of 3.3: user
+code must have a defined way to enter the kernel. The privilege level is what
+makes that boundary enforceable; the trap is what makes it exist.
+
+The recommendation is to design two levels into the state model from the
+start (one status bit, a previous-privilege bit saved on trap) and implement
+the enforcement later. Retrofitting privilege into an ISA after the ABI is
+fixed is far more expensive than reserving the bit.
 
 ### 3.5 A timer
 
+**PREREQUISITE.** Linux needs a *clocksource* (a monotonically increasing
+counter it can read) and a *clockevent* (a programmable interrupt at a chosen
+future time, or periodically). Without the second there is no scheduler tick,
+no timeouts, and no preemption; the kernel's own boot sequence calibrates
+against it and will hang.
+
+Minimum viable device: a 32-bit (better, 64-bit) free-running counter at a
+known frequency, a comparator register, and an interrupt when they match.
+This is perhaps 60 lines of Verilog and one of the cheapest PREREQUISITEs on
+the list.
+
+*Today:* gpu16 has `perf_cycles`, a free-running cycle counter readable
+through `s_rd_sys`. That is half of the clocksource already, and is a fair
+illustration of why section 2 recommends what it recommends.
+
 ### 3.6 A console
 
-### 3.7 Virtual memory: an MMU with page tables, or a nommu build
+**PREREQUISITE in practice.** Formally the kernel boots without one; in
+practice a bring-up with no console is a bring-up where a failure is
+indistinguishable from a hang, and everything in this project's method -
+`.expect` files, cross-checks, `docs/fpga_bringup.md`'s whole troubleshooting
+section - depends on being able to see what happened.
+
+* **Output only, memory-mapped TX register, polled**: enough for `earlycon`
+  and for every boot message. PREREQUISITE. Perhaps 40 lines.
+* **Input (RX), interrupt-driven**: needed for a shell. Strictly OPTIONAL for
+  "it booted", required for "I used it".
+* A 16550-compatible register layout: OPTIONAL, but worth it - an existing
+  kernel driver instead of a written one.
+
+### 3.7 Virtual memory: page tables, or a nommu build
+
+**The MMU is OPTIONAL, and taking the option is the single largest saving in
+this plan.**
+
+Linux has supported `!CONFIG_MMU` for two decades, and several architectures
+(m68k, SuperH, ARM, ARC, RISC-V, Xtensa) carry live nommu ports. What it
+costs, stated so the decision is informed:
+
+* **no `fork()`** - only `vfork()` and `clone()` with shared memory. Every
+  userspace program must be written or built to cope. BusyBox does.
+* **no demand paging, no swap, no `mmap()` of a file privately** - the whole
+  program is resident.
+* **no memory protection** - a userspace bug corrupts the kernel.
+* **binaries must be position-independent in a specific way**: bFLT or
+  FDPIC-ELF, which means the toolchain has to emit them (section 5).
+* **fragmentation becomes a real failure mode**, since allocations must be
+  physically contiguous.
+
+None of those stop a shell prompt appearing. They do stop it being a general
+purpose system, which is why the MMU is not dropped from the plan, only
+deferred.
+
+**If the MMU is later built**, it is PREREQUISITE-sized work in its own
+right: a TLB, a page-table walk (hardware or a software-refill trap), fault
+reporting with a faulting address, TLB-invalidate instructions, an
+address-space identifier or a full flush on context switch, and a kernel/user
+address split. Realistically this is the second-largest item in the whole
+plan after the compiler. A software-refill TLB (MIPS's approach) is the
+cheaper form and is the one to choose: less hardware, and the walk lives in
+kernel C where it can be debugged.
 
 ### 3.8 Atomics
 
+**OPTIONAL on a uniprocessor, PREREQUISITE the moment there are two cores.**
+
+This is the item people over-build. On a UP kernel with no preemption inside
+critical sections, every atomic operation can be implemented as
+*disable interrupts, do it, restore interrupts* - and that is exactly what
+`ARCH_ATOMIC` fallbacks and several real ports do. So the interrupt-enable
+bit of 3.3 is not just an interrupt feature: **it is the atomics story.**
+
+What is still needed even on UP:
+
+* a way to disable and restore interrupts atomically (part of 3.3);
+* compiler and kernel agreement that there is no SMP (`CONFIG_SMP=n`).
+
+A load-reserved/store-conditional pair or a compare-and-swap instruction is
+the right thing to add *before* a second core, and a waste of gates before
+that. Mark it as scheduled work, not as a gap.
+
 ### 3.9 Boot protocol and device tree
 
-### 3.10 The itemised table
+**PREREQUISITE, though less of it than it first appears.**
+
+What must exist:
+
+* **a defined entry state**: where the kernel image is in memory, what the PC
+  is at release from reset, and which register (if any) holds a pointer to
+  the hardware description;
+* **a way to get several megabytes into memory before release**: today this
+  repo's loader writes one word per cycle with reset held high
+  (`cpu16.v`'s `prog_load_*`, `gpu16_cu`'s `prog_load_*`). At one word per
+  JTAG-clocked cycle, a 4 MiB image is not a plausible load path - see 6.3;
+* **a hardware description**: a flattened device tree is the modern answer
+  and a new architecture should use it rather than invent a boot parameter
+  block. It must describe at minimum the memory range, the timer frequency,
+  the interrupt controller and the console;
+* **an initramfs**, which is how a nommu system gets a root filesystem
+  without a block driver. This can be linked into the kernel image itself
+  (`CONFIG_INITRAMFS_SOURCE`), which removes the need for any storage device
+  at all. **Do this**; it deletes an entire class of work.
+
+OPTIONAL: a bootloader. With the image and the DTB linked together and
+written by the loader, there is nothing for one to do.
+
+### 3.10 The non-hardware prerequisite nobody costs
+
+**PREREQUISITE, and it is not RTL at all: `arch/cpu32/` inside the kernel
+tree.** A new Linux architecture port is, at minimum, its own: entry/trap
+assembly, context switch, `thread_info` and `pt_regs` layout, signal delivery,
+syscall table and wrappers, memory init, IRQ chip driver, timer driver,
+`Kconfig`/`Makefile` wiring, `uapi` headers, and a set of atomic/bitop/barrier
+headers. Existing minimal ports (RISC-V's original merge, ARC, openrisc) land
+in the region of **10,000 to 20,000 lines**, much of it adapted rather than
+invented, but all of it needing to be right.
+
+This is stated here rather than in section 8 because it belongs on the
+requirements list: it is as much a prerequisite for booting as the trap
+mechanism is, and it is larger than all the RTL in this plan combined.
+
+### 3.11 The itemised table
+
+| # | Requirement | Mark | Exists today? |
+|---|---|---|---|
+| 3.1 | 32-bit word and address | PREREQUISITE | gpu16 scalar: yes. cpu16: no |
+| 3.1 | >= 16 general registers | PREREQUISITE | gpu16: 16, at the floor. cpu16: 8, fails |
+| 3.1 | 32 registers | OPTIONAL (but decide *now*) | no |
+| 3.2 | byte/halfword/word load and store, signed and unsigned | PREREQUISITE | **no** - cpu16 is byte-only; gpu16 scalar is word-load-only, no store |
+| 3.2 | trap on misaligned access | PREREQUISITE (given 3.3) | no |
+| 3.2 | hardware misalignment fixup | OPTIONAL, not recommended | no |
+| 3.3 | precise trap, EPC, cause, vector base, return-from-trap | PREREQUISITE | **no, none of it** |
+| 3.3 | global interrupt enable | PREREQUISITE | no |
+| 3.3 | >= 1 external interrupt input | PREREQUISITE | no |
+| 3.3 | system-call instruction | PREREQUISITE | no |
+| 3.3 | interrupt controller, vectored entry, nesting | OPTIONAL | no |
+| 3.4 | two privilege levels | PREREQUISITE for a real system; OPTIONAL for first boot | no |
+| 3.5 | clocksource (free-running counter) | PREREQUISITE | **partly** - `perf_cycles` via `s_rd_sys` |
+| 3.5 | clockevent (comparator + interrupt) | PREREQUISITE | no |
+| 3.6 | polled TX console | PREREQUISITE in practice | no |
+| 3.6 | RX, interrupt-driven | OPTIONAL (required for a shell) | no |
+| 3.7 | MMU, TLB, page tables, faults, invalidation | OPTIONAL (nommu first); PREREQUISITE for `fork()` and protection | no |
+| 3.8 | atomic RMW or LR/SC instructions | OPTIONAL on UP; PREREQUISITE on SMP | no |
+| 3.9 | defined entry state and hardware description (FDT) | PREREQUISITE | no |
+| 3.9 | a loader that can move megabytes | PREREQUISITE | **no** - one word per cycle, see 6.3 |
+| 3.9 | initramfs linked into the image | PREREQUISITE (avoids needing storage) | n/a - kernel config |
+| 3.9 | bootloader | OPTIONAL | no |
+| 3.10 | `arch/cpu32/` in the kernel tree | PREREQUISITE | no |
+| - | multiply | OPTIONAL (libgcc can) | yes, both |
+| - | divide | OPTIONAL (libgcc can) | cpu16 yes; gpu16 deliberately not |
+| - | carry flag / add-with-carry | OPTIONAL | cpu16 yes; gpu16 reserved, unimplemented |
+| - | caches, coherency | OPTIONAL at this scale | no, and no need |
+| - | idle/wait-for-interrupt | OPTIONAL | no |
+
+The shape of that table is the finding: **eleven hardware PREREQUISITEs are
+entirely absent, and every one of them is in sections 3.2, 3.3, 3.5, 3.6 and
+3.9 - the load/store unit, the trap architecture, the timer, the console and
+the boot path. None of them are about being 32 bits wide.** Widening the
+data path is the part of this project that is already mostly done.
 
 ## 4. The staged sequence
 
