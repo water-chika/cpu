@@ -8,11 +8,13 @@
 // two things a vector instruction can write outside the VGPR file - a lane
 // mask for `v_cmp_*` and one lane's value for `v_readlane`.
 //
-// SCOPE.  Section 4.6 and nothing else.  The matrix unit (4.7), the per lane
-// global accesses (4.8) and LDS (4.9) also live in the vector datapath and
-// are deliberately absent; opcodes belonging to them are not decoded here and
-// still fall through to `gpu16.v`'s `unknown opcode` arm, so nothing silently
-// pretends to implement them.
+// SCOPE.  Section 4.6, plus the register file side of the per lane memory
+// accesses of sections 4.8 and 4.9 - the cross lane address read, the store
+// data read and the load return path, all of which are ports on this file
+// driven by the memory unit in `gpu16.v`.  The matrix unit (4.7) is
+// deliberately absent; its opcodes are not decoded here and still fall
+// through to `gpu16.v`'s `unknown opcode` arm, so nothing silently pretends
+// to implement it.
 //
 // THE REGISTER FILE is one flat array rather than sixteen separate ones:
 //
@@ -63,7 +65,33 @@ module gpu16_vector #(
     // specifies.  Valid whenever `inst` is one of the four compares.
     output [15:0] cmp_mask,
     // `v_readlane`: v[Arg1] in lane Mod[3:0], read regardless of exec.
-    output [31:0] readlane_value
+    output [31:0] readlane_value,
+
+    // ------------------------------------------------ the memory unit's ports
+    //
+    // Sections 4.8 and 4.9 put the address of a per lane access in a VGPR and
+    // its data in another, but the unit that turns sixteen addresses into
+    // transactions lives in `gpu16.v` beside the memories.  These three ports
+    // are what that unit needs from this register file, and they are sized
+    // the way the hardware is: **one VGPR per cycle**, sixteen lanes wide.
+    //
+    // `vaddr` is v[Arg1] in all sixteen lanes, which is the address operand of
+    // every per lane access, and it is the same cross lane read `v_readlane`
+    // already does.
+    output [511:0] vaddr,
+    // `st_data` is v[st_reg] in all sixteen lanes.  A store walks its source
+    // registers one per cycle through `st_reg`, so a `v_st16_g` reads its quad
+    // over four cycles rather than through four register file ports - the
+    // same argument section 4.8 makes for the load return path.
+    input [3:0] st_reg,
+    output [511:0] st_data,
+    // The load return path.  `mem_mask` is already ANDed with exec by the
+    // memory unit, so section 1.2's rule - a disabled lane's register is not
+    // written - is applied here by the mask and nowhere else.
+    input mem_write,
+    input [3:0] mem_reg,
+    input [15:0] mem_mask,
+    input [511:0] mem_data
 );
 
 wire [7:0] opcode = inst[31:24];
@@ -92,6 +120,8 @@ generate
         // the eight bits the array index wants.
         localparam [3:0] LANE = g;
         assign xlane[g] = vregs[{arg1, LANE}];
+        assign vaddr[32*g+:32] = xlane[g];
+        assign st_data[32*g+:32] = vregs[{st_reg, LANE}];
         assign cmp_bit[g] = (opcode == 8'h5c) ? (xlane[g] != 32'b0)
                           : (opcode == 8'h5d) ? (xlane[g] == 32'b0)
                           : (opcode == 8'h5e) ? ($signed(xlane[g]) < 0)
@@ -197,6 +227,19 @@ always @(posedge clk or posedge reset) begin
 
             if (issue & write_v & exec[l[3:0]]) begin
                 vregs[{arg0, l[3:0]}] <= result;
+            end
+        end
+
+        // The memory unit's return path (section 4.8), one VGPR per cycle.
+        // This is a second write port only in the sense that it is a second
+        // `if`: `gpu16.v` holds `issue` low for every cycle a memory
+        // instruction is still occupying the memory unit, so the loop above
+        // and the loop below never fire in the same cycle.
+        if (mem_write) begin
+            for (l = 0; l < WAVE_WIDTH; l = l + 1) begin
+                if (mem_mask[l[3:0]]) begin
+                    vregs[{mem_reg, l[3:0]}] <= mem_data[32*l+:32];
+                end
             end
         end
     end

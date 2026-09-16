@@ -271,6 +271,27 @@ if(IVERILOG_EXECUTABLE AND VVP_EXECUTABLE)
     add_gpu_test(gpu_exec      tests/gpu_exec.s      - gpu_exec.expect      200
                  +vexpect=${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_exec.vexpect)
 
+    # Per lane global memory, sections 3.1 and 4.8.  gpu_global checks what
+    # the loads bring back, gpu_gstore and gpu_gwide what the stores leave
+    # behind and what the exec mask does to both, and gpu_coalesce checks the
+    # thing values alone cannot see: how many 64 byte transactions the access
+    # actually cost.  All four share one data file whose only rule is that the
+    # byte at address a holds a & 0xff.
+    add_gpu_test(gpu_global tests/gpu_global.s
+                 tests/gpu_global.data32 gpu_global.expect 300
+                 +vexpect=${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_global.vexpect)
+
+    add_gpu_test(gpu_gstore tests/gpu_gstore.s
+                 tests/gpu_global.data32 gpu_gstore.expect 300
+                 +vexpect=${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_gstore.vexpect)
+
+    add_gpu_test(gpu_gwide tests/gpu_gwide.s
+                 tests/gpu_global.data32 gpu_gwide.expect 300
+                 +vexpect=${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_gwide.vexpect)
+
+    add_gpu_test(gpu_coalesce tests/gpu_coalesce.s
+                 tests/gpu_global.data32 gpu_coalesce.expect 300)
+
     # What the five tests above cannot reach.  gpu16.v is the scalar unit, so
     # simulation covers about a third of the ISA; the vector ALU, the matrix
     # unit, LDS and the exec mask are pinned by their encodings instead, which

@@ -542,10 +542,22 @@ System registers for `s_rd_sys`:
 | 10 | `perf_mma_busy` | cycles the matrix unit has been busy |
 | 11 | `perf_gmem_bytes` | global bytes moved by this workgroup |
 | 12 | `perf_lds_cycles` | LDS port cycles consumed by this workgroup |
+| 13 | `perf_gmem_trans` | global transactions issued by this workgroup |
 
-System registers 8-12 are not decoration: section 7.4 uses them to make the
+System registers 8-13 are not decoration: section 7.4 uses them to make the
 benchmark self-measuring, so that tier-1 predictions can be falsified by the
 RTL without a separate instrumentation harness.
+
+`perf_gmem_trans` counts transactions in section 3.1's sense - one per
+distinct aligned 64-byte block per access - and it is the one counter that is
+about the memory *system* rather than about the program.  `perf_gmem_bytes`
+is the bytes a kernel asked for, which is section 7.2's `Bytes` metric and the
+denominator of AI; the two numbers are equal only when every access is
+perfectly coalesced, and section 3.1's own worked example is a fill that runs
+at 50% transaction efficiency.  Without a counter of its own the transaction
+rule - the rule the whole memory system is built on - would be observable only
+as an unexplained difference in `perf_cycles`, which is a poor thing to write
+a regression test against.
 
 ### 4.4 Scalar control flow
 

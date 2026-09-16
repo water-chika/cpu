@@ -1031,11 +1031,11 @@ struct asm_gpu16 {
             if (kind == GPU16_K_ACCIDX && v > 31) {
                 return ASM_ERR_MOD_RANGE;       // 32 accumulators, section 2.3
             }
-            // Section 4.3 lists the system registers as 0-5 and 8-12.  Six,
-            // seven and everything above twelve read as nothing in
+            // Section 4.3 lists the system registers as 0-5 and 8-13.  Six,
+            // seven and everything above thirteen read as nothing in
             // particular, so they are refused rather than assembled into a
             // load of whatever the hardware happens to leave on the bus.
-            if (kind == GPU16_K_SYSREG && (v > 12 || v == 6 || v == 7)) {
+            if (kind == GPU16_K_SYSREG && (v > 13 || v == 6 || v == 7)) {
                 return ASM_ERR_MOD_RANGE;
             }
             if (v > 255) {

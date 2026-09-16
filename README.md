@@ -595,9 +595,33 @@ reconverges by restoring the mask it saved in an SGPR.  Section 1.2's rule
 that a disabled lane still *reads* its operands is what makes ```v_bpermute```
 and ```v_readlane``` well defined while the wave is divergent.
 
-The matrix unit (4.7), the per lane memory accesses (the rest of 4.8) and LDS
-(4.9) are still absent, and their opcodes still report ```unknown opcode```
-rather than guessing.
+```gpu16_gmem.v``` is global memory as wide as section 3.1 says it is: the
+array underneath is still 32 bit words, so a ```.data32``` file loads into it
+with one ```$readmemh```, but the port on the outside is one aligned 64 byte
+block per cycle.  The memory unit in ```gpu16.v``` is what turns sixteen lane
+addresses into transactions, and it implements section 3.1's rule literally -
+sort the enabled lanes' addresses into distinct aligned 64-byte blocks and
+spend one cycle per distinct block - so sixteen lanes reading four
+consecutive bytes each cost one cycle and sixteen lanes walking a matrix
+column cost sixteen.  At the register file end it moves one VGPR per cycle,
+which is one cycle for a 1 or 4 byte access and four for ```v_ld16_g``` or
+```v_st16_g```, exactly the argument section 4.8 makes for why a wide access
+needs no extra register file port.  The wave stalls for those cycles, so
+```s_waitcnt_g``` still has nothing to wait for.
+
+The whole of section 4.8 now runs: ```v_ld_g```, ```v_ld_gs```,
+```v_ld4_g```, ```v_ld16_g```, ```v_st_g```, ```v_st4_g```, ```v_st16_g```
+and ```s_ld_g```.  The matrix unit (4.7) and LDS (4.9) are still absent, and
+their opcodes still report ```unknown opcode``` rather than guessing.
+
+The one thing added to the ISA rather than implemented from it is system
+register 13, ```perf_gmem_trans```: the transaction count.  Section 4.3's
+counters can see the bytes a kernel asked for but not how many port cycles it
+took to move them, and those are different numbers whenever an access is not
+perfectly coalesced - section 3.1's own worked example is a fill that runs at
+50% transaction efficiency.  Without it the rule the whole memory system is
+built on would be observable only as an unexplained difference in
+```perf_cycles```, which is a poor thing to write a regression test against.
 
 ```asm_gpu16``` is the assembler, and it is the whole ISA rather than the
 part that runs: all 97 documented instructions assemble, scalar and vector
@@ -613,8 +637,8 @@ in for an address anywhere the ISA takes one, not only after ```la``` -
 ```s_imm s7, target``` for a plain word address.  ```la s10, target``` is one
 ```s_addpc```, because unlike cpu8 this machine can add to its own PC.
 
-```testgpu.v``` is its testbench, modelled on ```test16.v```, and the nine
-```gpu_*``` CTests assemble a program with ```asm_gpu16```, run it on
+```testgpu.v``` is its testbench, modelled on ```test16.v```, and the
+thirteen ```gpu_*``` CTests assemble a program with ```asm_gpu16```, run it on
 ```gpu16.v``` and check all sixteen scalar registers.  A gpu16 program must
 reach ```s_endpgm```: unlike cpu16, running off the end is a failure even if
 the registers look right.  The five scalar programs' ```.expect``` files were
@@ -636,6 +660,29 @@ cannot tell this machine from one with no exec mask at all, and the whole
 difference is in lanes 1..15 keeping what they had.  Deleting the exec term
 from the vector write, or the exec AND from ```v_cmp```, or the lane select
 from ```v_writelane```, each fails at least one of them.
+
+Four more programs cover section 4.8.  ```gpu_global``` and ```gpu_gstore```
+check what the loads bring back and what the stores leave behind, including
+the two halves of the exec rule - a masked store must not touch the disabled
+lanes' *memory*, a masked load must not touch their *registers* - and
+```gpu_gwide``` does the same for the 256 bytes an instruction of the
+```v_*16_g``` family moves.  All three run against a data file whose only rule
+is that the byte at address ```a``` holds ```a & 0xff```, so every expected
+word is a function of its address and a load that lands one byte or one lane
+out of place cannot accidentally match.
+
+```gpu_coalesce``` is the one that checks something values cannot see.  A
+machine that issues sixteen transactions for every access returns exactly the
+same data as one that coalesces, so the test reads ```perf_gmem_trans``` either
+side of five accesses of known shape and asserts 1, 16, 2, 4 and 1
+transactions, and reads ```perf_cycles``` either side of two of them to show
+the cost is real: seven cycles for the access that costs one transaction and
+twenty-two for the one that costs sixteen, a difference of exactly one cycle
+per extra transaction.  Ten mutations of the memory unit were run against
+these four tests - no coalescing at all, a 32-byte block index, exec ignored
+on either side, a big-endian quad, both address truncations removed, a byte
+store that writes the whole word, and a ```v_ld_gs``` that zero extends - and
+every one of them fails at least one test.
 
 Simulation can only reach the part of the ISA that ```gpu16.v``` implements,
 so ```gpu_encoding``` covers the rest: it assembles all 97 instructions and
@@ -692,12 +739,11 @@ compiles every ```*.v``` on its own with ```-Wall``` and fails on any message.
   ```unknown opcode``` for them.  Only ```cpu16.v``` has the second program
   memory port they need.
 * ```variables_to_registers``` is not implemented.
-* ```gpu16``` has no matrix unit, no LDS and no per lane memory access, and
-  therefore none of section 7.4's kernels yet - a kernel that computes needs
-  a way to get its data in.  ```asm_gpu16``` assembles the instructions they
-  would need, but nothing can execute them, so those are held down by
-  ```gpu_encoding``` rather than by simulation.  Its global loads complete in
-  one cycle, so
-  ```s_waitcnt_g``` is architecturally required but does nothing; there is
-  deliberately no forwarding from a load into the next instruction, so a
-  program that omits the wait does not accidentally work.
+* ```gpu16``` has no matrix unit and no LDS, and therefore none of section
+  7.4's kernels yet - a kernel that computes needs somewhere to stage what it
+  computes on.  ```asm_gpu16``` assembles the instructions they would need,
+  but nothing can execute them, so those are held down by ```gpu_encoding```
+  rather than by simulation.  Global accesses complete before the next
+  instruction issues, so ```s_waitcnt_g``` is architecturally required but
+  does nothing; there is deliberately no forwarding from a load into the next
+  instruction, so a program that omits the wait does not accidentally work.

@@ -1,0 +1,35 @@
+// gpu_coalesce.s: the sixteen scalar registers, s0 first.
+//
+// s5..s9 are transaction counts, read out of system register 13 either side
+// of one access each, and they are section 3.1's rule written as five
+// numbers: one transaction per distinct aligned 64-byte block touched by the
+// enabled lanes, whatever the access width.
+//
+// s10 and s11 are the cycles from the perf_cycles read before an access to
+// the one after it - seven for the access that costs one transaction and
+// twenty-two for the one that costs sixteen.  The difference is exactly
+// fifteen, one cycle per extra transaction, which is the 64 B/cycle port.
+// The seven is four fixed instructions plus the three cycles of the access
+// itself: issue, one transaction, one VGPR written back.
+//
+// s12 is perf_gmem_bytes: 64 + 64 + 64 + 256 + 64 = 512 bytes asked for.
+// s13 is perf_gmem_trans: 1 + 16 + 2 + 4 + 1 = 24 transactions to move them.
+// The two are not the same measurement, which is the point of the counter:
+// 512 bytes in 24 transactions is 512 / (24 * 64) = 33% transaction
+// efficiency, and nothing in the 8-12 range can see that.
+00000000
+00000000
+00000000
+00000000
+xxxxxxxx  // s4 is the scratch the deltas are taken against
+00000001  // s5   lane*4,  4 B each: one 64 byte block
+00000010  // s6   lane*64, 4 B each: sixteen blocks, 1/16 rate
+00000002  // s7   lane*8,  4 B each: two blocks
+00000004  // s8   lane*16, 16 B each: 256 bytes is four blocks
+00000001  // s9   the store coalesces by the same rule
+00000007  // s10  cycles around the one-transaction load
+00000016  // s11  cycles around the sixteen-transaction load: 7 + 15
+00000200  // s12  perf_gmem_bytes
+00000018  // s13  perf_gmem_trans
+00000000
+00000000
