@@ -1,11 +1,22 @@
 # cpu32 - widening the ISA until Linux boots on it
 
-**Status: skeleton.** Headings and one line of intent each. Sections are
-filled in and pushed one at a time; anything still one line has not been
-thought through yet, and should not be quoted.
+**Status: complete first draft.** Every section is written. Nothing in it has
+been implemented, measured or built; section 9 collects every claim that is a
+prediction rather than a reading of the RTL.
 
 **Scope: plan only.** No RTL and no toolchain code changes anywhere in this
 document's commits. The existing 69 CTest tests are not touched.
+
+**The one-paragraph version.** Widening the data path is the part that is
+already mostly done - `gpu16.v`'s scalar unit *is* a 32-bit `cpu16.v`, so
+promote it rather than widening `cpu16.v` a second time (section 2). What is
+missing is not width: it is a load/store unit, a trap architecture, a timer,
+a console and a boot path, eleven hardware prerequisites of which the
+repository has none (section 3). All of that RTL is four to eight months of
+evenings; the compiler and the kernel port after it are one to three years
+(sections 4, 8). Keep the ISA, but borrow the RISC-V *privileged model* while
+keeping your own encodings - it is free and it removes most of the design
+risk (section 7.4).
 
 ---
 
@@ -991,15 +1002,205 @@ on a board is then an engineering exercise with a known answer.
 
 ## 7. The RISC-V question
 
-Stated fairly, in a section of its own: what adopting RV32 would buy, what it
-would cost, and under which goal each answer wins.
+This section exists because the plan would be dishonest without it. The
+stated goal is to widen *this* ISA, and nothing below overrides that; what
+follows is the tradeoff argued properly, so that the choice is made rather
+than defaulted into.
+
+### 7.1 The asymmetry, stated first
+
+Sections 4 and 5 put the RTL - the whole CPU, S0 to S7 - at four to six
+months of evenings, and the compiler and kernel port at one to three years.
+**Roughly 80% of the cost of "Linux on my ISA" is in the two components that
+have nothing to do with the ISA being yours**, and both of them are free for
+RV32 and only for RV32:
+
+* a mature LLVM and GCC backend, an assembler, a linker, musl, uClibc-ng,
+  newlib, and BusyBox builds that already work;
+* `arch/riscv/` in the kernel tree, with a live nommu configuration,
+  maintainers, and a body of people who will answer a question about it;
+* a reference implementation to diff against when a boot hangs at a point no
+  message explains - which, on a port of one's own, is the failure mode that
+  ends projects.
+
+The fair statement of the tradeoff is not "RISC-V is better". It is:
+**adopting RV32IMA_Zicsr plausibly converts a 2-4 year project into a 6-18
+month one, and the thing being given up is the part that made it interesting.**
+
+### 7.2 What adopting RV32 would actually cost
+
+Not zero, and the usual telling understates it:
+
+* **The existing family argument dies.** `gpu_isa.md` 4.3 and 4.13 spend real
+  effort establishing that gpu16's scalar unit *is* cpu16 widened, with
+  identical opcode numbers where the operations coincide. Adopting RISC-V for
+  cpu32 makes the lineage cpu8 -> cpu16 -> gpu16, full stop, with an
+  unrelated fourth core beside it. That is a genuine loss of the repository's
+  organising idea, not a sentimental one.
+* **The encoding is not free to implement.** RV32I's immediate fields are
+  famously scattered across the instruction word for hardware reasons that
+  matter at a scale this project is not at; a hand-written decoder for it is
+  fiddlier than a hand-written decoder for an ISA designed by the person
+  writing it. The privileged spec (traps, CSRs, the `sv32` page table format)
+  is a hundred-odd pages that must be implemented *as specified* - no
+  shortcuts, because the whole value is that existing software assumes them.
+* **It stops being a design project and becomes an implementation project.**
+  Every interesting question in sections 2, 3 and 4 - how many registers,
+  what shape the trap mechanism is, what the CSR space looks like - is
+  answered in advance by a document. For someone whose stated aim is their
+  own ISA, that is the cost, and it is the largest one.
+* **The compliance burden is real.** "RV32IMA" means passing `riscv-tests`
+  and ideally the architectural test suite; a partial implementation gets the
+  *worst* of both worlds, since the toolchain assumes conformance and fails in
+  ways that look like software bugs.
+
+### 7.3 Which goal picks which answer
+
+| If the goal is... | Then |
+|---|---|
+| **"I designed a CPU and Linux runs on it"** | your own ISA. The prize is the ISA; the boot is the proof. Accept 2-4 years. |
+| **"I want to see Linux boot on hardware I built, this year"** | RV32IMA. The CPU is still yours; only the ISA is borrowed, and writing a conformant RV32 core from scratch is a real and respected exercise. |
+| **"I want to learn how an ISA becomes an operating system"** | your own ISA, because the lessons are exactly in the parts RISC-V hands you. |
+| **"I want the GPU and the CPU to stay one family"** | your own ISA, decisively. There is no version of this where cpu32 is RISC-V and `gpu_isa.md` 4.13 still means anything. |
+| **"I want something other people can use"** | RV32IMA. |
+
+### 7.4 The third option, which is the one worth taking seriously
+
+**Keep the ISA, and borrow the *architecture* where borrowing is free.**
+
+The expensive parts of section 3 are not the instruction encodings; they are
+the *models* - what state a trap saves, how a CSR space is numbered, what a
+page table entry contains, what the boot protocol passes. Those can be copied
+from the RISC-V privileged specification into an ISA with entirely different
+encodings, and doing so costs nothing and buys a lot:
+
+* the design questions are pre-answered by a specification known to work,
+  which removes the most likely source of a fatal late discovery;
+* the kernel port of 3.10 becomes an adaptation of `arch/riscv/`'s structure
+  rather than an invention, which is where most of the 10-20k lines come from
+  anyway;
+* the compiler port is unaffected either way - it depends on the encodings,
+  which stay yours.
+
+Concretely: a `mstatus`-shaped status word, an `mcause`-shaped cause
+encoding, `mtvec`/`mepc`/`mtval`-shaped registers, an `sv32`-shaped page
+table, an FDT boot protocol with the DTB pointer in a defined register. None
+of that makes the ISA RISC-V; all of it makes the hard parts of sections 3.3,
+3.7 and 3.9 into transcription instead of design.
+
+### 7.5 Recommendation
+
+**Keep your own ISA. Take section 7.4's borrowing. Do not adopt RV32 unless
+the goal in the table above changes** - and if it does change, notice it
+explicitly and early, because the expensive thing is to spend a year on a
+compiler backend and *then* decide the ISA was not the point.
+
+One concrete hedge, which costs nothing today: **do not let the ISA churn
+after S8 starts.** Whatever it is by then is what the compiler encodes, and
+every later change costs a compiler change plus a rebuild of everything. The
+version of this project that fails is not the one that chose the wrong ISA;
+it is the one that was still changing it while writing the compiler for it.
+
+---
 
 ## 8. What this costs, and what could stop it
 
-A total effort estimate with its assumptions exposed, and the specific things
-that would end the project rather than merely delay it.
+### 8.1 The total estimate
+
+Summing section 4, in evenings-and-weekends, for one person:
+
+| Block | Range |
+|---|---|
+| S0-S2: extract, widen, load/store | 1.5-3 months |
+| S3-S4: traps, timer, interrupts | 1.5-3 months |
+| S5-S7: console, big memory, privilege | 1.5-2.5 months |
+| **All RTL to a Linux-capable core** | **4-8 months** |
+| S8: compiler toolchain | 4-12 months |
+| S9: `arch/cpu32/` nommu port to a shell | 6-18 months |
+| **To a shell prompt in simulation** | **1.5-3.5 years** |
+| S10: MMU, `fork()`, a general system | +3-9 months |
+| S12: on real hardware with DDR | +2-6 months |
+| **To Linux on an FPGA you can log into** | **2-4.5 years** |
+
+Assumptions, exposed so they can be disagreed with: roughly 6-10 hours a
+week, sustained; no prior LLVM-backend or kernel-port experience, but
+substantial experience with everything else in this repository; existing
+minimal ports are read and adapted rather than everything being invented;
+no second person.
+
+**Double the compiler and kernel numbers if the LLVM backend is a first
+one.** That is not pessimism, it is what the learning curve costs, and the
+estimate above already assumes the reading time is included - badly.
+
+### 8.2 What could stop it
+
+Ordered by how likely each is to actually be the thing that ends it.
+
+1. **The compiler stalls.** Most likely by a wide margin. A backend that
+   compiles small functions is a few months; one that compiles the kernel is
+   a different thing, and the gap between them is filled with relocations,
+   calling-convention corners, inline-assembly constraints and optimisation
+   bugs that present as kernel misbehaviour. **Mitigation:** build the libc
+   and BusyBox *before* attempting the kernel, since they exercise nearly the
+   same surface and fail more legibly.
+2. **Debugging a kernel with no tools.** A hang between the entry point and
+   the first console character has no output, no debugger and no reference
+   implementation. **Mitigation:** S5's console first and `earlycon` as early
+   as possible; an instruction trace from the simulator; and 7.4's borrowing,
+   so the kernel's expectations are a document rather than a guess.
+3. **Simulation speed.** If P4 is right, iverilog cannot run a boot, and the
+   whole of S9 depends on a Verilator migration that has not been attempted.
+   **Mitigation:** do it at S6, not at S9.
+4. **ISA churn after the compiler exists.** Section 7.5. Self-inflicted and
+   entirely avoidable, which is why it is this high.
+5. **Memory and the board.** Section 6.3. This stops *hardware*, not the
+   project: simulation is a complete and honest home for S9.
+6. **Scope drift into the interesting part.** This repository's own history
+   shows the pattern - a GPU, a matrix unit, three assembler backends, a
+   compiler with a fuzzer. All excellent, none of them Linux. The Linux path
+   is unusually long and unusually short of rewards in the middle; S5's
+   console and S9's staged transcripts exist partly to manufacture some.
+7. **The MMU.** Only a threat if attempted early. Deferring it behind a
+   working nommu boot removes it from this list almost entirely.
+8. **Something genuinely unforeseen in the kernel's expectations.** Small but
+   non-zero: a new architecture occasionally trips over an assumption nobody
+   documented because every existing port happened to satisfy it. 7.4's
+   borrowing is the cheapest insurance available against this.
+
+### 8.3 The blunt summary
+
+Booting Linux on your own ISA from where this repository stands today is a
+**two to four year evening project, of which at most a fifth is CPU design**.
+Nothing in it is research; every stage is known work by someone. The CPU is
+the small part, the compiler and the kernel port are the project, and the
+single highest-value decision available today is the one in section 7.4:
+keep the ISA, borrow the architecture, and stop changing the encodings before
+the compiler starts.
+
+---
 
 ## 9. Predictions
 
-Everything above that is a guess, collected in one place and labelled, so a
-later reader can check it rather than inherit it.
+Everything above that is a guess rather than a reading, collected so a later
+reader checks it instead of inheriting it. Nothing in this table has been
+measured; **no code was written, no tool was run, and no board was touched in
+producing this document.**
+
+| # | Prediction | Section | How to falsify it |
+|---|---|---|---|
+| P1 | Splitting the scalar unit out of `gpu16.v` is a few-hundred-line refactor, not a rewrite | 2.4 | do S0; count the diff |
+| P2 | 16 registers is enough for a workable C ABI, 32 is comfortable | 3.1 | the compiler port will say, loudly, in S8 |
+| P3 | Precise exceptions are nearly free on a pipeline this short | 3.3 | implement S3 and see whether any instruction can half-commit |
+| P4 | iverilog runs this design at 10^4-10^5 cycles/s, so a boot (10^8-10^9 cycles) is hours to weeks; Verilator is 100-1000x faster | 4.3 | time 10^6 cycles of `testgpu.v` under both. **Cheap to check, and worth checking early** |
+| P5 | A cpu32 assembler is a fourth `asm_kernel.hpp` struct plus a `main()` | 5.1 | write it |
+| P6 | An LLVM backend that compiles the kernel is 4-9 months of evenings for a first-timer | 5.3 | only time tells; track it against the estimate monthly |
+| P7 | The S0-S7 core is ~5-8k LUTs and ~1.2k FFs | 6.1 | one synthesis run, which `fpga_bringup.md` 4.2 has been waiting for anyway |
+| P8 | A minimal nommu kernel is 2-4 MiB, and 8-16 MiB is enough to reach a shell | 6.2 | build a nommu kernel for an existing small architecture and measure it. **Also cheap, also worth doing early** |
+| P9 | Adopting RV32 converts a 2-4 year project into a 6-18 month one | 7.1 | unfalsifiable without doing both; treat it as an order-of-magnitude claim only |
+| P10 | Borrowing the RISC-V privileged *model* while keeping your own encodings costs nothing and removes most of the design risk in 3.3, 3.7 and 3.9 | 7.4 | S3 will show it: count how many design questions had to be invented versus transcribed |
+| P11 | Total: 1.5-3.5 years to a shell in simulation, 2-4.5 years to hardware | 8.1 | keep a log; revise this table rather than the memory of it |
+| P12 | The compiler, not the kernel and not the RTL, is the most likely thing to end the project | 8.2 | it either does or it does not |
+
+P4 and P8 are the two that are **cheap to settle now**, cost a single evening
+each, and would materially change the shape of section 4 if either came back
+badly. If any part of this document is acted on first, it should be those.

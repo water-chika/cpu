@@ -944,6 +944,22 @@ so not one of the six benchmark kernels in
 [```docs/gpu_isa.md```](docs/gpu_isa.md) section 7 can run, on a board or in
 simulation.
 
+## Widening it to 32 bits, and Linux
+
+[```docs/cpu32_linux.md```](docs/cpu32_linux.md) asks what it would take to
+boot a Linux kernel on this family's own ISA, and answers it honestly rather
+than optimistically.  Three things in it are worth knowing without reading
+the whole document.  The width is the part that is already done - ```gpu16```'s
+scalar unit *is* a 32 bit ```cpu16.v``` by construction, so the plan promotes
+it rather than widening ```cpu16.v``` a second time.  What is actually
+missing is a scalar load/store unit (```gpu16``` has ```s_ld_g``` and no
+store at all), a trap architecture, a timer, a console and a boot path -
+eleven hardware prerequisites of which this repository has none.  And the CPU
+is the small part: all of that RTL is months, while the compiler backend and
+the kernel port after it are years.  It is a plan and not a build; nothing in
+it has been implemented or measured, and its section 9 lists every claim that
+is a prediction.
+
 ## Removed modules
 
 Two modules were deleted rather than repaired, because neither could be given
