@@ -546,15 +546,209 @@ data path is the part of this project that is already mostly done.
 
 ## 4. The staged sequence
 
-Stages S0..Sn, each one independently testable in the existing
-iverilog + CTest harness, each with a stated pass criterion and a stated
-unit of time - weeks or months.
-
 ### 4.1 How a stage is judged done
+
+Three rules, taken from how this repository already works rather than
+invented for this document:
+
+1. **A stage ends with a CTest that fails before it and passes after it.**
+   `docs/fpga_bringup.md` 4.3's rule - "no bitstream is built for a
+   configuration that has not first passed the tests" - generalises: no stage
+   is claimed without a test that would have caught its absence. The
+   `gpu_gfar` test in commit 308421e is the model: it was checked to *fail*
+   against the old configuration before it was checked in.
+2. **Existing tests do not change.** All 69 stay green, byte for byte,
+   through every stage. Where a stage makes that impossible the plan says so
+   in advance (only S0 comes close, and it must not).
+3. **Where a C++ model exists, the RTL is cross-checked against it.** The
+   `xcheck_*` family and `c16_fuzz_rtl` are worth more than any `.expect`
+   file, and a `cpu32_sim.cpp` beside `cpu16_sim.cpp` should be built as the
+   ISA grows, not afterwards.
+
+**The verdict function has to change partway through**, and it is better to
+know that now. `tests/run_test.sh` runs N cycles and diffs the final register
+file. That is right for an instruction and meaningless for a boot. From S5
+the verdict becomes *"the bytes the UART transmitted match this expected
+transcript"*, which is a new testbench and a new runner script alongside the
+old ones - not a change to them, and not RTL.
 
 ### 4.2 The stages
 
+Estimates are **for one person working evenings and weekends**, which is what
+this repository visibly is. They assume no hardware is involved until S12.
+All of them are predictions (section 9).
+
+---
+
+**S0 - Split the scalar unit out of `gpu16.v`.**
+Produce `cpu32.v` holding the fetch, decode, scalar ALU, branch and
+system-register logic; `gpu16.v` instantiates it and keeps the vector,
+matrix, LDS, exec-mask and global-port logic.
+*Pass criterion:* all 69 tests green, **zero `.expect` files touched**, and
+`verilog_lint` clean on the new file. This is precisely the derisking
+argument `gpu_isa.md` 4.13 already made for the synthesis clean-up.
+*Effort:* **1-2 weekends.** Pure refactor, well fenced by 26 gpu tests.
+
+---
+
+**S1 - A byte-addressed 32-bit PC, and a narrow memory port.**
+Replace the 16-bit word-addressed PC with a 32-bit byte-addressed one (so
+`s_addpc`, `s_call` and the `_i` branches change units), and give the core a
+word-wide instruction and data port with **`ready`/`valid`** rather than the
+64-byte block port.
+*Pass criterion:* a new `cpu32_branch` test - a program that branches
+backwards and forwards past 64 KiB - plus the 69 unchanged. The stall path
+gets its own test: a testbench memory that deasserts `ready` on a fixed
+pattern, with identical final registers to one that never stalls.
+*Effort:* **2-4 weekends.** The ready/valid stall is the part that will take
+longer than expected; it is the first time anything in this repository can be
+told "not yet" (commit 308421e says exactly this about the GPU's port).
+
+---
+
+**S2 - The scalar load/store unit.**
+`lb`, `lbu`, `lh`, `lhu`, `lw`, `sb`, `sh`, `sw` with register+immediate
+addressing, and a misalignment detection signal that goes nowhere yet.
+*Pass criterion:* `cpu32_ldst`, covering each width, both sign extensions,
+and store-then-load at every byte offset within a word; plus an `xcheck`
+against `cpu32_sim.cpp`.
+*Effort:* **2-4 weekends.** This is the first genuinely new datapath - see
+1.1: gpu16 has no scalar store at all.
+
+---
+
+**S3 - The trap architecture.** The big one before the toolchain.
+Writable system registers (a real CSR space, generalising `s_rd_sys`),
+`EPC`, cause, trap-value, vector base, a status word with an
+interrupt-enable bit and a saved copy, a `trap-return` instruction, a
+`syscall` instruction, and traps raised by illegal instruction and by the
+misalignment signal S2 left dangling.
+*Pass criterion:* `cpu32_trap` - a program that installs a handler, then
+deliberately executes an illegal instruction, a misaligned load and a
+syscall, and whose handler records each cause in a register before returning.
+The test passes only if all three causes appear in the right order and the
+program then reaches its end normally. A second test proves the
+enable/disable bit by taking a trap with interrupts masked and checking it is
+*not* taken.
+*Effort:* **1-2 months.** Not because any one piece is hard, but because this
+is where an ISA acquires state that everything else must then save, restore
+and agree about, and where the bugs are non-local. Budget for getting the
+trap-return atomicity wrong once.
+
+---
+
+**S4 - Timer and interrupts.**
+A free-running counter (extend `perf_cycles`), a comparator, an interrupt
+output, and an external interrupt input reaching the S3 trap mechanism.
+*Pass criterion:* `cpu32_timer` - enable interrupts, arm the comparator for
+`now + K`, spin; the handler increments a register and re-arms. After N
+cycles the register holds the arithmetically predicted count. That number is
+checkable by hand, which is what makes it a good test.
+*Effort:* **2-3 weekends.** Cheap, and it is what makes S3 provably real.
+
+---
+
+**S5 - A UART, and the transcript harness.**
+A polled memory-mapped TX register, then RX. Alongside it: `run_console_test.sh`
+and a testbench that collects transmitted bytes into a file and diffs them
+against a `.expect` transcript.
+*Pass criterion:* `cpu32_hello` - a program that writes a fixed string and
+halts; the transcript matches exactly.
+*Effort:* **1-2 weekends** for the UART, **1 weekend** for the harness. Low
+risk, high leverage: everything after this is debuggable.
+
+---
+
+**S6 - Memory, in simulation, at Linux scale.**
+A simulation memory of tens of MiB behind the S1 ready/valid port, and a load
+path that fills it from a file in one go rather than a word per cycle.
+*Pass criterion:* a `cpu32_far` test in the spirit of `gpu_gfar` - write two
+patterns megabytes apart, read both back - which must be verified to **fail**
+against a small memory before it is checked in.
+*Effort:* **1-2 weekends.** Also the point at which to move simulation from
+`iverilog` to **Verilator** for speed; see 4.3. That migration is tooling, not
+RTL, and the iverilog path stays as the lint and reference.
+
+---
+
+**S7 - Two privilege levels.**
+A current-privilege bit, a saved-previous-privilege bit, privileged
+instructions and CSRs faulting in user mode, and a defined user/supervisor
+split of the address space.
+*Pass criterion:* `cpu32_priv` - user-mode code attempts a privileged CSR
+write and a `trap-return`, and both must trap with the right cause; the
+handler returns to user mode and the program completes.
+*Effort:* **2-4 weekends**, *if* the bits were reserved in S3. Months if they
+were not - which is the whole argument of 3.4.
+
+---
+
+**S8 - The compiler.** See section 5. An LLVM backend for cpu32, or a GCC
+port.
+*Pass criterion:* the compiler builds a small C program; the program runs on
+the RTL through the S5 transcript harness and prints what it should. Then the
+real one: **it builds `newlib` or a small libc, and then BusyBox.**
+*Effort:* **4-12 months.** This is the largest single item in the plan after
+the kernel port, and section 5 argues it cannot be avoided by growing `c16`.
+
+---
+
+**S9 - `arch/cpu32/`, nommu.** See 3.10.
+*Pass criterion:* staged, because "it booted" is not one event. In order:
+(a) the entry point is reached and `earlycon` prints one character;
+(b) `start_kernel` reaches the console handover and prints the banner;
+(c) the timer tick is counted and `Calibrating delay loop` completes;
+(d) the kernel panics with `No working init found` - **this is a success**,
+    it means the whole kernel ran;
+(e) `init` from an initramfs runs;
+(f) a shell prompt, and `echo hello` works.
+Each of (a)-(f) is a checked-in transcript `.expect` file and therefore a
+CTest.
+*Effort:* **6-18 months.** The range is wide and honestly so: how much can be
+adapted from an existing minimal port dominates it.
+
+---
+
+**S10 - The MMU.** Software-refill TLB, page-table format, fault reporting,
+invalidation, and `CONFIG_MMU=y`.
+*Pass criterion:* the S9 (f) transcript, with `fork()` working - the simplest
+honest demonstration being a shell script that pipes one command into
+another, which nommu cannot do.
+*Effort:* **3-9 months.**
+
+---
+
+**S11 - SMP, atomics, a second core.** Everything 3.8 defers.
+*Effort:* **months**, and out of scope until S10 is done.
+
+**S12 - Hardware.** Follow `docs/fpga_bringup.md`, whose phases apply
+unchanged; the new constraint is section 6's memory, which is a board
+question, not an RTL one.
+
 ### 4.3 What is weeks and what is months
+
+| Stage | Scale | Why |
+|---|---|---|
+| S0, S4, S5, S6 | **weekends** | refactor, or a small well-understood peripheral with a hand-checkable pass criterion |
+| S1, S2, S7 | **weeks** | new datapath, but local, and testable one instruction at a time |
+| S3 | **1-2 months** | new *architectural state*, whose bugs are non-local |
+| S8 | **4-12 months** | a compiler backend is a project, not a task |
+| S9 | **6-18 months** | a kernel port is a bigger project |
+| S10 | **3-9 months** | as above, with the hardware half attached |
+
+The shape of that table is the real finding of this plan: **S0 to S7 - all of
+the RTL, the entire CPU - is on the order of four to six months of evenings,
+and S8 to S10 is on the order of one to three years.** The machine is the
+cheap part. Everything above it is not.
+
+**A warning about simulation speed, marked as a prediction (P4).** A nommu
+boot to a shell is plausibly 10^8 to 10^9 clock cycles. `iverilog` is an
+interpreter; on a design this size it is likely in the 10^4-10^5 cycles/second
+range, which puts one boot attempt somewhere between *hours and weeks*. That
+is not a debugging loop. Verilator compiles to C++ and should be 100-1000x
+faster, bringing a boot to minutes. **S6 should adopt Verilator, and the
+iverilog path should be kept as `verilog_lint` and as the reference for the
+existing 69 tests.** None of these numbers have been measured here.
 
 ## 5. Toolchain consequences
 
