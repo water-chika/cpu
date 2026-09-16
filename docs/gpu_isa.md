@@ -1399,11 +1399,25 @@ In descending order of how likely it is to be wrong:
    each cycle, which means the VGPR file needs a read path that is not
    lane-local.  On an FPGA this is a wide mux and fine; in a small ASIC tile
    the wiring may be the thing that sets the clock period.
+
+   *RTL update.*  It builds as claimed.  `gpu16_matrix.v` takes the A
+   fragment as a single 32-bit port and `gpu16_vector.v` produces it with one
+   continuous assignment, `vregs[{mat_areg, mat_row}]`, selected by the row
+   counter; nothing in the design needs a second cross-lane path for the
+   matrix unit.  The area argument survives simulation, but the clock-period
+   worry is untouched by it - only synthesis can answer that.
 4. **`exec` semantics for `mma_i8`.**  Reading `vA` from disabled lanes is
    defensible but sharp.  The alternative - forcing `exec = 0xFFFF` and making
    anything else undefined - is simpler to implement and simpler to reason
    about.  I chose the more permissive rule and I am not sure it earns its
    keep.
+
+   *RTL update.*  Implemented as written, and it cost nothing: the A read is
+   unconditional and only the accumulator write is masked, which is one gate
+   fewer than the alternative rather than one more.  `gpu_mma_exec` pins it.
+   `acc_zero` is masked by `exec` as well, by section 1.2's general rule;
+   section 4.7 does not restate it, and that silence is the remaining
+   ambiguity here.
 5. **The global memory port width.** 64 B/cycle is asserted, not derived.  The
    existing `memory.v` has an 8-bit data port.  Everything in section 7 that
    is not explicitly pin-limited assumes a memory system roughly 8x wider than
@@ -1549,7 +1563,13 @@ Six metrics, reported for every kernel at every tier:
   waves;
 * scalar and vector ALU: 1 issue cycle, result bypassed, no stall;
 * `mma_i8`: 1 issue cycle, occupies the matrix unit for 16 cycles; a wave
-  issuing a second `mma` stalls until the unit frees;
+  issuing a second `mma` stalls until the unit frees - where "frees" means
+  the last of the sixteen walking cycles, not the cycle after it, so a
+  back-to-back stream costs 16 cycles per `mma` and not 17.  (The RTL
+  implements it that way because section 7.3's 1024 matrix cycles per
+  workgroup iteration is 4 x 16 x 16; the stricter reading would give 1088.
+  `acc_rd` and `acc_wr` get no such allowance - they touch the accumulator
+  file in their issue cycle.)
 * LDS: 1 issue cycle + 1 port cycle per conflict way; 4-cycle latency,
   non-blocking;
 * global: 64 B/cycle port, one transaction per distinct aligned 64 B block,
@@ -1707,10 +1727,10 @@ What has to be added:
    under `--hex --sep_with_line`.  It is called `asm_gpu16` and not `asm32`:
    `asm` and `asm16` are named after the width of the machine they assemble
    for, so `asm32` would read as a third CPU rather than as the tool for
-   gpu16.  All 97 instructions in sections 4.3 to 4.10 assemble, not only the
-   scalar ones `gpu16.v` can execute; the ones no hardware can run yet are
-   held down by `gpu_encoding`, which compares the words against a checked in
-   expectation and so needs no core.  Labels work as sections 4.4 and 4.3
+   gpu16.  All 97 instructions in sections 4.3 to 4.10 assemble, and since
+   the matrix unit was built `gpu16.v` executes all of them too, so
+   `gpu_encoding` now holds down the *encoding* rather than standing in for
+   missing hardware.  Labels work as sections 4.4 and 4.3
    allow them to: a word offset from `PC_next` for the `_i` branches and
    `s_call`, a plain word address for `s_imm`, and `la` as one `s_addpc`.
 2. `tests/gemm64.s`, `tests/gemm128.s`, `tests/gemm256.s`, `tests/axpy16k.s`,

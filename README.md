@@ -794,8 +794,120 @@ ignored so that every test runs four waves - and every one of them fails a
 test.  Eleven fail ```gpu_wg```; the twelfth, ```launch```, falls to the
 single-wave counter tests, which is the right answer for it.
 
-Simulation can only reach the part of the ISA that ```gpu16.v``` implements,
-so ```gpu_encoding``` covers the rest: it assembles all 97 instructions and
+```gpu16_matrix.v``` is the matrix unit, section 4.7, and the reason the rest
+of the machine exists.  One ```mma_i8``` is ```D += A * B``` with A a 16x4
+```int8``` fragment, B a 4x16 one and D a 16x16 ```int32``` accumulator block:
+1024 MACs in a single instruction word, walked by a 64-MAC array over sixteen
+cycles, one accumulator row per cycle.  That rate is not an implementation
+choice but requirement A1 read backwards - the accumulator file sustains one
+16-lane by 32-bit read-modify-write per cycle and no more, so sixteen rows
+take sixteen cycles, and section 2.3's own note that doubling the array
+without doubling that port would make ```mma_i8``` a 32-cycle instruction is
+the same arithmetic.
+
+The structural claim worth checking in RTL is section 4.7's, because the area
+estimate in section 6 rests on it.  ```vB``` is read per lane: on every cycle
+lane n wants ```B[k][n]```, which lives in lane n's own register, and that is
+free.  ```vA``` is read *across* lanes, which sounds like the expensive case -
+but the unit walks one m per cycle, so on the cycle that computes row m all
+sixteen lanes want the same 32-bit word, the one in lane m.  That is a 16:1
+mux of 32 bits selected by the row counter, not a 16x16 crossbar, and the
+difference is about two orders of magnitude of wiring.  It builds exactly as
+specified: ```gpu16_matrix.v``` takes A as a single ```[31:0] a_frag``` port
+and B as ```[511:0]```, so the property is visible in the module's interface
+rather than buried in an ```always``` block, and a crossbar version could not
+be connected to it without widening the port.  The multiplexing itself is one
+line in ```gpu16_vector.v```, ```mat_a = vregs[{mat_areg, mat_row}]```, which
+is the only place in the design where a register is read from a lane other
+than its own outside ```v_readlane``` and ```v_bpermute```.
+
+The array is one per compute unit and shared by the four waves, arbitrated
+round-robin; the accumulator file is per wave and per lane, as section 2.3
+says.  Section 7.3 is what settles that: "four waves give 324 issue slots
+against 1024 matrix cycles per workgroup iteration" is 4 x 256, which only
+reads as one array the waves queue for.  Round-robin rather than the fixed
+priority the memory ports use, because a wave can re-arm an ```mma``` on the
+cycle its last one retires and under fixed priority would starve its
+neighbours indefinitely.  ```acc_zero``` is a sixteen-cycle walk too, not a
+single-cycle clear of 256 words, for the same port reason - but it does not
+request the array, so it does not show up in ```perf_mma_busy```.
+
+Six tests check the value and two the timing.  ```gpu_mma``` seeds a block
+through ```acc_wr``` with ```C0[m][n] = 0x1000 + 16m + n``` - a function of
+both indices, so a tile that is transposed or one row out of place cannot
+match even before the products are added - accumulates two K steps onto it
+with no manual wait anywhere, and reads all sixteen rows back with
+```acc_rd```; it works in block A1 with A0 filled with something else, so the
+top bit of the five-bit accumulator number is under test as well.
+```gpu_mma_z``` poisons all thirty-two accumulators and then takes both of
+section 4.7's routes to a fresh tile, ```acc_zero``` plus ```mma_i8``` in one
+block and ```mma_i8_z``` in the other, and subtracts the two blocks *in the
+machine* into ```s8``` - so that half of it does not depend on the
+expectation file being right at all.  ```gpu_mma_exec``` is section 4.7's
+sharp edge: with ```exec = 0x0f0f``` the disabled lanes keep their old
+accumulators but still supply their A row, so a unit that masked the A read
+would corrupt rows that the mask was supposed to protect.
+
+The other two are a matched pair, and they are the reason the mutation table
+below means anything.  A matrix unit that reads B across lanes and A per lane
+computes a perfectly respectable product - the transpose of the right one -
+and no amount of checking a symmetric example will notice.  ```gpu_mma_sym```
+is that symmetric example, ```D = As * As^T``` built so the answer equals its
+own transpose, and it is in the suite to be *passed* by that bug;
+```gpu_mma_map``` runs the same program on an asymmetric product where all 240
+off-diagonal entries differ from their transpose, and catches it.
+
+Every ```.expect``` and ```.vexpect``` here is computed by
+```tests/gen_mma_expect.py```, which is section 4.7's loop transcribed into
+Python, and none was ever read back from the simulator - an expectation is
+worth exactly what its provenance is worth.  ```gpu_mma_expect``` re-runs the
+generator inside CTest and diffs its output against the checked-in files, so
+a later session cannot quietly repair a failing test by pasting in what the
+hardware printed.
+
+```gpu_mma_perf``` measures what no computed value can see, and its three
+numbers were predicted from the document before the simulator was run: an
+```acc_zero``` stretch of 19 cycles, eight back-to-back ```mma_i8``` of 131,
+and ```perf_mma_busy``` on sysreg 10 advancing by exactly 128.  The middle
+one is the headline: **an ```mma_i8``` costs 16 cycles, matching section
+4.7**, and back-to-back is 16 and not 17 only because the next matrix
+instruction is allowed to issue on the walk's last cycle.  Model-A's "a wave
+issuing a second ```mma``` stalls until the unit frees" is ambiguous on that
+cycle, and section 7.3's 1024 matrix cycles per workgroup iteration is the
+tie-breaker: 16 x 16 x 4 is 1024, where the stricter reading would give 1088.
+```acc_rd``` and ```acc_wr``` are *not* allowed to slip in that way, since
+they touch the accumulator file in their issue cycle.  ```gpu_mma_wg``` then
+runs four waves of eight ```mma``` each and requires ```perf_mma_busy``` to
+read 512 - four times one wave's 128, with no arbitration overhead and no
+overlap - which is the shared-array claim stated as a number.
+
+So section 7's matrix figures rest on arithmetic that now holds: sixteen
+cycles per ```mma_i8```, additive across the four waves of a workgroup, with
+round-robin arbitration costing nothing because the array is saturated
+whenever anyone is waiting for it.  What is *not* yet measured is the other
+half of the utilisation fraction - 76.1%, 85.3% and 90.7% come from those
+1024 cycles divided by 1056, 1024 + 32 for the barrier, and that denominator
+assumes the 324 issue slots of section 5.3's GEMM kernel hide entirely under
+the matrix work.  Nothing in this harness has run that kernel, so those three
+percentages remain predictions with a confirmed numerator.
+
+Eleven mutations were run against the matrix unit, and each is listed with the
+test that catches it: A and B swapped so the product transposes
+(```gpu_mma_map```, while ```gpu_mma_sym``` passes - exactly the pair they
+were built for), the A fragment read from lane 0 instead of through the row
+mux (everything), the accumulator row index off by one (everything), the
+block select in ```mma_i8``` ignored (```gpu_mma```, ```gpu_mma_z```), the
+block bit of ```acc_rd```/```acc_wr``` ignored (```gpu_mma```), ```exec```
+ignored on the accumulator write (```gpu_mma_exec```), ```mma_i8_z```
+accumulating like ```mma_i8``` (```gpu_mma_z```), ```acc_zero``` filling ones
+instead of zeroes (```gpu_mma_z```), the ```int8``` operands zero extended
+instead of sign extended (everything), the last-cycle issue removed so
+back-to-back ```mma``` costs 17 cycles (```gpu_mma_perf``` alone, since no
+value changes), and the array un-shared so all four waves are granted every
+cycle (```gpu_mma_wg``` alone, for the same reason).
+
+Simulation now reaches every instruction in the ISA, but ```gpu_encoding```
+still covers what no simulation can: it assembles all 97 instructions and
 compares the words against ```tests/gpu_encoding.expect32```, which needs no
 hardware at all.  That expectation was not produced by running the assembler
 - it came from a script that read section 4.2's field table and sections 4.3
@@ -849,10 +961,13 @@ compiles every ```*.v``` on its own with ```-Wall``` and fails on any message.
   ```unknown opcode``` for them.  Only ```cpu16.v``` has the second program
   memory port they need.
 * ```variables_to_registers``` is not implemented.
-* ```gpu16``` has no matrix unit, so none of section 7.4's kernels can run
-  yet.  ```asm_gpu16``` assembles the instructions they would need,
-  but nothing can execute them, so those are held down by ```gpu_encoding```
-  rather than by simulation.  Global accesses complete before the next
-  instruction issues, so ```s_waitcnt_g``` is architecturally required but
-  does nothing; there is deliberately no forwarding from a load into the next
-  instruction, so a program that omits the wait does not accidentally work.
+* ```gpu16``` implements the whole ISA including section 4.7's matrix unit,
+  so nothing in it is held down by ```gpu_encoding``` alone any more.  What
+  has still never been run is section 7.4's GEMM kernels themselves: the
+  matrix unit's sixteen cycles and their sum across four waves are measured,
+  but the utilisation percentages in section 7.3 divide those by a cycle
+  count for a kernel no test here executes.  Global accesses complete before
+  the next instruction issues, so ```s_waitcnt_g``` is architecturally
+  required but does nothing; there is deliberately no forwarding from a load
+  into the next instruction, so a program that omits the wait does not
+  accidentally work.
