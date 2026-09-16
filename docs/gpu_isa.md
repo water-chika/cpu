@@ -1995,7 +1995,17 @@ An Artix-7 board (Arty A7-100T, ~$270) remains the natural intermediate
 step.
 `gpu16-full` needs 64 int8 MACs (32 DSP48E1 slices packing two int8 MACs
 each, of 240 available), 8 KiB of LDS as 8 BRAM18 in 16 banks, and the
-register files in distributed RAM.  100 MHz is comfortable, and the board's
+register files in distributed RAM.  The LDS figure was, for a time, false by
+construction and not merely unproven: `gpu16_lds.v` read its banks
+combinationally, and an asynchronous-read array cannot be a block RAM on any
+Xilinx part, so the tool would have built LUTRAM whatever this table said.
+The LDS banks, the per-wave instruction memories and `gpu16_gmem` now read
+through a register (see `docs/fpga_bringup.md` section 2.2b), which is the
+shape an inference template wants.  That makes the 8 BRAM18 claim *possible*
+rather than *true*: only a utilisation report from a real synthesis run can
+promote it, and no such run has happened.  Add to it, on the same evidence,
+16 more BRAM18 for the four 131 Kbit instruction memories, which this table
+forgot entirely.  100 MHz is comfortable, and the board's
 DDR3 delivers ~1.3 GB/s against the 363 MB/s the kernel wants at 100 MHz, so the FPGA is
 **compute-bound where the silicon is not**:
 
@@ -2076,7 +2086,7 @@ Read honestly, that table says:
 | `gpu16-full` `gemm256` wall clock on silicon | **13.1 ms** | outside 9 - 20 ms |
 | `gpu4-tiny` `gemm256` wall clock on silicon | **330 ms** | outside 230 - 470 ms |
 | `gpu16-full` on Artix-7 at 100 MHz | **2.89 ms**, 5.81 GMAC/s | outside 2.4 - 3.6 ms |
-| Artix-7 resource use | 32 DSP48E1, 8 BRAM18, ~12k LUT | above 64 DSP or 32 BRAM18 |
+| Artix-7 resource use | 32 DSP48E1, 8 BRAM18 of LDS + 16 of instruction memory, ~12k LUT | above 64 DSP or 48 BRAM18 |
 | Total cost to `gpu4-tiny` first silicon | **~$620** | above $1,200 |
 | GMAC/s/mm2 advantage over `cpu16w` | **5.3x** | below 3x or above 12x |
 | GMAC/s/W advantage over `cpu16w` | **70x** | below 30x or above 150x |

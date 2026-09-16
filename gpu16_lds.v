@@ -23,10 +23,15 @@
 // to consecutive banks and why the stride argument in section 3.2 works out
 // as `(m * S/4 + c) & 15`.
 //
-// Reads are asynchronous and writes are byte enabled, for the same two
-// reasons as in `gpu16_gmem.v`: the address is produced by one clock edge and
-// consumed by the next, and `v_st_l` writes one byte per lane, which a
-// word-only write port could only do by reading first.
+// Reads are **synchronous** and writes are byte enabled, for the same two
+// reasons as in `gpu16_gmem.v`: a bank that is read combinationally cannot be
+// a BRAM18 - which is what `gpu_isa.md` section 7.5 predicts these sixteen
+// banks would become - and `v_st_l` writes one byte per lane, which a
+// word-only write port could only do by reading first.  `out_data` therefore
+// belongs to the `bank_row` presented on the previous clock edge, and the
+// memory unit in `gpu16.v` pipelines against that; the conflict rule of
+// section 3.2 is untouched, since it is about how many cycles the banks are
+// asked for and not about when the data comes back.
 //
 // This module does not know what a conflict is.  Resolving sixteen lane
 // addresses into a sequence of conflict-free cycles is the memory unit's job
@@ -55,20 +60,11 @@ module gpu16_lds #(
 );
 
 reg [31:0] mem[0:16*ROWS-1];
+reg [511:0] out_data_r;
 
 integer b;
 integer n;
-
-genvar g;
-generate
-    for (g = 0; g < 16; g = g + 1) begin : bank
-        localparam [3:0] INDEX = g;
-        // {row, bank}: the row picked for this bank, with the bank number in
-        // the low four bits.
-        wire [ROW_WIDTH+3:0] word = {bank_row[ROW_WIDTH*g+:ROW_WIDTH], INDEX};
-        assign out_data[32*g+:32] = mem[word];
-    end
-endgenerate
+integer g;
 
 always @(posedge clk) begin
     for (b = 0; b < 16; b = b + 1) begin
@@ -81,6 +77,13 @@ always @(posedge clk) begin
             end
         end
     end
+    // After the writes, which makes this read-first: each bank returns the
+    // word {row, bank} it was pointed at, registered.
+    for (g = 0; g < 16; g = g + 1) begin
+        out_data_r[32*g+:32] <= mem[{bank_row[ROW_WIDTH*g+:ROW_WIDTH], g[3:0]}];
+    end
 end
+
+assign out_data = out_data_r;
 
 endmodule

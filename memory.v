@@ -18,6 +18,15 @@
 // Reads are write first: a read of the address being written in the same
 // cycle returns the value being written, which is what cpu16's read modify
 // write opcode relies on.
+//
+// `memory` and `program_memory` below are both asynchronous-read and stay
+// that way.  That is a deliberate choice and not an oversight: they are the
+// two CPUs' memories, 256 entries each, which is 2 Kbit and 4 Kbit - far
+// below the 18 Kbit granularity of a block RAM, so distributed RAM is the
+// right primitive for them anyway.  Converting them would also change cpu8's
+// and cpu16's timing, which the nine RTL-vs-C++ cross-check tests pin down
+// cycle for cycle.  `block_memory` at the bottom of this file is the
+// registered-read form, and it is what the *large* arrays use.
 
 module memory #(
    parameter DATA_WIDTH = 8,
@@ -125,5 +134,51 @@ wire [15:0] a_bypassed = b_half ? {b_in_data, a_word[7:0]}
 assign a_out_data = !a_enable ? 16'b0
                   : (b_write && b_address == a_address) ? a_bypassed
                                                         : a_word;
+
+endmodule
+
+// A registered-read memory: the shape a block RAM actually has.
+//
+// `memory` above reads combinationally, which is fine for a 2 Kbit array and
+// wrong for a large one - Xilinx block RAM has a registered read port, so an
+// array read combinationally cannot be a BRAM and the tool builds LUTRAM
+// instead, silently, or falls back to registers where the port count defeats
+// even that.  With `PROGRAM_ADDR_WIDTH = 12` the gpu16 instruction memory is
+// 131 Kbit *per wave* and there are four waves to a compute unit, so that
+// difference is most of a small Artix-7.  See docs/fpga_bringup.md 2.2(b).
+//
+// The template below is the read-first one: the write is scheduled before the
+// read in the same clocked block, so a read of the address being written
+// returns the value from before the write.  Both Xilinx and Altera recognise
+// it.  There is no bypass mux, because a bypass is a combinational path from
+// the write data to the read data and that is exactly what a BRAM cannot do.
+//
+// The cost is that `out_data` belongs to the address presented on the
+// *previous* clock edge.  A user therefore has to present the address one
+// cycle early; gpu16.v's fetch does that by reading with the value the PC is
+// about to take rather than with the PC.
+module block_memory #(
+   parameter DATA_WIDTH = 32,
+   parameter ADDR_WIDTH = 12,
+   parameter RAM_DEPTH = 1 << ADDR_WIDTH
+) (
+   input clk,
+   input write_enable,
+   input [ADDR_WIDTH-1:0] address,
+   input [DATA_WIDTH-1:0] in_data,
+   output [DATA_WIDTH-1:0] out_data
+);
+
+reg [DATA_WIDTH-1:0] mem[0:RAM_DEPTH-1];
+reg [DATA_WIDTH-1:0] out_data_r;
+
+always @(posedge clk) begin
+    if (write_enable) begin
+        mem[address] <= in_data;
+    end
+    out_data_r <= mem[address];
+end
+
+assign out_data = out_data_r;
 
 endmodule

@@ -3,6 +3,14 @@
 // s4..s8 are the port cycles five accesses of known bank pattern cost, s9 and
 // s10 the total cycles the first and third of them took, and s11 the running
 // total over all eight accesses the program makes.
+//
+// s9 and s10 each grew by one cycle when gpu16_lds became a registered-read
+// memory, which is what a bank has to be to infer as a BRAM18.  The banks are
+// asked for the row in one cycle and answer in the next, so a load spends one
+// cycle at the end waiting for its last row to land.  Only that one cycle
+// moved: the port cycles, s4..s8 and s11, are unchanged, because the
+// conflict rule of section 3.2 is about how many cycles the banks are
+// occupied and not about when the data comes back.
 00000000        // s0  kernel_arg_ptr
 00000000        // s1  group_id_x
 00000000        // s2  group_id_y
@@ -12,8 +20,8 @@
 00000008        // s6  stride 32:  2 banks, 8 lanes each
 00000002        // s7  stride 8:   8 banks, 2 lanes each
 00000008        // s8  stride 32 stored: a write conflicts the same way
-00000007        // s9  cycles for the 1-way load:  6 + 1
-0000000e        // s10 cycles for the 8-way load:  6 + 8
+00000008        // s9  cycles for the 1-way load:  6 + 1 + 1
+0000000f        // s10 cycles for the 8-way load:  6 + 8 + 1
 00000018        // s11 total LDS port cycles: 2 + 2 + 16 + 4 = 24
 xxxxxxxx        // s12 scratch
 00000024        // s13 36, the padded stride

@@ -18,6 +18,8 @@
 #
 # s10 and s11 are the cycles the first two cost.  They differ by exactly 15,
 # one per extra transaction, which is the 64 B/cycle port of section 3.1.
+# The constant either side of that difference includes one cycle for the
+# registered read port gpu16_gmem needs in order to be a block RAM.
 #
 # s6 is section 3.1's second worked example - "16 lanes reading 4 bytes each
 # at stride lda (a matrix column walk): 16 transactions, 1/16 rate" - and it

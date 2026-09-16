@@ -9,13 +9,24 @@
 // sixteen, which is section 3.1's transaction rule expressed as hardware
 // rather than as a comment.
 //
-// Reads are asynchronous, as in `memory.v` and for the same reason: the
-// address is produced by one clock edge and the data consumed by the next, so
-// it has a whole cycle to settle.  Unlike `memory.v` there is no write-first
-// bypass, because the one customer - `gpu16.v`'s memory unit - never reads
-// and writes in the same cycle: a store spends its cycles scattering and a
-// load spends its cycles gathering, and an instruction does only one of the
-// two.
+// Reads are **synchronous**, which is the whole point of the module being a
+// separate one: a block RAM has a registered read port, so an array read
+// combinationally cannot be a BRAM and a synthesis tool builds LUTRAM or
+// registers instead (docs/fpga_bringup.md 2.2b).  `out_block` therefore
+// belongs to the `block_index` presented on the *previous* clock edge, and
+// `gpu16.v`'s memory unit pipelines against that: it presents one block
+// address per cycle and writes the data of the block it asked for one cycle
+// later, so an access still costs one port cycle per distinct block and
+// section 3.1's transaction rule is unchanged.  What it costs is one extra
+// cycle at the end of a load, to let the last block's data land.
+//
+// Read-first, and no write-first bypass: the write is scheduled before the
+// read in the same clocked block, so a read of a block being written returns
+// the value from before the write.  A bypass would be a combinational path
+// from the write data to the read data, which is precisely what a BRAM
+// cannot do.  Nothing needs one - the one customer never reads and writes in
+// the same cycle, because a store spends its cycles scattering and a load
+// spends its cycles gathering, and an instruction does only one of the two.
 //
 // Writes are byte enabled.  `v_st_g` writes one byte per lane, so a block
 // write that could only be done a whole word at a time would have to read,
@@ -51,16 +62,11 @@ reg [31:0] mem[0:WORDS-1];
 // rather than an add.
 wire [WORD_INDEX_WIDTH-1:0] base = {block_index, 4'b0};
 
-genvar w;
-generate
-    for (w = 0; w < 16; w = w + 1) begin : word
-        localparam [WORD_INDEX_WIDTH-1:0] OFFSET = w;
-        assign out_block[32*w+:32] = mem[base | OFFSET];
-    end
-endgenerate
+reg [511:0] out_block_r;
 
 integer i;
 integer b;
+integer r;
 
 always @(posedge clk) begin
     if (write_enable) begin
@@ -72,6 +78,13 @@ always @(posedge clk) begin
             end
         end
     end
+    // After the write, so this is the read-first template: sixteen words out
+    // of one aligned block, registered.
+    for (r = 0; r < 16; r = r + 1) begin
+        out_block_r[32*r+:32] <= mem[base | r[3:0]];
+    end
 end
+
+assign out_block = out_block_r;
 
 endmodule

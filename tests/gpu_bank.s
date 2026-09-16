@@ -26,10 +26,12 @@
 #
 # s9 and s10 are what the first and third accesses cost in `perf_cycles`,
 # measured over identical instruction sequences so that only the access
-# differs.  They come out 7 and 14 - one cycle per way, on top of the six
-# cycles the surrounding instructions take either way - which is the evidence
-# that `perf_lds_cycles` is counting something real and not just being
-# incremented in a comment.
+# differs.  They come out 8 and 15 - one cycle per way, on top of the six
+# cycles the surrounding instructions take either way and the one cycle a
+# registered-read bank takes to answer - which is the evidence that
+# `perf_lds_cycles` is counting something real and not just being incremented
+# in a comment.  What matters is the difference, seven, which is the seven
+# extra ways; the constant is the fixed overhead.
 #
 # s11 is the total: 1+1 + 1+1 + 8+8 + 2+2 = 24 port cycles for the eight
 # accesses, stores included.

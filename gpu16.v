@@ -167,24 +167,25 @@ reg [1:0] bubble;
 integer i;
 
 // ---------------------------------------------------------------- fetch
-
-wire [PROGRAM_ADDR_WIDTH-1:0] program_address = PC[PROGRAM_ADDR_WIDTH-1:0];
+//
+// The instruction memory is a `block_memory`: registered read, because an
+// array read combinationally cannot be a block RAM and this one is 131 Kbit
+// per wave (docs/fpga_bringup.md 2.2b).  A registered read wants its address
+// one cycle early, so the memory is read with `pc_d` - the value the PC is
+// *about* to take - rather than with `PC`.  The instruction for cycle N+1 is
+// therefore fetched on the edge that makes PC equal to its address, and the
+// fetch costs no cycle at all once the wave is running: a taken branch
+// redirects `pc_d` on the cycle it issues, so the target is already in `Inst`
+// when the three cycle bubble ends.
+//
+// It costs exactly one cycle at the start.  Nothing has been read out of the
+// memory before the first clock edge after reset, so `Inst` is undefined
+// then; `inst_valid` holds the wave back for that one cycle and the first
+// instruction issues on the cycle after.  That is the one cycle every gpu16
+// program got longer, and it is the honest cost of a memory with a
+// registered read port.
 wire [31:0] Inst;
-
-wire [PROGRAM_ADDR_WIDTH-1:0] fetch_address =
-    prog_load_enable ? prog_load_address : program_address;
-
-memory #(
-    .DATA_WIDTH(32),
-    .ADDR_WIDTH(PROGRAM_ADDR_WIDTH)
-) program (
-    .clk(clk),
-    .write_enable(prog_load_enable),
-    .enable(1'b1),
-    .address(fetch_address),
-    .in_data(prog_load_data),
-    .out_data(Inst)
-);
+reg inst_valid;
 
 // ---------------------------------------------------------------- decode
 //
@@ -302,6 +303,7 @@ localparam MEM_GATHER  = 3'd1;   // load:  one cycle per distinct block
 localparam MEM_RETURN  = 3'd2;   // load:  one VGPR per cycle back to the file
 localparam MEM_READ    = 3'd3;   // store: one VGPR per cycle out of the file
 localparam MEM_SCATTER = 3'd4;   // store: one cycle per distinct block
+localparam MEM_GWAIT   = 3'd5;   // load:  the last block's data lands
 
 reg [2:0] mem_state;
 reg [7:0] mem_op;
@@ -315,12 +317,25 @@ reg [15:0] served;
 reg [383:0] lane_addr;    // sixteen 24 bit effective addresses
 reg [2047:0] stage;       // sixteen lanes x four words, the unit's own buffer
 reg [3:0] st_reg;
+// The lanes whose gathered data arrives *this* cycle, i.e. the lanes the
+// transaction granted on the previous cycle served.  Both memories have
+// registered read ports now, so the block or the sixteen bank words asked for
+// in cycle N come back in cycle N+1.  The unit still presents one address per
+// cycle and still marks its lanes served on the cycle it is granted - so an
+// access costs exactly the port cycles section 3.1 and 3.2 say it does - and
+// the answers are written into `stage` one cycle behind.  What that costs is
+// one extra cycle per load, at the end, to let the last block land: MEM_GWAIT.
+reg [15:0] gath_match;
 
-// `s_ld_g`'s own two cycle path: latch the address, and select its word out
-// of the block the cycle the port is granted.
+// `s_ld_g`'s own path: latch the address, spend a cycle on the port, and
+// select its word out of the block the cycle after that - the extra cycle
+// being the global memory's registered read port, the same one MEM_GWAIT
+// pays for a per lane load.  `gmem_read` is the cycle it asks for the port
+// and `gmem_data` is the cycle its word comes back.
 reg [23:0] gmem_address;
 reg [3:0] gmem_dst;
 reg gmem_read;
+reg gmem_data;
 
 // A wave issues nothing while the memory unit is still working through an
 // access, which is the second of the three reasons this machine stalls - the
@@ -402,8 +417,8 @@ wire op_accmove = (opcode == 8'h72) | (opcode == 8'h73);
 wire mat_stall = (op_matrix & mat_busy & ~mat_last)
                | ((op_accmove | (opcode == 8'hb3)) & mat_busy);
 
-wire wave_ready = (bubble == 2'b0) & ~halted_r & launch
-                & (mem_state == MEM_IDLE) & ~gmem_read;
+wire wave_ready = inst_valid & (bubble == 2'b0) & ~halted_r & launch
+                & (mem_state == MEM_IDLE) & ~gmem_read & ~gmem_data;
 
 assign barrier_wait = wave_ready & at_barrier & ~bar_done;
 assign issue_request = wave_ready & (~at_barrier | bar_done) & ~mat_stall;
@@ -654,6 +669,100 @@ gpu16_vector #(
     .mat_wdata(mat_wdata)
 );
 
+// ---------------------------------------------------------------- the PC
+//
+// The PC and the branch bubble are computed combinationally here and merely
+// latched by the clocked block below.  They used to be assigned from inside
+// that block's `case (opcode)`, which was fine while the instruction memory
+// read combinationally; a registered read port needs the *next* address a
+// cycle early, so the value has to exist as a wire before the edge that takes
+// it.  Section 4.4's branch block is therefore here, once, and the clocked
+// block keeps only what a branch does besides redirecting - which is the
+// return address `s_call` writes.
+//
+// Both outputs are assigned unconditionally first, so this is a
+// multiplexer and not a latch: the PC holds unless something issues, and the
+// bubble counts down unless a taken branch reloads it with three.
+reg [15:0] pc_d;
+reg [1:0] bubble_d;
+always @* begin
+    pc_d = PC;
+    bubble_d = (bubble != 2'b0) ? (bubble - 2'b1) : 2'b0;
+    if (issue) begin
+        pc_d = PC_next;
+        case (opcode)
+            8'h20: if (src0_value != 32'b0) begin
+                pc_d = src1_value[15:0];
+                bubble_d = 2'd3;
+            end
+            8'h21: if (src0_value == 32'b0) begin
+                pc_d = src1_value[15:0];
+                bubble_d = 2'd3;
+            end
+            8'h22: begin
+                pc_d = src1_value[15:0];
+                bubble_d = 2'd3;
+            end
+            8'h23: if ($signed(src0_value) < 0) begin
+                pc_d = src1_value[15:0];
+                bubble_d = 2'd3;
+            end
+            8'h24: if ($signed(src0_value) > 0) begin
+                pc_d = src1_value[15:0];
+                bubble_d = 2'd3;
+            end
+            8'h25: if (src0_value != 32'b0) begin
+                pc_d = PC_next + imm16;
+                bubble_d = 2'd3;
+            end
+            8'h26: if (src0_value == 32'b0) begin
+                pc_d = PC_next + imm16;
+                bubble_d = 2'd3;
+            end
+            8'h27: begin
+                pc_d = PC_next + imm16;
+                bubble_d = 2'd3;
+            end
+            8'h28: begin
+                pc_d = PC_next + imm16;
+                bubble_d = 2'd3;
+            end
+            // The two exec-mask branches.  Section 1.3 makes these the escape
+            // hatch for a branch every lane has fallen out of: the body is
+            // still correct with exec == 0 - every vector instruction in it
+            // is a no-op - so these are an optimisation and not a
+            // correctness requirement.
+            8'h29: if (exec == 16'b0) begin
+                pc_d = PC_next + imm16;
+                bubble_d = 2'd3;
+            end
+            8'h2a: if (exec != 16'b0) begin
+                pc_d = PC_next + imm16;
+                bubble_d = 2'd3;
+            end
+            default: ;
+        endcase
+    end
+end
+
+// The instruction memory, read with the address the PC is about to take.  The
+// loader owns the port instead while it is enabled, which only happens with
+// `reset` held high.
+wire [PROGRAM_ADDR_WIDTH-1:0] program_address = pc_d[PROGRAM_ADDR_WIDTH-1:0];
+wire [PROGRAM_ADDR_WIDTH-1:0] fetch_address =
+    prog_load_enable ? prog_load_address : program_address;
+
+block_memory #(
+    .DATA_WIDTH(32),
+    .ADDR_WIDTH(PROGRAM_ADDR_WIDTH)
+) program (
+    .clk(clk),
+    .write_enable(prog_load_enable),
+    .address(fetch_address),
+    .in_data(prog_load_data),
+    .out_data(Inst)
+);
+
 // ---------------------------------------------------------------- system registers
 
 reg [31:0] perf_cycles;
@@ -715,6 +824,8 @@ always @(posedge clk or posedge reset) begin
         gmem_address <= 24'b0;
         gmem_dst <= 4'b0;
         gmem_read <= 1'b0;
+        gmem_data <= 1'b0;
+        inst_valid <= 1'b0;
         perf_cycles <= 32'b0;
         perf_instrs <= 32'b0;
         bar_done <= 1'b0;
@@ -726,6 +837,7 @@ always @(posedge clk or posedge reset) begin
         served <= 16'hffff;
         lane_addr <= 384'b0;
         stage <= 2048'b0;
+        gath_match <= 16'b0;
         st_reg <= 4'b0;
         mat_busy <= 1'b0;
         mat_fill <= 1'b0;
@@ -746,77 +858,112 @@ always @(posedge clk or posedge reset) begin
         registers[2] <= group_id_y;
     end
     else begin
+        // One edge has now been taken with the fetch address the reset value
+        // of the PC produced, so `Inst` is the instruction at PC from the
+        // next cycle on.
+        inst_valid <= 1'b1;
+
         if (~halted_r) begin
             perf_cycles <= perf_cycles + 1;
         end
 
-        if (bubble != 2'b0) begin
-            bubble <= bubble - 2'b1;
-        end
+        // Section 4.4's branch block decides both of these; see the `pc_d`
+        // process above.
+        PC <= pc_d;
+        bubble <= bubble_d;
 
-        if (gmem_read & g_grant) begin
+        // `s_ld_g`, in two halves: the cycle the port is granted asks the
+        // memory for the block, and the cycle after that is when the block
+        // is there to select the word out of.
+        if (gmem_data) begin
             registers[gmem_dst] <= gmem_word;
+            gmem_data <= 1'b0;
+        end
+        if (gmem_read & g_grant) begin
             gmem_read <= 1'b0;
+            gmem_data <= 1'b1;
         end
 
         if (barrier_release) begin
             bar_done <= 1'b1;
         end
 
+        // ---- the gathered data of the transaction granted last cycle
+        //
+        // `gpu16_gmem` and `gpu16_lds` are registered-read, so what is on
+        // their outputs this cycle is the answer to the address presented on
+        // the previous one.  `gath_match` says which lanes that answer
+        // serves; the addressing fields it is indexed by - the lane offsets,
+        // the banks, the access width - are all latched at issue and hold
+        // still for the whole access, so nothing else has to be pipelined
+        // alongside it.
+        for (l = 0; l < 16; l = l + 1) begin
+            if (gath_match[l]) begin
+                gather_off = lane_addr[24*l+:6];
+                if (mem_lds) begin
+                    // The lane's own bank, which it held alone on the cycle
+                    // it was granted, so the row it asked for is the row that
+                    // came back.
+                    gather_word = lds_out[32*lane_addr[24*l+2+:4]+:32];
+                    if (mem_word) begin
+                        stage[128*l+:32] <= gather_word;
+                    end
+                    else begin
+                        // Section 4.9 has only the zero extending `v_ld_l`;
+                        // there is no LDS equivalent of `v_ld_gs`.
+                        gather_byte = gather_word[8*lane_addr[24*l+:2]+:8];
+                        stage[128*l+:32] <= {24'b0, gather_byte};
+                    end
+                end
+                else if (mem_quad) begin
+                    for (j = 0; j < 4; j = j + 1) begin
+                        stage[128*l+32*j+:32] <=
+                            gmem_out_block[8*gather_off+32*j+:32];
+                    end
+                end
+                else if (mem_word) begin
+                    stage[128*l+:32] <= gmem_out_block[8*gather_off+:32];
+                end
+                else begin
+                    // One byte, zero extended by v_ld_g and sign extended by
+                    // v_ld_gs.
+                    gather_byte = gmem_out_block[8*gather_off+:8];
+                    stage[128*l+:32] <= mem_sext
+                        ? {{24{gather_byte[7]}}, gather_byte}
+                        : {24'b0, gather_byte};
+                end
+            end
+        end
+
+        // What will be on those outputs next cycle: the lanes this cycle's
+        // transaction serves, if there is one and the port was granted.
+        gath_match <= ((mem_state == MEM_GATHER) & any_unserved & port_go)
+                    ? match : 16'b0;
+
         // ---- the per lane memory unit, one state per phase of an access
         case (mem_state)
             MEM_GATHER: begin
                 if (any_unserved & port_go) begin
-                    for (l = 0; l < 16; l = l + 1) begin
-                        if (match[l]) begin
-                            gather_off = lane_addr[24*l+:6];
-                            if (mem_lds) begin
-                                // The lane's own bank, which it holds alone
-                                // this cycle, so the row it asked for is the
-                                // row that came back.
-                                gather_word = lds_out[32*lane_addr[24*l+2+:4]+:32];
-                                if (mem_word) begin
-                                    stage[128*l+:32] <= gather_word;
-                                end
-                                else begin
-                                    // Section 4.9 has only the zero
-                                    // extending `v_ld_l`; there is no LDS
-                                    // equivalent of `v_ld_gs`.
-                                    gather_byte = gather_word[8*lane_addr[24*l+:2]+:8];
-                                    stage[128*l+:32] <= {24'b0, gather_byte};
-                                end
-                            end
-                            else if (mem_quad) begin
-                                for (j = 0; j < 4; j = j + 1) begin
-                                    stage[128*l+32*j+:32] <=
-                                        gmem_out_block[8*gather_off+32*j+:32];
-                                end
-                            end
-                            else if (mem_word) begin
-                                stage[128*l+:32] <= gmem_out_block[8*gather_off+:32];
-                            end
-                            else begin
-                                // One byte, zero extended by v_ld_g and sign
-                                // extended by v_ld_gs.
-                                gather_byte = gmem_out_block[8*gather_off+:8];
-                                stage[128*l+:32] <= mem_sext
-                                    ? {{24{gather_byte[7]}}, gather_byte}
-                                    : {24'b0, gather_byte};
-                            end
-                        end
-                    end
                     served <= served | match;
                     if ((served | match) == 16'hffff) begin
-                        mem_state <= MEM_RETURN;
-                        mem_j <= 2'b0;
+                        mem_state <= MEM_GWAIT;
                     end
                 end
                 else if (~any_unserved) begin
-                    // exec was zero: no lane reads, and the destination quad
-                    // is left alone because MEM_RETURN's mask is mem_exec.
+                    // exec was zero: no lane reads, nothing is in flight, and
+                    // the destination quad is left alone because MEM_RETURN's
+                    // mask is mem_exec.
                     mem_state <= MEM_RETURN;
                     mem_j <= 2'b0;
                 end
+            end
+            MEM_GWAIT: begin
+                // The last transaction's data lands on this cycle's edge, in
+                // the block above.  One cycle per load, not per transaction:
+                // every earlier block's data landed while the next one was
+                // being asked for.
+                mem_state <= MEM_RETURN;
+                mem_j <= 2'b0;
             end
             MEM_RETURN: begin
                 // The write itself happens in the vector unit, off
@@ -872,7 +1019,6 @@ always @(posedge clk or posedge reset) begin
         end
 
         if (issue) begin
-            PC <= PC_next;
             perf_instrs <= perf_instrs + 1;
 
             case (opcode)
@@ -908,68 +1054,16 @@ always @(posedge clk or posedge reset) begin
 
                 // ------------------------------- 4.4 scalar control flow
                 //
-                // cpu16's branch block, verbatim, at cpu16's own numbers.
-                8'h20:
-                    if (src0_value != 0) begin
-                        PC <= src1_value[15:0];
-                        bubble <= 2'd3;
-                    end
-                8'h21:
-                    if (src0_value == 0) begin
-                        PC <= src1_value[15:0];
-                        bubble <= 2'd3;
-                    end
-                8'h22:
-                    begin
-                        PC <= src1_value[15:0];
-                        bubble <= 2'd3;
-                    end
-                8'h23:
-                    if ($signed(src0_value) < 0) begin
-                        PC <= src1_value[15:0];
-                        bubble <= 2'd3;
-                    end
-                8'h24:
-                    if ($signed(src0_value) > 0) begin
-                        PC <= src1_value[15:0];
-                        bubble <= 2'd3;
-                    end
-                8'h25:
-                    if (src0_value != 0) begin
-                        PC <= PC_next + imm16;
-                        bubble <= 2'd3;
-                    end
-                8'h26:
-                    if (src0_value == 0) begin
-                        PC <= PC_next + imm16;
-                        bubble <= 2'd3;
-                    end
-                8'h27:
-                    begin
-                        PC <= PC_next + imm16;
-                        bubble <= 2'd3;
-                    end
-                8'h28:
-                    begin
-                        registers[arg0] <= {16'b0, PC_next};
-                        PC <= PC_next + imm16;
-                        bubble <= 2'd3;
-                    end
-                // The two exec-mask branches.  Section 1.3 makes these the
-                // escape hatch for a branch every lane has fallen out of: the
-                // body is still correct with exec == 0 - every vector
-                // instruction in it is a no-op - so these are an optimisation
-                // and not a correctness requirement.
-                8'h29:
-                    if (exec == 16'b0) begin
-                        PC <= PC_next + imm16;
-                        bubble <= 2'd3;
-                    end
-                8'h2a:
-                    if (exec != 16'b0) begin
-                        PC <= PC_next + imm16;
-                        bubble <= 2'd3;
-                    end
+                // cpu16's branch block, verbatim, at cpu16's own numbers -
+                // but the redirection itself now lives in the `pc_d` process
+                // above, because the instruction memory has to be read with
+                // the branch target on the cycle the branch issues.  All that
+                // is left here is the one branch that also writes a register,
+                // `s_call`'s return address.  The other arms exist so that a
+                // branch is not reported as an unknown opcode.
+                8'h20, 8'h21, 8'h22, 8'h23, 8'h24,
+                8'h25, 8'h26, 8'h27, 8'h29, 8'h2a: ;
+                8'h28: registers[arg0] <= {16'b0, PC_next};
 
                 // --------------------------------------- 4.5 exec mask
                 //

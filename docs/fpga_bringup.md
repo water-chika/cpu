@@ -185,17 +185,17 @@ Three properties of the shape chosen, all deliberate:
 `prog_load_enable` must be low while a wave runs; the port is not an
 alternative instruction path, it is a loader.
 
-#### (b) Every memory in the design is asynchronous-read, so none of it is BRAM
+#### (b) Every large memory used to be asynchronous-read. **Fixed.**
 
-`memory.v` says so in its own header and means it: "Reads are asynchronous...
+`memory.v` said so in its own header and meant it: "Reads are asynchronous...
 On an FPGA this maps to distributed RAM rather than to a block RAM." The same
-holds for `gpu16_lds.v:66` (`assign out_data[...] = mem[word]`) and
-`gpu16_gmem.v:58` (`assign out_block[...] = mem[base | OFFSET]`). Xilinx
+held for `gpu16_lds.v` (`assign out_data[...] = mem[word]`) and
+`gpu16_gmem.v` (`assign out_block[...] = mem[base | OFFSET]`). Xilinx
 BRAM has a registered read port; an array read combinationally cannot be a
-BRAM, so Vivado will build LUTRAM instead - silently - and where the port
-count defeats LUTRAM it will fall back to registers.
+BRAM, so Vivado would build LUTRAM instead - silently - and where the port
+count defeats LUTRAM it would fall back to registers.
 
-This matters most for the program memory, because of its size. With
+This mattered most for the program memory, because of its size. With
 `PROGRAM_ADDR_WIDTH = 12` each wave holds 4096 x 32 = **131,072 bits**, and
 there are **four waves per compute unit**, so 512 Kbit of asynchronous-read
 storage for instruction fetch alone. As LUTRAM at 64 bits per SLICEM LUT
@@ -203,16 +203,76 @@ that is order 2,000 LUTs per wave before output multiplexing - call it 10,000
 LUTs for a compute unit, which on a small Artix-7 is most of the device.
 **Hand-estimated; only a synthesis report can confirm it.**
 
-Note also that `gpu_isa.md` section 7.5 predicts "8 KiB of LDS as 8 BRAM18 in
-16 banks". As written the LDS cannot be BRAM at all, for the reason above.
-That prediction is already falsified by reading, before any tool runs.
+**What is there now.** The three large arrays read synchronously, from the
+read-first template both Xilinx and Altera recognise - the write scheduled
+before the read inside one `always @(posedge clk)`, and no bypass mux, since
+a bypass is exactly the combinational write-data-to-read-data path a BRAM
+cannot have:
 
-The cut-down is easy and is section 4.3's first lever: the largest
-checked-in test program is `gpu_wg.s` at 197 source lines, so
+| Array | Module | Size | Read |
+|-------|--------|------|------|
+| program memory x4 | `block_memory` in `memory.v`, via `gpu16.v` | 4 x 131 Kbit | registered |
+| LDS, 16 banks | `gpu16_lds.v` | 64 Kbit | registered, per bank |
+| global memory | `gpu16_gmem.v` | parameterised, 16 words wide | registered |
+
+And what deliberately did **not** change:
+
+* `memory` and `program_memory` in `memory.v`, which are the two CPUs'
+  memories. They are 256 entries - 2 Kbit and 4 Kbit - below the 18 Kbit
+  granularity of a BRAM18, so distributed RAM is the right primitive for
+  them; and converting them would change cpu8's and cpu16's timing, which the
+  nine RTL-vs-C++ cross-checks pin down cycle for cycle. That is a choice
+  with a reason, not an omission.
+* `vregs` and `accs` in `gpu16_vector.v`, which are (c) below and a larger
+  piece of work: they have several live read ports, so they are not a
+  registered-read conversion but a port-count problem.
+
+**What it cost, in cycles.** A registered read port hands its data back a
+cycle after the address, so three things moved, and nothing else did:
+
+* **one cycle at wave start.** `Inst` is undefined until an edge has been
+  taken, so the first instruction issues one cycle later than it used to. The
+  fetch is otherwise free: `gpu16.v` reads the instruction memory with `pc_d`,
+  the value the PC is *about* to take, so a taken branch redirects the fetch
+  on the cycle it issues and the target is already in `Inst` when the
+  three-cycle bubble ends.
+* **one cycle per per-lane load**, at the end of the access, in the new
+  `MEM_GWAIT` state. It is one cycle per *load*, not per transaction: the
+  memory unit still presents one block address per cycle, and now writes each
+  block's data into the staging buffer while the next block is being asked
+  for. So section 3.1's and 3.2's transaction and conflict counts - which are
+  what `perf_gmem_trans` and `perf_lds_cycles` measure, and what
+  `gpu_coalesce` and `gpu_bank` assert - are **unchanged**.
+* **one cycle per `s_ld_g`**, for the same reason.
+
+Stores cost nothing extra; a write was always synchronous. Measured, before
+against after, on the checked-in tests: `gpu_branch` 59 -> 60 (start only),
+`gpu_global` 42 -> 49 (start + 6 loads), `gpu_lds` 82 -> 90, `gpu_coalesce`
+72 -> 77, `gpu_bank` 82 -> 87, `gpu_mma_perf` 170 -> 173, `gpu_wg` 833 -> 834
+- the four-wave case pays almost nothing, because the extra cycles hide in
+round-robin issue behind other waves.
+
+Two checked-in expectation files moved with that, and only in their
+wall-clock numbers: `gpu_coalesce.expect` s10/s11 from 7/0x16 to 8/0x17, and
+`gpu_bank.expect` s9/s10 from 7/0xe to 8/0xf. In both, the *difference* the
+test exists to demonstrate - fifteen cycles for fifteen extra transactions,
+seven cycles for seven extra bank ways - is exactly what it was, and the
+transaction and port-cycle counters those same tests assert did not move at
+all.
+
+`gpu_isa.md` section 7.5 predicts "8 KiB of LDS as 8 BRAM18 in 16 banks".
+That prediction used to be falsified by reading. It is now merely
+*unconfirmed*, which is a different and much better place for it to be: the
+RTL is at least written in a shape that can infer, and only a utilisation
+report can say whether it did.
+
+The size cut-down is still available and is still section 4.3's first lever:
+the largest checked-in test program is `gpu_wg.s` at 197 source lines, so
 `PROGRAM_ADDR_WIDTH = 8` (256 words, 8 Kbit per wave) holds every test in the
 repo with room to spare and cuts instruction storage 16x. It is already a
 module parameter that `testgpu.v` passes through, so it costs nothing but a
-parameter value.
+parameter value. It matters less than it did - 131 Kbit is four BRAM18s per
+wave rather than order 2,000 LUTs - but a BRAM is still a BRAM.
 
 #### (c) The register and accumulator files may become flip-flops
 
@@ -334,23 +394,26 @@ deleted `memory_ramb18e1.v` wrapper, not a measurement.
 Reading the RTL gives candidate critical paths, which is what the first
 `report_timing` should be checked against:
 
-1. **Fetch through execute in one cycle.** `PC` -> asynchronous LUTRAM read
-   of the program memory (`gpu16.v:153-166`) -> opcode/field decode
-   (`gpu16.v:178-183`) -> the `always @*` decode blocks -> 32-bit scalar ALU
-   -> register write, all inside one clock period. There is no fetch/decode
-   pipeline register. This is the most likely critical path in the whole
-   design, and it gets *worse* with a bigger `PROGRAM_ADDR_WIDTH` because the
-   LUTRAM output multiplexer grows.
+1. **Decode through execute in one cycle.** Since 2.2(b) the fetch itself is
+   out of this path: `Inst` is the registered output of a `block_memory`, so
+   the period starts at a flop. What remains is opcode/field decode -> the
+   `always @*` decode blocks -> 32-bit scalar ALU -> register write, plus the
+   *address* side of the fetch, `pc_d` -> memory address, which is a small
+   adder and a branch mux. There is still no decode/execute pipeline
+   register, so this is probably still the critical path - but it no longer
+   grows with `PROGRAM_ADDR_WIDTH`, because there is no LUTRAM output
+   multiplexer in it any more.
 2. **The matrix unit.** `gpu16_matrix.v:59-85`: asynchronous read of `vregs`
    and `accs`, four signed 8x8 multiplies, a 4-input adder tree, a 32-bit
    accumulate, written back to `accs` - 16 lanes wide, all combinational
    between two edges. If the multiplies land in DSP48s without pipeline
    registers this is slow; if they land in LUTs it is slower.
 3. **The LDS crossbar.** Address computation -> sixteen per-bank row selects
-   -> asynchronous 512-bit read (`gpu16_lds.v:63-71`) -> lane routing -> VGPR
-   write.
-4. **The global port.** 512-bit asynchronous read out of `gpu16_gmem` with
-   byte-enable merging, in the consuming cycle.
+   -> bank address, one period; then, in the *next* period, the registered
+   512-bit read output -> lane routing -> staging write. 2.2(b) split this
+   path in two, which is most of the point of a registered read.
+4. **The global port.** The registered 512-bit output of `gpu16_gmem` ->
+   byte-enable merging -> staging, in the cycle after the address.
 5. **The four-wave arbiter.** `gpu16_cu.v:219` documents a fixed-priority
    grant chain across four waves, combinational, feeding the memory ports in
    the same cycle it resolves.
@@ -361,7 +424,8 @@ for which `report_timing_summary` shows WNS >= 0, on a named part.
 ### 3.2 Actual resource fit
 
 Section 2.2 predicts that instruction storage and the vector/accumulator
-files dominate, and that neither becomes BRAM. Those are predictions from
+files dominate, and - since the fix in 2.2(b) - that the first becomes BRAM
+while the second does not. Those are predictions from
 reading. The utilisation report settles them, and it settles the prior
 question of whether a four-wave `gpu16_cu` fits the board at all. Note that
 synthesis alone is enough for both 3.1 and 3.2 - **this item needs a Vivado,
@@ -431,20 +495,22 @@ tool.** The right-hand column is what to compare against once one has.
 
 | Module | State | Hand estimate | Confirm with |
 |--------|-------|---------------|--------------|
-| program memory x4 (`memory.v` via `gpu16.v`) | 4 x 131 Kbit, written through the loader port of 2.2(a) | ~2,000 LUTs/wave, ~8-10k LUTs total; no longer at risk of being trimmed | utilisation report, LUTRAM row |
+| program memory x4 (`block_memory` in `memory.v`, via `gpu16.v`) | 4 x 131 Kbit, registered read, written through the loader port of 2.2(a) | 4 BRAM18/wave, 16 total, *if* it infers; ~2,000 LUTs/wave of LUTRAM if it does not | utilisation report: the BRAM row should be non-zero |
 | `vregs` x4 (`gpu16_vector.v:138`) | 4 x 8 Kbit | LUTRAM if the tool can, ~32k FFs if it cannot | primitive inference report |
 | `accs` x4 (`gpu16_vector.v:153`) | 4 x 16 Kbit | as above, ~64k FFs worst case | primitive inference report |
-| `gpu16_lds` | 64 Kbit, 16 banks x 128 x 32, async read | ~1,000 LUTs of LUTRAM; **not** the 8 BRAM18 section 7.5 predicts | utilisation report, BRAM row = 0 |
-| `gpu16_gmem` | 32 Kbit (4 KiB), 16 x 64 x 32 effective | ~500 LUTs of LUTRAM | utilisation report |
+| `gpu16_lds` | 64 Kbit, 16 banks x 128 x 32, registered read | 8 BRAM18 if the banks infer, which 2.2(b) has at least made possible; ~1,000 LUTs of LUTRAM if they do not | utilisation report, BRAM row |
+| `gpu16_gmem` | parameterised; 32 Kbit (4 KiB) at the default width, registered read, 16 words wide | the 512-bit port is the awkward part - a 16-word-wide read may want 16 BRAM18 in parallel rather than one | utilisation report |
 | `gpu16_matrix` | none (combinational) | 64 signed 8x8 MACs: 64 DSP48, 32 packed DSP48, or ~4-5k LUTs | DSP row; check against 7.5's claim of 32 |
 | scalar+decode logic x4 (`gpu16.v`) | ~100 FFs/wave | ~2-3k LUTs/wave | utilisation report |
 | `gpu16_cu` arbiters, counters, barrier | ~200 FFs | ~500 LUTs | utilisation report |
 
 The headline: **instruction storage and the vector/accumulator files are the
 fit risk, not the matrix unit.** The matrix array is the part that sounds
-expensive and is not - 64 int8 MACs is small - while 512 Kbit of
-asynchronous-read instruction memory for four copies of a 200-line program is
-the part that sounds free and is not.
+expensive and is not - 64 int8 MACs is small - while 512 Kbit of instruction
+memory for four copies of a 200-line program is the part that sounds free and
+is not. Since 2.2(b) that 512 Kbit should land in BRAM rather than LUTRAM,
+which changes which resource it exhausts but not the fact that it is the
+largest thing in the design.
 
 ### 4.3 The documented cut-down, if gpu16 does not fit
 
@@ -552,11 +618,13 @@ The reasoning, in order of weight:
    bitstream and a new configuration. At minutes per implementation run that
    turns a test suite into an afternoon. JTAG-to-AXI writes memory on a
    running device, so all the tests share one bitstream.
-3. **The memories are not BRAMs anyway.** Section 2.2(b): every array in the
-   design is asynchronous-read, so `updatemem` has nothing to target. Making
-   `updatemem` work would mean converting the program memory to a registered
-   read port - which is a worthwhile change on its own merits for Fmax, but
-   it is a change to verified RTL to enable the weaker of two mechanisms.
+3. **The memories might be BRAMs now, and it does not rescue `updatemem`.**
+   Section 2.2(b): the program memory has a registered read port since the
+   BRAM fix, so `updatemem` finally has something it could target. It is
+   still the wrong mechanism, for reasons 1 and 2 above - which are about
+   readback and about bitstream turnaround, and are untouched by that change.
+   And the program memory now has a write port of its own (2.2a), which is
+   strictly better, because it writes a *running* device.
 4. **ILA cannot load.** It is a capture buffer. It is still worth having:
    with `halted`, `PC`, `Inst`, `bubble`, `exec`, the grant signals and
    `perf_mma_busy` on an ILA, a hung program shows its own last instruction,
@@ -661,9 +729,11 @@ Now the honest part.
   The "100 MHz is comfortable" assumption is exactly the kind of statement
   this plan exists to replace with a number.
 * **Resource fit**, and therefore 7.5's "32 DSP48E1 slices" and "8 BRAM18"
-  claims. The second is **already falsified by reading** - section 2.2(b),
-  an asynchronous-read array cannot be a BRAM - and the first depends on a
-  DSP packing inference that `gpu16_matrix.v` was not written to invite.
+  claims. The second used to be **falsified by reading** - an asynchronous-read
+  array cannot be a BRAM - and is open again: since 2.2(b) the LDS banks are
+  registered-read, so whether they infer as BRAM18 is now a question only a
+  utilisation report answers. The first still depends on a DSP packing
+  inference that `gpu16_matrix.v` was not written to invite.
 * **That synthesis preserves behaviour**, via the cycle-count and
   perf-counter comparison of 4.6. Nothing else in the repo tests that.
 * **7.5's conclusion that "if the goal were performance, the project should
@@ -888,6 +958,11 @@ The distinction this whole document turns on.
   messages** (`tests/lint_verilog.sh`, CTest #17).
 * The RTL has **real resets and no `initial` blocks**; the only unreset state
   is memory arrays, deliberately.
+* Programs reach the instruction memory through a **real write port**, on
+  both CPUs and on gpu16, and the testbenches load through it (2.2a).
+* The program memory, the LDS and the global memory are **registered-read**,
+  which is the shape a block RAM has (2.2b). That they are *shaped* right is
+  verified; that a tool infers BRAM from them is not.
 * gpu16's **functional behaviour** - scalar unit, exec mask, divergence,
   lanes, LDS banking, global coalescing, the matrix unit and the four-wave
   workgroup - against checked-in expectations.
@@ -897,8 +972,9 @@ The distinction this whole document turns on.
 
 Everything in section 2.2 and section 4.2 falls here. In particular:
 
-* that **no array in the design can infer as BRAM** (2.2b), which contradicts
-  `gpu_isa.md` 7.5's "8 BRAM18";
+* that the three large arrays, now written with registered read ports, **do**
+  infer as BRAM (2.2b). The RTL is in the shape a tool wants; nothing has
+  confirmed that a tool takes it;
 * that `vregs`/`accs` **may become flip-flops** (2.2c);
 * every LUT, FF and DSP number in the 4.2 table;
 * the critical-path candidates in 3.1.
