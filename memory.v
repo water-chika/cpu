@@ -56,6 +56,15 @@ endmodule
 // exactly what those two instructions need - without it a program cannot
 // touch its own instruction memory while it is still being fetched from.
 //
+// There is also a loader: `load_enable` / `load_address` / `load_data` write
+// one whole 16 bit word per cycle and take priority over port B.  This is the
+// port a program arrives through on a device, and it is deliberately not a
+// third write port - it is a mux in front of the one port B already had, so
+// it costs an address and a data multiplexer and no extra memory port.  The
+// host holds the CPU in reset while it loads, so the conflict the priority
+// resolves never happens in practice; the priority exists so the behaviour is
+// defined rather than hoped for.
+//
 // A write on port B is visible to port A in the same cycle, so an instruction
 // stored here takes effect the next time it is fetched.  That bypass is the
 // explicit mux below; it used to be an accident of one blocking assignment
@@ -75,7 +84,12 @@ module program_memory #(
    input b_half, // 0: low byte of the word, 1: high byte
    input [ADDR_WIDTH-1:0] b_address,
    input [7:0] b_in_data,
-   output [7:0] b_out_data
+   output [7:0] b_out_data,
+
+   // The loader.  One 16 bit word per cycle, write only, priority over B.
+   input load_enable,
+   input [ADDR_WIDTH-1:0] load_address,
+   input [15:0] load_data
 );
 
 reg [15:0] mem[0:RAM_DEPTH-1];
@@ -83,7 +97,10 @@ reg [15:0] mem[0:RAM_DEPTH-1];
 wire b_write = b_enable & b_write_enable;
 
 always @(posedge clk) begin
-    if (b_write) begin
+    if (load_enable) begin
+        mem[load_address] <= load_data;
+    end
+    else if (b_write) begin
         if (b_half) begin
             mem[b_address][15:8] <= b_in_data;
         end

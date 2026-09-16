@@ -125,7 +125,25 @@ module gpu16 #(
     input [31:0] perf_mma_busy_in,
 
     // High once s_endpgm has retired, or immediately for an unlaunched slot.
-    output halted
+    output halted,
+
+    // ---- the program memory loader, section 2.2(a) of docs/fpga_bringup.md.
+    //
+    // `write_enable` on the instruction memory used to be tied to zero.  On a
+    // device that means the array is written by nothing and initialised by
+    // nothing, so a synthesis tool is entitled to replace it with a constant
+    // and take the decoder with it; in simulation it was invisible only
+    // because the testbench reached into the hierarchy with `$readmemh`,
+    // which is not a thing hardware can do.  This is the real port: one 32
+    // bit instruction word per cycle, addressed from outside.
+    //
+    // It is a multiplexer in front of the fetch port rather than a second
+    // port, because the host loads with `reset` held high and the fetch is
+    // not using the memory then.  `prog_load_enable` must be low while the
+    // wave runs.
+    input prog_load_enable,
+    input [PROGRAM_ADDR_WIDTH-1:0] prog_load_address,
+    input [31:0] prog_load_data
 );
 
 // Waves per workgroup, lanes per wave and bytes of LDS per workgroup, as
@@ -153,15 +171,18 @@ integer i;
 wire [PROGRAM_ADDR_WIDTH-1:0] program_address = PC[PROGRAM_ADDR_WIDTH-1:0];
 wire [31:0] Inst;
 
+wire [PROGRAM_ADDR_WIDTH-1:0] fetch_address =
+    prog_load_enable ? prog_load_address : program_address;
+
 memory #(
     .DATA_WIDTH(32),
     .ADDR_WIDTH(PROGRAM_ADDR_WIDTH)
 ) program (
     .clk(clk),
-    .write_enable(1'b0),
+    .write_enable(prog_load_enable),
     .enable(1'b1),
-    .address(program_address),
-    .in_data(32'b0),
+    .address(fetch_address),
+    .in_data(prog_load_data),
     .out_data(Inst)
 );
 

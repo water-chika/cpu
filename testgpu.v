@@ -71,6 +71,19 @@ integer lane;
 integer vreg;
 integer waves;
 
+// The loader.  The program is read into the testbench's own array and then
+// clocked into the compute unit through its `prog_load_*` port, one
+// instruction word per cycle, with reset held high.  It used to be four
+// hierarchical `$readmemh` calls straight into `U0.wg[N].w_inst.program.mem`,
+// which is not something a device can do - and which hid the fact that the
+// instruction memory had no write port at all (docs/fpga_bringup.md 2.2a).
+// The port writes all four waves at once, because all four run one program.
+reg prog_load_enable;
+reg [PROGRAM_ADDR_WIDTH-1:0] prog_load_address;
+reg [31:0] prog_load_data;
+reg [31:0] progmem[0:(1<<PROGRAM_ADDR_WIDTH)-1];
+integer w;
+
 gpu16_cu #(
     .PROGRAM_ADDR_WIDTH(PROGRAM_ADDR_WIDTH),
     .DATA_INDEX_WIDTH(DATA_INDEX_WIDTH)
@@ -82,7 +95,10 @@ gpu16_cu #(
     .group_id_y(group_y[31:0]),
     .wave_id_base(wave[31:0]),
     .waves(waves[2:0]),
-    .halted()
+    .halted(),
+    .prog_load_enable(prog_load_enable),
+    .prog_load_address(prog_load_address),
+    .prog_load_data(prog_load_data)
 );
 
 initial begin
@@ -132,19 +148,23 @@ initial begin
         waves = 1;
     end
 
-    // Every wave runs the same program; section 3.3's workgroup is one
-    // kernel over four waves, told apart by `s_wave_id`, not four programs.
+    // Into the testbench's own array first; the clocking in happens below,
+    // after reset has been asserted.
+    for (w = 0; w < (1 << PROGRAM_ADDR_WIDTH); w = w + 1) begin
+        progmem[w] = 32'hxxxxxxxx;
+    end
     if (program_words > 0) begin
-        $readmemh(program_file, U0.wg[0].w_inst.program.mem, 0, program_words - 1);
-        $readmemh(program_file, U0.wg[1].w_inst.program.mem, 0, program_words - 1);
-        $readmemh(program_file, U0.wg[2].w_inst.program.mem, 0, program_words - 1);
-        $readmemh(program_file, U0.wg[3].w_inst.program.mem, 0, program_words - 1);
+        $readmemh(program_file, progmem, 0, program_words - 1);
     end
     else begin
-        $readmemh(program_file, U0.wg[0].w_inst.program.mem);
-        $readmemh(program_file, U0.wg[1].w_inst.program.mem);
-        $readmemh(program_file, U0.wg[2].w_inst.program.mem);
-        $readmemh(program_file, U0.wg[3].w_inst.program.mem);
+        $readmemh(program_file, progmem);
+        // No count given: load everything the file actually covered.
+        program_words = 0;
+        for (w = 0; w < (1 << PROGRAM_ADDR_WIDTH); w = w + 1) begin
+            if (^progmem[w] !== 1'bx) begin
+                program_words = w + 1;
+            end
+        end
     end
     if (has_data) begin
         if (data_words > 0) begin
@@ -166,11 +186,29 @@ initial begin
             U0.wg[0].w_inst.registers[4], U0.wg[0].w_inst.registers[5], U0.wg[0].w_inst.registers[6], U0.wg[0].w_inst.registers[7]);
     end
 
-    // reset is asynchronous, and the pulse is over before the first rising
-    // edge at t=10, so the wave executes its first instruction there.
+    // reset is asynchronous and is held high for the whole load, so no wave
+    // is fetching while the loader owns the instruction memory's port.
     clk = 1;
     reset = 1;
-    #7 reset = 0;
+    prog_load_enable = 1'b0;
+    prog_load_address = {PROGRAM_ADDR_WIDTH{1'b0}};
+    prog_load_data = 32'b0;
+
+    // One word per cycle.  t = 2, 12, 22 ... is well clear of the rising
+    // edges at 10, 20, 30 ...
+    #2;
+    prog_load_enable = 1'b1;
+    for (w = 0; w < program_words; w = w + 1) begin
+        prog_load_address = w[PROGRAM_ADDR_WIDTH-1:0];
+        prog_load_data = progmem[w];
+        #10;
+    end
+    prog_load_enable = 1'b0;
+
+    // The same release phase as before, 10*program_words later: the pulse is
+    // over before a rising edge, so the wave executes its first instruction
+    // on the next one and `ran` counts exactly the cycles it used to.
+    #5 reset = 0;
 
     // Step one cycle at a time so that the run stops at s_endpgm instead of
     // burning the whole budget.  t = 7, 17, 27 ... is always in the low half

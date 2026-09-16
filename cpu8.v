@@ -9,9 +9,26 @@
 // condition flag.  Behaviour is unchanged cycle for cycle; see the comment at
 // the top of cpu16.v for the two places where preserving that needed an
 // explicit mux.
+//
+// THE LOADER.  See the comment on cpu16.v's: `program_write_enable` used to be
+// tied to zero, so on a device nothing could ever write the instruction memory
+// and nothing ever filled it - a synthesis tool would have been entitled to
+// replace the whole array with a constant.  Both memories now have a real load
+// port, driven from outside one word per cycle while `reset` is held high, and
+// the testbench loads through it instead of reaching into the hierarchy.
 module cpu_inst8_data8(
     input clk,
-    input reset
+    input reset,
+
+    // Instruction memory loader: one 8 bit word per cycle.
+    input prog_load_enable,
+    input [7:0] prog_load_address,
+    input [7:0] prog_load_data,
+
+    // Data memory loader: one byte per cycle.
+    input data_load_enable,
+    input [7:0] data_load_address,
+    input [7:0] data_load_data
 );
 
 parameter INST_WIDTH = 8;
@@ -49,12 +66,18 @@ reg data_read_enable;
 reg [7:0] data_address;
 reg [7:0] data_in_data;
 wire [7:0] data_out_data;
+// The loader's mux in front of the data memory's one port.  The CPU is in
+// reset while the host loads, so this is a multiplexer and not a second port.
+wire data_mem_write_enable = data_load_enable | data_write_enable;
+wire [7:0] data_mem_address = data_load_enable ? data_load_address : data_address;
+wire [7:0] data_mem_in_data = data_load_enable ? data_load_data : data_in_data;
+
 memory data(
     .clk(clk),
-    .write_enable(data_write_enable),
+    .write_enable(data_mem_write_enable),
     .enable(data_enable),
-    .address(data_address),
-    .in_data(data_in_data),
+    .address(data_mem_address),
+    .in_data(data_mem_in_data),
     .out_data(data_out_data)
 );
 
@@ -62,10 +85,11 @@ assign data_enable = 1'b1;
 
 wire [INST_WIDTH-1:0] Inst;
 
-assign program_address = IP;
+// The fetch owns the instruction memory's port except while the loader has it.
+assign program_address = prog_load_enable ? prog_load_address : IP;
 assign program_read_enable = 1'b1;
-assign program_write_enable = 1'b0;
-assign program_in_data = 8'b00000000;
+assign program_write_enable = prog_load_enable;
+assign program_in_data = prog_load_data;
 assign Inst = stall_active ? 8'b00000000 : program_out_data;
 
 reg [7:0] registers[7:0];

@@ -25,9 +25,31 @@
 //   * `stall` used to clear itself with a blocking assignment and then be
 //     tested again in the same evaluation.  `stall_active` is that already
 //     cleared value.
+//
+// THE LOADER.  A device has to get a program into the instruction memory
+// somehow, and a hierarchical `$readmemh` from a testbench is not something
+// that survives synthesis: on hardware the array would be written by nothing
+// and initialised by nothing.  So the two memories have a real load port -
+// one word or one byte per cycle, addressed from outside - and the testbench
+// drives it exactly as a JTAG or UART loader would.  The path the board will
+// use is therefore the path the tests exercise.
+//
+// The loader is expected to be used with `reset` held high, which is what
+// makes it free: the CPU drives neither memory while it is in reset, so the
+// loader simply takes the port, and no arbitration is needed.
 module cpu_inst16_data8(
     input clk,
-    input reset
+    input reset,
+
+    // Instruction memory loader: one 16 bit word per cycle.
+    input prog_load_enable,
+    input [7:0] prog_load_address,
+    input [15:0] prog_load_data,
+
+    // Data memory loader: one byte per cycle.
+    input data_load_enable,
+    input [7:0] data_load_address,
+    input [7:0] data_load_data
 );
 
 parameter INST_WIDTH = 16;
@@ -72,7 +94,10 @@ program_memory program(
     .b_half(program_b_half),
     .b_address(program_b_address),
     .b_in_data(program_b_in_data),
-    .b_out_data(program_b_out_data)
+    .b_out_data(program_b_out_data),
+    .load_enable(prog_load_enable),
+    .load_address(prog_load_address),
+    .load_data(prog_load_data)
 );
 
 assign program_b_enable = 1'b1;
@@ -83,12 +108,19 @@ reg data_read_enable;
 reg [7:0] data_address;
 reg [7:0] data_in_data;
 wire [7:0] data_out_data;
+// The loader's mux in front of the data memory's one port.  Same argument as
+// the instruction memory's: the CPU is in reset while the host loads, so this
+// is a multiplexer rather than a second port.
+wire data_mem_write_enable = data_load_enable | data_write_enable;
+wire [7:0] data_mem_address = data_load_enable ? data_load_address : data_address;
+wire [7:0] data_mem_in_data = data_load_enable ? data_load_data : data_in_data;
+
 memory data(
     .clk(clk),
-    .write_enable(data_write_enable),
+    .write_enable(data_mem_write_enable),
     .enable(data_enable),
-    .address(data_address),
-    .in_data(data_in_data),
+    .address(data_mem_address),
+    .in_data(data_mem_in_data),
     .out_data(data_out_data)
 );
 

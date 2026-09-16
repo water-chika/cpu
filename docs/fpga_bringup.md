@@ -130,9 +130,10 @@ of them fatal. All of them are **desk findings, not tool findings**: no
 synthesis run has confirmed any of them, and confirming them is the first
 thing to do when a Vivado install exists.
 
-#### (a) The program memory will be optimised away. This is the blocker.
+#### (a) The program memory would have been optimised away. **Fixed.**
 
-`gpu16.v:156-166` instantiates the program memory as:
+This used to be the blocker, and it is worth recording what it was before
+recording what replaced it. `gpu16.v` instantiated the program memory as:
 
 ```verilog
 memory #(.DATA_WIDTH(32), .ADDR_WIDTH(PROGRAM_ADDR_WIDTH)) program (
@@ -140,32 +141,49 @@ memory #(.DATA_WIDTH(32), .ADDR_WIDTH(PROGRAM_ADDR_WIDTH)) program (
     .address(program_address), .in_data(32'b0), .out_data(Inst));
 ```
 
-`write_enable` is tied to zero. Inside `memory.v` the only assignment to the
-array is guarded by `enable & write_enable`, so on hardware **nothing can
+`write_enable` was tied to zero. Inside `memory.v` the only assignment to the
+array is guarded by `enable & write_enable`, so on hardware **nothing could
 ever write the array** - and with no `initial` block and no `$readmemh`
-outside simulation, nothing ever fills it either. A synthesis tool sees an
+outside simulation, nothing ever filled it either. A synthesis tool sees an
 array that is never written and never initialised. The legal outcome is a
 constant; the likely outcome is that `Inst` collapses to zero and takes the
 decoder, the ALU and eventually most of the design with it.
 
-In simulation this is invisible, because `testgpu.v` reaches straight into
+In simulation it was invisible, because `testgpu.v` reached straight into
 the hierarchy - `$readmemh(program_file, U0.wg[N].w_inst.program.mem, ...)`
 once per wave - and a hierarchical `$readmemh` is not something that survives
 synthesis.
 
-Consequence: **a program memory write port is not an optional debug
-nicety, it is a precondition for the design existing on a device at all.**
-That same port is what section 4.5's loader needs, so the fix and the loader
-are one piece of work. The same argument applies to `gpu16_gmem`'s array
-(`gpu16_gmem.v:47`), which *is* written by the design so will not be trimmed,
-but whose contents at power-up are undefined - every test that passes `+data`
-needs that array loaded from outside.
+**What is there now.** Every module that owns an instruction memory carries a
+real load port, and every testbench drives it instead of reaching into the
+hierarchy, so the path a board will use is the path the 68 tests exercise:
 
-The cheapest shape for the fix, to be designed properly later: a second write
-port on the wave's program memory - `memory.v`'s `program_memory` already
-demonstrates the two-port pattern for cpu16 - driven by a debug block, with
-the four waves' copies written together, since every wave runs the same
-program.
+| Module | Port | Width |
+|--------|------|-------|
+| `gpu16` | `prog_load_enable` / `prog_load_address` / `prog_load_data` | one 32-bit instruction per cycle |
+| `gpu16_cu` | the same three, broadcast to all four waves at once | one instruction per cycle into four copies |
+| `cpu_inst16_data8` | `prog_load_*` (16-bit words) and `data_load_*` (bytes) | one word or byte per cycle |
+| `cpu_inst8_data8` | `prog_load_*` and `data_load_*` (bytes) | one byte per cycle |
+| `digital_tube_board` | both, brought out to board pins | as above |
+
+Three properties of the shape chosen, all deliberate:
+
+* **It is a multiplexer, not an extra memory port.** The host loads with
+  `reset` held high, so the fetch is not using the instruction memory and the
+  loader simply takes the port. In `gpu16.v` that is one address mux and one
+  data mux; in `memory.v`'s `program_memory` the loader takes priority over
+  port B inside the one `always` block that already wrote the array, so
+  `ld_p` / `st_p` keep the port they had. Nothing gains a write port it did
+  not already have, so no memory inference is made harder.
+* **The four wave copies are written together**, because a workgroup is one
+  kernel over four waves (section 3.3 of `gpu_isa.md`), which is what section
+  4.5's address map already assumed.
+* **The CPUs' data memories got the same treatment**, because
+  `$readmemh(U0.data.mem)` is the same defect wearing a different hat. The one
+  array still loaded hierarchically after this fix is `gpu16_gmem`.
+
+`prog_load_enable` must be low while a wave runs; the port is not an
+alternative instruction path, it is a loader.
 
 #### (b) Every memory in the design is asynchronous-read, so none of it is BRAM
 
@@ -265,7 +283,7 @@ out by hierarchical reference, and none of that exists on a device:
 
 | Simulation does | Hardware needs |
 |-----------------|----------------|
-| `$readmemh(prog, U0.wg[N].w_inst.program.mem)` x4 | a real write port on the program memory, written over JTAG |
+| ~~`$readmemh(prog, U0.wg[N].w_inst.program.mem)` x4~~ **done**: the testbench clocks the program in through `prog_load_*` | the same port, driven over JTAG instead of by a testbench |
 | `$readmemh(data, U0.data.mem)` | a real write port into `gpu16_gmem` |
 | `reset = 1; #7 reset = 0;` | a reset the host can pulse, released synchronously |
 | `while (ran < cycles && U0.halted !== 1)` | `halted` in a status register the host can poll, plus a cycle counter and a timeout |
@@ -413,7 +431,7 @@ tool.** The right-hand column is what to compare against once one has.
 
 | Module | State | Hand estimate | Confirm with |
 |--------|-------|---------------|--------------|
-| program memory x4 (`memory.v` via `gpu16.v:156`) | 4 x 131 Kbit, async read, never written | ~2,000 LUTs/wave, ~8-10k LUTs total *or the whole thing trimmed away*, see 2.2(a) | utilisation report, LUTRAM row |
+| program memory x4 (`memory.v` via `gpu16.v`) | 4 x 131 Kbit, written through the loader port of 2.2(a) | ~2,000 LUTs/wave, ~8-10k LUTs total; no longer at risk of being trimmed | utilisation report, LUTRAM row |
 | `vregs` x4 (`gpu16_vector.v:138`) | 4 x 8 Kbit | LUTRAM if the tool can, ~32k FFs if it cannot | primitive inference report |
 | `accs` x4 (`gpu16_vector.v:153`) | 4 x 16 Kbit | as above, ~64k FFs worst case | primitive inference report |
 | `gpu16_lds` | 64 Kbit, 16 banks x 128 x 32, async read | ~1,000 LUTs of LUTRAM; **not** the 8 BRAM18 section 7.5 predicts | utilisation report, BRAM row = 0 |
@@ -693,17 +711,21 @@ a bench.
 cost thousands; the timing report closes trivially; on the device nothing
 happens.
 
-**Cause.** Section 2.2(a): the program memory is never written and never
-initialised, so `Inst` is a constant and the tool trimmed the decoder, the
-ALU and the register file behind it.
+**Cause.** The old version of section 2.2(a): the program memory was never
+written and never initialised, so `Inst` was a constant and the tool trimmed
+the decoder, the ALU and the register file behind it.
 
-**Fix.** The program memory write port. It is not optional.
+**Fix.** The program memory write port, which now exists - `prog_load_*` on
+`gpu16`, `gpu16_cu` and both CPUs. If this symptom appears anyway, check that
+the top level actually connects those ports rather than tying them off, which
+recreates the original defect exactly.
 
 *Caught by:* a **synthesis run at the desk**, reading the utilisation report
-before making a bitstream. Not caught by any simulation, because
-`testgpu.v`'s hierarchical `$readmemh` fills an array that hardware has no
-way to fill. This is the single most likely way to waste a first board
-session.
+before making a bitstream. It was not caught by any simulation while
+`testgpu.v` filled the array with a hierarchical `$readmemh`; now that the
+testbench loads through the port, a loader that does not work is a test
+failure rather than a bench surprise. This used to be the single most likely
+way to waste a first board session.
 
 ### 5.2 `DONE` never asserts / the device does not configure
 
@@ -875,7 +897,6 @@ The distinction this whole document turns on.
 
 Everything in section 2.2 and section 4.2 falls here. In particular:
 
-* that the program memory would be **optimised away** (2.2a);
 * that **no array in the design can infer as BRAM** (2.2b), which contradicts
   `gpu_isa.md` 7.5's "8 BRAM18";
 * that `vregs`/`accs` **may become flip-flops** (2.2c);
@@ -908,8 +929,9 @@ acquiring or connecting anything.
 
 1. Install Vivado; synthesise `gpu16_cu` as-is; read the utilisation and
    timing reports. Confirm or refute section 2.2. *(No board.)*
-2. Write the program-memory write port and the debug wrapper; write the
-   bus-driven testbench; get the 23 gpu tests green through it, in
+2. The program-memory write port is **done** (2.2a). What is left of this
+   step is the debug wrapper and the bus-driven testbench: get the 23 gpu
+   tests green through a bus port rather than through plusargs, in
    simulation. *(No board.)*
 3. Take L1 unconditionally; re-run all 68 tests. *(No board.)*
 4. Identify the device (4.1). *(Board, no bitstream.)*

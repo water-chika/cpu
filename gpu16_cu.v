@@ -59,7 +59,16 @@ module gpu16_cu #(
     input [2:0] waves,
 
     // High once every launched wave has retired its s_endpgm.
-    output halted
+    output halted,
+
+    // The program memory loader, section 2.2(a) of docs/fpga_bringup.md.  One
+    // instruction word per cycle, written into all four waves at once: every
+    // wave of a workgroup runs the same program, so the four private copies
+    // of the instruction memory are four copies of one thing and there is no
+    // reason for the host to write them one at a time.
+    input prog_load_enable,
+    input [PROGRAM_ADDR_WIDTH-1:0] prog_load_address,
+    input [31:0] prog_load_data
 );
 
 localparam WAVES = 4;
@@ -406,7 +415,10 @@ generate
             .perf_gmem_trans_in(perf_gmem_trans),
             .perf_lds_cycles_in(perf_lds_cycles),
             .perf_mma_busy_in(perf_mma_busy),
-            .halted(w_halted[w])
+            .halted(w_halted[w]),
+            .prog_load_enable(prog_load_enable),
+            .prog_load_address(prog_load_address),
+            .prog_load_data(prog_load_data)
         );
     end
 endgenerate

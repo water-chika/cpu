@@ -27,9 +27,19 @@ endmodule
 // six digit seven segment display.  It used to instantiate a module called
 // "main", which was renamed to cpu_inst8_data8 when main.v became cpu8.v, and
 // it used to be called "test", which collided with the testbench in test.v.
+// The loader is brought out to the board's own pins rather than tied off: a
+// bitstream does not carry a program, so without this port the board would
+// come up with an instruction memory that nothing had ever written.  See
+// docs/fpga_bringup.md section 2.2(a).
 module digital_tube_board(
     input clk,
     input reset,
+    input prog_load_enable,
+    input [7:0] prog_load_address,
+    input [7:0] prog_load_data,
+    input data_load_enable,
+    input [7:0] data_load_address,
+    input [7:0] data_load_data,
     output [7:0] dig,
     output reg [5:0] sel
     );
@@ -38,7 +48,13 @@ module digital_tube_board(
 
     cpu_inst8_data8 U0(
     .clk(counter[20]),
-    .reset(reset)
+    .reset(reset),
+    .prog_load_enable(prog_load_enable),
+    .prog_load_address(prog_load_address),
+    .prog_load_data(prog_load_data),
+    .data_load_enable(data_load_enable),
+    .data_load_address(data_load_address),
+    .data_load_data(data_load_data)
     );
 
     reg [3:0] digits[5:0];
