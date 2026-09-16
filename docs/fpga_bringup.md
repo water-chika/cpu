@@ -508,3 +508,174 @@ timing - `testgpu.v` drives `reset = 1; #7 reset = 0;` with no synchroniser
 at all, and an unsynchronised release is invisible in an event simulator. The
 reset synchroniser is therefore untestable at the desk and belongs on the
 short list in spirit, if not on the critical path.
+
+### 4.5 Programs in and results out, over JTAG only
+
+No UART, no Ethernet, no external memory: the JTAG cable is the entire IO
+system. Three mechanisms are available and they are not equivalent.
+
+| Mechanism | Can load a program? | Can read results? | Cost per test |
+|-----------|--------------------|--------------------|---------------|
+| **JTAG-to-AXI Master** (`create_hw_axi_txn` / `run_hw_axi` from Tcl) | yes, any address, at run time | yes, any address | a few hundred transactions |
+| **BRAM init via `updatemem`** / hardware manager | yes, but only as part of a bitstream | no | a full implementation run, minutes |
+| **ILA / VIO** | no (VIO can drive a handful of control bits) | capture window only, not memory | free once instantiated |
+
+**Decision: JTAG-to-AXI Master as the transport; ILA and VIO as
+instrumentation; BRAM init rejected.**
+
+The reasoning, in order of weight:
+
+1. **Results have to come back.** The whole comparison in 4.6 is against
+   `.expect` files, so the host must read 16 scalar registers and 256 VGPR
+   words after each run. `updatemem` is a one-way street - it can put a
+   program in, and has no path back at all. That alone disqualifies it.
+2. **68 programs must not mean 68 bitstreams.** `updatemem` rewrites
+   memory contents inside a bitstream; each test program would need a new
+   bitstream and a new configuration. At minutes per implementation run that
+   turns a test suite into an afternoon. JTAG-to-AXI writes memory on a
+   running device, so all the tests share one bitstream.
+3. **The memories are not BRAMs anyway.** Section 2.2(b): every array in the
+   design is asynchronous-read, so `updatemem` has nothing to target. Making
+   `updatemem` work would mean converting the program memory to a registered
+   read port - which is a worthwhile change on its own merits for Fmax, but
+   it is a change to verified RTL to enable the weaker of two mechanisms.
+4. **ILA cannot load.** It is a capture buffer. It is still worth having:
+   with `halted`, `PC`, `Inst`, `bubble`, `exec`, the grant signals and
+   `perf_mma_busy` on an ILA, a hung program shows its own last instruction,
+   which is the single most useful piece of evidence in section 5. A VIO
+   driving reset/launch/`waves` is a good manual override when the AXI path
+   itself is suspect - it uses no pins and no extra cable.
+
+The debug wrapper this implies, sketched as an address map (to be designed
+and simulated in Phase 0, section 2.3, not invented at the bench):
+
+| Offset | Access | Contents |
+|--------|--------|----------|
+| `0x0000` | W | control: `reset`, `launch`, `waves[2:0]` |
+| `0x0004` | R | status: `halted`, `running`, `timeout` |
+| `0x0008` | R | cycle counter (see 4.6) |
+| `0x0010..0x001f` | W | launch parameters: `kernel_arg_ptr`, `group_id_x`, `group_id_y`, `wave_id_base` |
+| `0x0100..0x010f` | R | `perf_gmem_bytes`, `perf_gmem_trans`, `perf_lds_cycles`, `perf_mma_busy` |
+| `0x1000..` | W | program memory, written to all waves at once |
+| `0x4000..` | RW | global memory (`gpu16_gmem`), for `+data` in and results out |
+| `0x8000..` | R | wave 0's 16 scalar registers |
+| `0x9000..` | R | wave 0's 256 VGPR words |
+
+Two notes on that map. The scalar and VGPR windows are **read-only debug
+views of flip-flops**, not memories; they are what replaces `testgpu.v`'s
+hierarchical references, and they are the part most likely to perturb timing,
+because they add fanout on every register in the file. If 3.1 says they cost
+Fmax, the alternative is a serial shift-out chain, slower to read but almost
+free in timing. And the program-memory window writes all four wave copies
+from one address, because `testgpu.v` already establishes that every wave
+runs the same program.
+
+**Throughput.** Tcl-driven `run_hw_axi` transactions are slow - milliseconds
+each is a reasonable planning assumption. With L1 applied (256-word program
+memory) a full program load is 256 writes; a full readback is 272 reads. That
+is seconds per test, which is fine for 23 tests. Without L1 it is 4096 writes
+per test, which is not. This is a second, independent reason to take L1.
+
+*What simulation would have caught:* all of it. Section 2.3's bus-driven
+testbench exercises this exact address map and this exact sequence, so the
+only failures left for the bench are electrical and tool-related ones.
+
+### 4.6 The same programs, against the same `.expect` files
+
+This is the point of the exercise, and the rule is that **nothing is
+re-written for hardware**. Specifically:
+
+* the same `asm_gpu16` binary assembles the same `tests/*.s` into the same
+  hex;
+* the same `tests/*.expect` and `tests/*.vexpect` files are the reference;
+* the comparison prints the same `TEST PASS: ...` / `MISMATCH: s%0d = ...`
+  lines `testgpu.v` prints, so CTest's existing `FAIL_REGULAR_EXPRESSION`
+  wiring works unchanged;
+* the hardware runner is added as a CTest suite guarded by a CMake option
+  (say `GPU16_HW_TARGET`), defaulting off, so a machine with no board runs
+  exactly the 68 tests it runs today.
+
+The runner is then a loop per test: write the program, write `+data` if the
+test has one, write the launch parameters, pulse reset, set `launch`, poll
+`halted` with a timeout in host time, read back the registers, compare.
+
+Three things to compare beyond pass/fail, because they cost nothing once the
+readback exists:
+
+1. **Cycle counts, hardware against simulation.** Section 3.4 argues they
+   must be *identical*. A difference means the wrapper disturbed the design,
+   or synthesis changed behaviour (an inferred latch, a trimmed array, an
+   X-state that simulation resolved optimistically and hardware did not).
+   This is the most sensitive bug detector available on the board and it is
+   free. The cycle counter at `0x0008` exists only for this - the RTL has
+   perf counters but no cycle counter, and `testgpu.v` counts cycles in the
+   testbench, which does not synthesise.
+2. **Perf counters, hardware against simulation.** Same argument, four more
+   numbers. `gpu_mma_perf` already asserts known values for them.
+3. **Wall-clock time**, which is the only genuinely new number: cycles
+   divided by the Fmax of 3.1.
+
+Order the hardware test set to bisect: `gpu_alu` first (scalar only), then
+`gpu_branch` and `gpu_exec` (control flow), `gpu_vector` (the lanes),
+`gpu_lds`/`gpu_bank` (the LDS), `gpu_global`/`gpu_coalesce` (the global
+port), `gpu_mma*` (the matrix unit), `gpu_wg` last (four waves and the
+barrier). Each step adds exactly one subsystem, so the first failure names
+its own suspect.
+
+### 4.7 The perf counters, and which section 7 predictions this can settle
+
+The four counters in `gpu16_cu.v:312-357` become readable over JTAG through
+the map in 4.5, which lets a hardware run report four of `gpu_isa.md` section
+7.2's six metrics directly: **cycles** (via the new counter), **bytes**
+(`perf_gmem_bytes`), **matrix utilisation** (`perf_mma_busy / cycles`), and
+**AI** (MACs from the program, bytes from the counter). **Instructions** has
+no counter and would need one - a trivial addition, gated on the 68 tests.
+**Lane efficiency** has no counter either and is the harder one, since it
+needs the useful-lane population count per issued instruction summed over the
+run; it is cheap in hardware (a 16-bit popcount of `exec` on every vector
+issue) and would be a genuine addition to what the repo can measure.
+
+Now the honest part.
+
+**What hardware can finally test:**
+
+* **Fmax**, and therefore every wall-clock and GMAC/s claim in section 7.5.
+  The "100 MHz is comfortable" assumption is exactly the kind of statement
+  this plan exists to replace with a number.
+* **Resource fit**, and therefore 7.5's "32 DSP48E1 slices" and "8 BRAM18"
+  claims. The second is **already falsified by reading** - section 2.2(b),
+  an asynchronous-read array cannot be a BRAM - and the first depends on a
+  DSP packing inference that `gpu16_matrix.v` was not written to invite.
+* **That synthesis preserves behaviour**, via the cycle-count and
+  perf-counter comparison of 4.6. Nothing else in the repo tests that.
+* **7.5's conclusion that "if the goal were performance, the project should
+  stop at the FPGA"** - at least in the weak form of a real
+  cycles-per-second number for the kernels that fit.
+
+**What hardware cannot test, and why:**
+
+* **Any of the six section 7 benchmark kernels.** `gpu16_gmem` is
+  instantiated with `DATA_INDEX_WIDTH = 10` (`gpu16_cu.v:276-288`), i.e.
+  1024 words = **4 KiB of global memory, on-chip, with no external memory
+  interface anywhere in the design**. `gemm64` alone needs its A, B and C
+  tiles in global memory, `axpy16k` names 16k elements, and `gemm256` moves
+  1.00 MiB by section 7.3's own table. None of them fit, and none of them fit
+  *in simulation either* - this is a property of the RTL, not of the board.
+  So the 535x-639x speedup claims stay untested at every tier until a memory
+  subsystem exists, and that is the single most important thing this plan
+  turned up. Raising `DATA_INDEX_WIDTH` does not fix it: at 64 KiB the array
+  would be 512 Kbit of asynchronous-read LUTRAM, which is worse than the
+  program memory problem. A real fix is a registered-read BRAM-backed global
+  memory, or a DDR controller, and either is new RTL with new tests.
+* **7.5's DDR3 bandwidth argument** ("the board's DDR3 delivers ~1.3 GB/s
+  against the 363 MB/s the kernel wants"), for the same reason: there is no
+  memory controller and no external memory port in this design. That
+  paragraph describes a machine that does not exist yet.
+* **Anything about sky130** - section 7.5's area budget, 7.6's cost and
+  power. An FPGA says nothing about an ASIC's area or power, and this
+  document should not pretend otherwise.
+* **The cpu16w baseline** (7.2), which is explicitly a fiction: 32-bit
+  registers and a 24-bit data address that `cpu16.v` does not have. Every
+  speedup ratio in 7.3 is against a machine no one has built. Running the
+  real `cpu16.v` on the board measures the real cpu16, which is a different
+  and much smaller claim.
