@@ -929,6 +929,21 @@ take the 5-bit fields for free instead, by absorbing an argument field that
 only two instructions use, implement 16 registers anyway, and solve the actual
 kernel problem with a bit that is already dead in ```v_ld16_g```.
 
+## Putting it on an FPGA
+
+[```docs/fpga_bringup.md```](docs/fpga_bringup.md) is a plan, not a build:
+there is no Vivado on the machine it was written on, so everything it says
+about synthesis comes from reading the RTL rather than from a report.  It is
+simulation-first on purpose - the 68 tests already settle functional
+correctness, so a board can only add ```Fmax```, fit and the things outside
+the RTL - and it carries two findings worth reading before anyone buys a
+board.  The program memory is instantiated with ```write_enable``` tied low
+and has no ```initial``` block, so a synthesis tool has nothing to keep it
+alive; and global memory is 4 KiB on chip with no external memory interface,
+so not one of the six benchmark kernels in
+[```docs/gpu_isa.md```](docs/gpu_isa.md) section 7 can run, on a board or in
+simulation.
+
 ## Removed modules
 
 Two modules were deleted rather than repaired, because neither could be given
