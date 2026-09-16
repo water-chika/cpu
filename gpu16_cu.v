@@ -42,9 +42,29 @@
 // so a single shared instruction memory would need four read ports; giving
 // each wave its own copy of the program is the honest simulation of a fetch
 // path that never misses, and costs nothing that the ISA can observe.
+//
+// GLOBAL MEMORY, INSIDE OR OUTSIDE.  `EXTERNAL_GMEM` picks which:
+//
+//   * 0, the default, instantiates a `gpu16_gmem` of `DATA_INDEX_WIDTH`
+//     words inside the compute unit.  That is the on-chip configuration, and
+//     what a small FPGA can actually hold.
+//   * 1 removes it and brings the same port out of the module instead, so a
+//     testbench, a DDR controller wrapper or anything else can back it with a
+//     memory of any size.  The port is the module's own port, unmodified: one
+//     aligned 64 byte block per cycle, byte enabled, read data one cycle
+//     after the address.  That is deliberately a protocol a BRAM implements
+//     directly and a DRAM controller can implement behind a stall - which
+//     this design has no way to express yet, so a controller is a later
+//     piece of work (docs/fpga_bringup.md 4.7).
+//
+// The block index brought out is the full **18 bits** of section 3's 24 bit
+// byte address, not `DATA_INDEX_WIDTH - 4`: the external memory is the thing
+// that decides how much of the architectural 16 MiB it implements, and the
+// compute unit should not be the part that truncates.
 module gpu16_cu #(
     parameter PROGRAM_ADDR_WIDTH = 12,
-    parameter DATA_INDEX_WIDTH = 10
+    parameter DATA_INDEX_WIDTH = 10,
+    parameter EXTERNAL_GMEM = 0
 ) (
     input clk,
     input reset,
@@ -68,7 +88,17 @@ module gpu16_cu #(
     // reason for the host to write them one at a time.
     input prog_load_enable,
     input [PROGRAM_ADDR_WIDTH-1:0] prog_load_address,
-    input [31:0] prog_load_data
+    input [31:0] prog_load_data,
+
+    // The external global memory port, live only when EXTERNAL_GMEM = 1.
+    // When it is 0 these still carry the internal memory's traffic, which
+    // costs nothing and makes the port usable as a bus monitor.
+    output [17:0] gmem_block_index,
+    output gmem_write_enable,
+    output [63:0] gmem_byte_enable,
+    output [511:0] gmem_in_block,
+    // Read data for the block index presented on the previous clock edge.
+    input [511:0] gmem_out_block
 );
 
 localparam WAVES = 4;
@@ -282,19 +312,34 @@ gpu16_matrix matrix (
     .acc_out(m_result)
 );
 
-gpu16_gmem #(
-    .WORD_INDEX_WIDTH(DATA_INDEX_WIDTH)
-) data (
-    .clk(clk),
-    // The data address is a 24 bit *byte* address and a block is 64 bytes,
-    // so the block index drops the low six.  This instance implements only
-    // the low DATA_INDEX_WIDTH words of that space.
-    .block_index(g_block[DATA_INDEX_WIDTH-5:0]),
-    .write_enable(g_write),
-    .byte_enable(g_byte_enable),
-    .in_block(g_wdata),
-    .out_block(g_rdata)
-);
+// The data address is a 24 bit *byte* address and a block is 64 bytes, so
+// the block index drops the low six.
+assign gmem_block_index = g_block;
+assign gmem_write_enable = g_write;
+assign gmem_byte_enable = g_byte_enable;
+assign gmem_in_block = g_wdata;
+
+generate
+if (EXTERNAL_GMEM == 0) begin : internal_gmem
+    // On-chip: this instance implements only the low DATA_INDEX_WIDTH words
+    // of the architectural space, and anything above wraps into it.
+    gpu16_gmem #(
+        .WORD_INDEX_WIDTH(DATA_INDEX_WIDTH)
+    ) data (
+        .clk(clk),
+        .block_index(g_block[DATA_INDEX_WIDTH-5:0]),
+        .write_enable(g_write),
+        .byte_enable(g_byte_enable),
+        .in_block(g_wdata),
+        .out_block(g_rdata)
+    );
+end
+else begin : external_gmem
+    // Off-chip: whoever instantiated this module owns the array, and owns
+    // the decision about how big it is.
+    assign g_rdata = gmem_out_block;
+end
+endgenerate
 
 gpu16_lds lds (
     .clk(clk),

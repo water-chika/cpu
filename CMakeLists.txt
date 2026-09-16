@@ -292,6 +292,14 @@ if(IVERILOG_EXECUTABLE AND VVP_EXECUTABLE)
     add_gpu_test(gpu_coalesce tests/gpu_coalesce.s
                  tests/gpu_global.data32 gpu_coalesce.expect 300)
 
+    # And the thing four KiB of on-chip memory could not do at all: address
+    # two regions three quarters of a megabyte apart and get two different
+    # answers back.  This is the test for the external global memory port
+    # (docs/fpga_bringup.md 4.7); it fails by aliasing if the compute unit is
+    # built with EXTERNAL_GMEM = 0 and its own 1024 word array.
+    add_gpu_test(gpu_gfar tests/gpu_gfar.s - gpu_gfar.expect 300
+                 +vexpect=${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_gfar.vexpect)
+
     # The LDS, sections 3.2 and 4.9.  gpu_lds checks what the four access
     # instructions move, including the byte enables inside a bank word and
     # both halves of the exec rule; gpu_bank checks the thing values cannot

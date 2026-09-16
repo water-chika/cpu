@@ -44,7 +44,13 @@
 module testgpu();
 
 parameter PROGRAM_ADDR_WIDTH = 12;
-parameter DATA_INDEX_WIDTH = 10;
+// Global memory lives *outside* the compute unit here, so this is the size of
+// the testbench's stand-in for off-chip memory rather than a statement about
+// the hardware.  2^18 words is 1 MiB, which is what section 7.3's largest
+// kernel, `gemm256`, moves; the on-chip default of 1024 words (4 KiB) could
+// not hold any of section 7's benchmarks at all, which is why the port
+// exists (docs/fpga_bringup.md 4.7).
+parameter DATA_INDEX_WIDTH = 18;
 
 reg clk;
 reg reset;
@@ -84,9 +90,53 @@ reg [31:0] prog_load_data;
 reg [31:0] progmem[0:(1<<PROGRAM_ADDR_WIDTH)-1];
 integer w;
 
+// The global memory, and its loader.  `gpu16_cu` is built with
+// EXTERNAL_GMEM = 1, so the array is the testbench's: this is the stand-in
+// for whatever a board would put on the other side of that port, and being
+// outside the compute unit is the entire point - it is how a working set
+// bigger than an FPGA's block RAM becomes possible.
+//
+// It is loaded the same way the program is, through the port, one aligned
+// 64 byte block per cycle with reset held high.  It used to be a
+// `$readmemh(data_file, U0.data.mem)` straight into the compute unit's
+// hierarchy, which is not something a device can do.
+reg [31:0] datamem[0:(1<<DATA_INDEX_WIDTH)-1];
+reg data_load_enable;
+reg [17:0] data_load_block;
+reg [511:0] data_load_data;
+integer blk;
+integer word;
+integer data_blocks;
+
+wire [17:0] cu_gmem_block_index;
+wire cu_gmem_write_enable;
+wire [63:0] cu_gmem_byte_enable;
+wire [511:0] cu_gmem_in_block;
+wire [511:0] gmem_out_block;
+
+// The loader owns the port while it is enabled; the compute unit owns it
+// afterwards.  Nothing arbitrates, because nothing needs to: the loader only
+// runs while reset is high and a wave in reset issues nothing.
+wire [17:0] gmem_block_index = data_load_enable ? data_load_block : cu_gmem_block_index;
+wire gmem_write_enable = data_load_enable ? 1'b1 : cu_gmem_write_enable;
+wire [63:0] gmem_byte_enable = data_load_enable ? {64{1'b1}} : cu_gmem_byte_enable;
+wire [511:0] gmem_in_block = data_load_enable ? data_load_data : cu_gmem_in_block;
+
+gpu16_gmem #(
+    .WORD_INDEX_WIDTH(DATA_INDEX_WIDTH)
+) gmem (
+    .clk(clk),
+    .block_index(gmem_block_index[DATA_INDEX_WIDTH-5:0]),
+    .write_enable(gmem_write_enable),
+    .byte_enable(gmem_byte_enable),
+    .in_block(gmem_in_block),
+    .out_block(gmem_out_block)
+);
+
 gpu16_cu #(
     .PROGRAM_ADDR_WIDTH(PROGRAM_ADDR_WIDTH),
-    .DATA_INDEX_WIDTH(DATA_INDEX_WIDTH)
+    .DATA_INDEX_WIDTH(DATA_INDEX_WIDTH),
+    .EXTERNAL_GMEM(1)
 ) U0 (
     .clk(clk),
     .reset(reset),
@@ -98,7 +148,12 @@ gpu16_cu #(
     .halted(),
     .prog_load_enable(prog_load_enable),
     .prog_load_address(prog_load_address),
-    .prog_load_data(prog_load_data)
+    .prog_load_data(prog_load_data),
+    .gmem_block_index(cu_gmem_block_index),
+    .gmem_write_enable(cu_gmem_write_enable),
+    .gmem_byte_enable(cu_gmem_byte_enable),
+    .gmem_in_block(cu_gmem_in_block),
+    .gmem_out_block(gmem_out_block)
 );
 
 initial begin
@@ -166,12 +221,20 @@ initial begin
             end
         end
     end
+    // Into the testbench's own array first, like the program; the clocking in
+    // through the port happens below, after reset has been asserted.
     if (has_data) begin
         if (data_words > 0) begin
-            $readmemh(data_file, U0.data.mem, 0, data_words - 1);
+            $readmemh(data_file, datamem, 0, data_words - 1);
         end
         else begin
-            $readmemh(data_file, U0.data.mem);
+            $readmemh(data_file, datamem);
+            data_words = 0;
+            for (word = 0; word < (1 << DATA_INDEX_WIDTH); word = word + 1) begin
+                if (^datamem[word] !== 1'bx) begin
+                    data_words = word + 1;
+                end
+            end
         end
     end
     $readmemh(expect_file, expected);
@@ -193,6 +256,9 @@ initial begin
     prog_load_enable = 1'b0;
     prog_load_address = {PROGRAM_ADDR_WIDTH{1'b0}};
     prog_load_data = 32'b0;
+    data_load_enable = 1'b0;
+    data_load_block = 18'b0;
+    data_load_data = 512'b0;
 
     // One word per cycle.  t = 2, 12, 22 ... is well clear of the rising
     // edges at 10, 20, 30 ...
@@ -205,9 +271,26 @@ initial begin
     end
     prog_load_enable = 1'b0;
 
-    // The same release phase as before, 10*program_words later: the pulse is
-    // over before a rising edge, so the wave executes its first instruction
-    // on the next one and `ran` counts exactly the cycles it used to.
+    // Then the data image, one 64 byte block per cycle on the same schedule.
+    // A partially covered last block is written whole; the words the file did
+    // not cover are x, which is what they would have been anyway.
+    data_blocks = (data_words + 15) / 16;
+    if (has_data && data_blocks > 0) begin
+        data_load_enable = 1'b1;
+        for (blk = 0; blk < data_blocks; blk = blk + 1) begin
+            data_load_block = blk[17:0];
+            for (word = 0; word < 16; word = word + 1) begin
+                data_load_data[32*word+:32] = datamem[blk*16 + word];
+            end
+            #10;
+        end
+        data_load_enable = 1'b0;
+    end
+
+    // The same release phase as before, one clock per loaded word and block:
+    // the pulse is over before a rising edge, so the wave executes its first
+    // instruction on the next one and `ran` counts exactly the cycles it
+    // used to.
     #5 reset = 0;
 
     // Step one cycle at a time so that the run stops at s_endpgm instead of

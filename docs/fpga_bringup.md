@@ -180,7 +180,9 @@ Three properties of the shape chosen, all deliberate:
   4.5's address map already assumed.
 * **The CPUs' data memories got the same treatment**, because
   `$readmemh(U0.data.mem)` is the same defect wearing a different hat. The one
-  array still loaded hierarchically after this fix is `gpu16_gmem`.
+  array still loaded hierarchically after this fix was `gpu16_gmem`, and it
+  is loaded through a port too now - see 4.7, where it fell out of giving the
+  compute unit an external memory interface.
 
 `prog_load_enable` must be low while a wave runs; the port is not an
 alternative instruction path, it is a loader.
@@ -344,7 +346,7 @@ out by hierarchical reference, and none of that exists on a device:
 | Simulation does | Hardware needs |
 |-----------------|----------------|
 | ~~`$readmemh(prog, U0.wg[N].w_inst.program.mem)` x4~~ **done**: the testbench clocks the program in through `prog_load_*` | the same port, driven over JTAG instead of by a testbench |
-| `$readmemh(data, U0.data.mem)` | a real write port into `gpu16_gmem` |
+| ~~`$readmemh(data, U0.data.mem)`~~ | **done** - `testgpu.v` owns the memory and loads it a block per cycle through `gpu16_cu`'s external global memory port |
 | `reset = 1; #7 reset = 0;` | a reset the host can pulse, released synchronously |
 | `while (ran < cycles && U0.halted !== 1)` | `halted` in a status register the host can poll, plus a cycle counter and a timeout |
 | `U0.wg[0].w_inst.registers[i]` | a readback path for the 16 scalar registers |
@@ -499,7 +501,7 @@ tool.** The right-hand column is what to compare against once one has.
 | `vregs` x4 (`gpu16_vector.v:138`) | 4 x 8 Kbit | LUTRAM if the tool can, ~32k FFs if it cannot | primitive inference report |
 | `accs` x4 (`gpu16_vector.v:153`) | 4 x 16 Kbit | as above, ~64k FFs worst case | primitive inference report |
 | `gpu16_lds` | 64 Kbit, 16 banks x 128 x 32, registered read | 8 BRAM18 if the banks infer, which 2.2(b) has at least made possible; ~1,000 LUTs of LUTRAM if they do not | utilisation report, BRAM row |
-| `gpu16_gmem` | parameterised; 32 Kbit (4 KiB) at the default width, registered read, 16 words wide | the 512-bit port is the awkward part - a 16-word-wide read may want 16 BRAM18 in parallel rather than one | utilisation report |
+| `gpu16_gmem` | parameterised, and optional: `EXTERNAL_GMEM = 1` removes it entirely. 32 Kbit (4 KiB) at the default width, registered read, 16 words wide | the 512-bit port is the awkward part - a 16-word-wide read may want 16 BRAM18 in parallel rather than one | utilisation report |
 | `gpu16_matrix` | none (combinational) | 64 signed 8x8 MACs: 64 DSP48, 32 packed DSP48, or ~4-5k LUTs | DSP row; check against 7.5's claim of 32 |
 | scalar+decode logic x4 (`gpu16.v`) | ~100 FFs/wave | ~2-3k LUTs/wave | utilisation report |
 | `gpu16_cu` arbiters, counters, barrier | ~200 FFs | ~500 LUTs | utilisation report |
@@ -742,23 +744,43 @@ Now the honest part.
 
 **What hardware cannot test, and why:**
 
-* **Any of the six section 7 benchmark kernels.** `gpu16_gmem` is
-  instantiated with `DATA_INDEX_WIDTH = 10` (`gpu16_cu.v:276-288`), i.e.
-  1024 words = **4 KiB of global memory, on-chip, with no external memory
-  interface anywhere in the design**. `gemm64` alone needs its A, B and C
-  tiles in global memory, `axpy16k` names 16k elements, and `gemm256` moves
-  1.00 MiB by section 7.3's own table. None of them fit, and none of them fit
-  *in simulation either* - this is a property of the RTL, not of the board.
-  So the 535x-639x speedup claims stay untested at every tier until a memory
-  subsystem exists, and that is the single most important thing this plan
-  turned up. Raising `DATA_INDEX_WIDTH` does not fix it: at 64 KiB the array
-  would be 512 Kbit of asynchronous-read LUTRAM, which is worse than the
-  program memory problem. A real fix is a registered-read BRAM-backed global
-  memory, or a DDR controller, and either is new RTL with new tests.
+* **Any of the six section 7 benchmark kernels** - **no longer blocked in
+  simulation.** `gpu16_gmem` used to be instantiated inside `gpu16_cu` with
+  `DATA_INDEX_WIDTH = 10`, i.e. 1024 words = 4 KiB of global memory, on-chip,
+  with no external memory interface anywhere in the design. `gemm64` alone
+  needs its A, B and C tiles in global memory, `axpy16k` names 16k elements,
+  and `gemm256` moves 1.00 MiB by section 7.3's own table. None of them fit,
+  and none of them fit *in simulation either* - it was a property of the RTL,
+  not of the board, and it was the single most important thing this plan
+  turned up.
+
+  `gpu16_cu` now takes an `EXTERNAL_GMEM` parameter. At 0, the default, it
+  instantiates the on-chip memory exactly as before. At 1 it instantiates
+  nothing and brings the port out of the module instead - the **full 18 bit**
+  block index of section 3's 24 bit address space, byte enables, and read
+  data one cycle after the address - so the memory belongs to whoever
+  instantiated the compute unit and is as large as they make it. `testgpu.v`
+  sets it to 1 and backs it with 2^18 words = **1 MiB**, which holds
+  `gemm256`'s working set, and loads it through that same port rather than
+  with a hierarchical `$readmemh`. `tests/gpu_gfar.s` is the regression test:
+  it writes two patterns 576 KiB apart and reads both back, which the 4 KiB
+  configuration fails by aliasing them onto block 0.
+
+  What this does **not** do is make the kernels run *on a board*. It removes
+  the ceiling in simulation, which is where tier 2's numbers come from; a
+  real DDR3 or MIG controller is still unwritten, and the port was shaped -
+  one aligned 64 byte block per cycle, data one cycle later - so that one can
+  be put behind it. The missing piece is a stall: the port has no ready or
+  valid signal, because on-chip memory never needs one, so a DRAM controller
+  behind it would have to be given a way to say "not yet", and the memory
+  unit in `gpu16.v` a way to wait. That is the next piece of RTL, and it is
+  bounded work rather than an open question.
 * **7.5's DDR3 bandwidth argument** ("the board's DDR3 delivers ~1.3 GB/s
-  against the 363 MB/s the kernel wants"), for the same reason: there is no
-  memory controller and no external memory port in this design. That
-  paragraph describes a machine that does not exist yet.
+  against the 363 MB/s the kernel wants"). There is now an external memory
+  *port*, which is the half of this the design was missing entirely; there is
+  still no memory controller behind it and no stall protocol for one to use.
+  That paragraph still describes a machine that does not exist yet, but the
+  gap is now one component rather than an architectural absence.
 * **Anything about sky130** - section 7.5's area budget, 7.6's cost and
   power. An FPGA says nothing about an ASIC's area or power, and this
   document should not pretend otherwise.
@@ -963,6 +985,9 @@ The distinction this whole document turns on.
 * The program memory, the LDS and the global memory are **registered-read**,
   which is the shape a block RAM has (2.2b). That they are *shaped* right is
   verified; that a tool infers BRAM from them is not.
+* Global memory can be **outside the compute unit** (`EXTERNAL_GMEM`), so a
+  working set is not capped at 4 KiB. What is verified is a 1 MiB memory in
+  simulation; no controller for a real off-chip part exists.
 * gpu16's **functional behaviour** - scalar unit, exec mask, divergence,
   lanes, LDS banking, global coalescing, the matrix unit and the four-wave
   workgroup - against checked-in expectations.
@@ -995,8 +1020,11 @@ acquiring or connecting anything.
 
 ### Untestable on this hardware, at any point, without new RTL
 
-* All six **section 7 benchmark kernels**, because global memory is 4 KiB
-  on-chip with no external memory interface (4.7).
+* All six **section 7 benchmark kernels** *on hardware*. The 4 KiB ceiling is
+  gone - `gpu16_cu` has an external global memory port and `testgpu.v` backs
+  it with 1 MiB, so the kernels are runnable in simulation (4.7) - but the
+  port has no stall protocol and there is no DDR3 controller behind it, so a
+  board still cannot hold their working sets.
 * Everything **sky130** - section 7.5's area budget and 7.6's cost and power.
 * The **cpu16w baseline** that section 7's speedups are measured against; it
   is a fiction with 32-bit registers that `cpu16.v` does not have.

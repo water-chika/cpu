@@ -2007,7 +2007,14 @@ promote it, and no such run has happened.  Add to it, on the same evidence,
 16 more BRAM18 for the four 131 Kbit instruction memories, which this table
 forgot entirely.  100 MHz is comfortable, and the board's
 DDR3 delivers ~1.3 GB/s against the 363 MB/s the kernel wants at 100 MHz, so the FPGA is
-**compute-bound where the silicon is not**:
+**compute-bound where the silicon is not**.  That comparison needs an
+external memory to be true of anything, and half of one now exists:
+`gpu16_cu` takes an `EXTERNAL_GMEM` parameter that removes its 4 KiB on-chip
+array and brings the port out instead, which is what lets a testbench back it
+with a megabyte and run these kernels at all.  What is still missing is a
+stall - the port has no ready/valid, so a DRAM controller cannot yet tell the
+memory unit to wait - and the controller itself.  Until both exist the
+sentence above is arithmetic about a machine no one has built:
 
 `gpu16-full` on Artix-7 at 100 MHz: 288,896 cycles = **2.89 ms**,
 **5.81 GMAC/s** - 4.5x *faster* than the sky130 part.
