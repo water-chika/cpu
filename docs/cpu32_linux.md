@@ -754,19 +754,240 @@ existing 69 tests.** None of these numbers have been measured here.
 
 ### 5.1 `asm16`, `asm_gpu16` and the shared encoder
 
-### 5.2 `c16` - and why it is not the compiler a userspace needs
+The good news first, and it is genuinely good. The three assemblers are three
+`main()`s over one pipeline: `asm_kernel.hpp` holds one `struct` per ISA -
+`asm_cpu8`, `asm_cpu16`, `asm_gpu16` - and the pipeline, the parallel
+backends and `asm_encode_statement` are shared. The structs are small
+declarative things:
 
-### 5.3 The real answer: a gcc or llvm backend
+```
+struct asm_gpu16 {
+    static constexpr const char* tool = "asm_gpu16";
+    static constexpr uint32_t word_bytes = 4;
+    static constexpr int isa_tag = 32;
+    static constexpr bool comma_separated = true;
+    static constexpr bool typed_operands = true;
+    static constexpr uint32_t address_limit = 4095;
+    ...
+};
+```
 
-### 5.4 The rest of the chain: binutils, libc, init
+So **a `cpu32` assembler is a fourth struct plus a `main()`**, and it
+inherits the serial, threaded and HIP backends and the byte-for-byte
+agreement test (`backends_*`) for free. Concretely what changes:
+
+* `word_bytes = 4`, `isa_tag` - a new tag, since `32` is taken by gpu16 and
+  the tag names the ISA, not the width;
+* `address_limit` grows from 4095 to something in the tens of millions, which
+  is the moment a `uint32_t` limit stops being a hand-checkable constant;
+* the opcode table: cpu32's trap, CSR and load/store instructions, which
+  overlap gpu16's numbering where 3.1's sibling rule holds and diverge
+  where 2.4 says they will;
+* one new `backends_cpu32_{hex,bin}` pair of tests, which costs two lines of
+  CMake.
+
+Risks worth naming: `asm_gpu16`'s `la_words = 1` assumption (one `s_addpc`
+reaches any label) breaks once the address space is 32 bits and a label can
+be further away than a 16-bit immediate - so label relocation becomes a real
+two-instruction sequence, and the assembler has to decide between forms. That
+is the classic relaxation problem, and it is the only non-trivial thing in
+5.1. Budget a weekend for it, not an afternoon.
+
+**`asm_gpu16` itself does not have to change.** gpu16 keeps its 16-bit PC and
+its own ISA; this is a fourth description, not a modification of the third.
+
+### 5.2 `c16`, and why it is not the compiler a userspace needs
+
+`c16` is a real compiler with a differential oracle, two output paths that
+must agree byte for byte, and a fuzzer. It is also, by explicit design,
+**a compiler for a language with one type**:
+
+> "8 bit unsigned values only. There is one type, `int`, and it is a byte.
+> Arithmetic wraps." - `docs/c16.md`
+
+and a code generator that targets 256 instruction words and 256 bytes of
+data, with constants hard-erroring at 255 (`c16_compiler.hpp`: *"the literal
+{} does not fit in cpu16's 8 bit data"*).
+
+A `c32` in the same spirit - one 32-bit type, a larger program, a real
+immediate - is a reasonable and *worthwhile* thing to build, perhaps **2-6
+weekends** given how much of `c16` generalises, and it would be extremely
+useful for S1-S7: every one of those stages wants test programs bigger than
+hand-written assembly is pleasant for, and `c16_verify`'s differential
+technique is exactly how you trust a test program you did not hand-check.
+
+**But it is not on the path to Linux, and the plan should not pretend
+otherwise.** To compile the kernel, a compiler needs at minimum: `char`,
+`short`, `int`, `long`, `long long`, signed and unsigned, and their
+conversion rules; pointers, arrays, `struct`, `union`, `enum`, `typedef`;
+`const`/`volatile` - and `volatile` is not decoration, a kernel driver is
+wrong without it; the preprocessor; `switch`; `goto`; function pointers;
+variadic functions; bitfields; inline assembly with operand constraints;
+attributes (`packed`, `aligned`, `section`, `noinline`, `naked`);
+linker-script-aware section placement; a stable and documented ABI; and
+enough optimisation that the result fits and runs. The kernel additionally
+uses GCC extensions that are not optional in practice - statement
+expressions, `typeof`, computed `goto`, `__builtin_*`.
+
+That is not "`c16`, but wider". It is two to three orders of magnitude more
+code than `c16_compiler.hpp`, and it is the reason no hobby ISA has ever
+booted Linux on a hand-written compiler.
+
+### 5.3 The real answer: an LLVM backend or a GCC port
+
+**This is S8, and it is unavoidable.** Two routes:
+
+* **LLVM backend.** A new target is a TableGen description of registers,
+  instruction formats and patterns, plus an `ISelLowering`, a frame lowering,
+  an `AsmPrinter`/`MCTargetDesc` and a calling convention. Well-trodden;
+  the in-tree targets are readable and several exist precisely as examples.
+  Clang then needs a driver and target info. **Prediction: 4-9 months of
+  evenings** for something that compiles the kernel, on top of learning LLVM's
+  backend architecture, which is itself a substantial part of that time.
+* **GCC port.** A machine description (`.md`), a `.h` of macros and a `.c` of
+  target hooks. Older, less documented, but the kernel is a GCC codebase and
+  building it with GCC removes a whole class of "clang does not support this
+  extension" problems. **Prediction: 6-12 months**, with a steeper
+  documentation cliff.
+
+**Recommendation: LLVM**, on the grounds that the documentation and the
+example targets are better, that its test infrastructure would fit this
+repository's habits, and that clang builds the kernel today on several
+architectures. Reconsider if kernel-side friction appears.
+
+There is a third route that must be named because it changes the answer to
+section 7: **adopt an existing ISA's compiler by adopting the ISA.** That is
+the RISC-V argument, and it is made properly in section 7 rather than
+smuggled in here.
+
+### 5.4 The rest of the chain
+
+Each of these is real work that is easy to forget when costing "the
+compiler":
+
+| Piece | What it is | Rough scale |
+|---|---|---|
+| Assembler and linker | GNU binutils port, or LLVM's integrated assembler + `lld` | weeks-months; largely falls out of the LLVM route |
+| C library | newlib for bare metal; musl or uClibc-ng for Linux userspace. A new architecture needs syscall stubs, `setjmp`, `crt1`, and the atomic/TLS headers | 1-3 months |
+| Binary format | nommu needs bFLT or FDPIC-ELF, which the toolchain must emit and the kernel must load | weeks, and unpleasant |
+| Userspace | BusyBox, statically linked | days, once the libc works |
+| Debugging | no GDB port means printf-debugging a kernel; a GDB stub or a simulator trace is worth more than it costs | weeks |
+
+**The honest summary of section 5: the assembler is a weekend, a `c32` is a
+month, and the actual toolchain is the better part of a year.**
+
+---
 
 ## 6. Area, memory and the board
 
-### 6.1 What the core itself costs, against `docs/fpga_bringup.md` 4.2
+### 6.1 What the core itself costs
 
-### 6.2 The memory requirement, and why it is the binding constraint
+`docs/fpga_bringup.md` 4.2 is the only resource estimate this repository has,
+it is explicit that **"every number in this table is hand-derived and none
+has been checked by a tool"**, and nothing below improves on that. Its
+relevant rows, for one gpu16 wave:
 
-### 6.3 The missing DDR controller and the missing ready/valid
+| Module | Hand estimate from 4.2 |
+|---|---|
+| scalar + decode logic, per wave | ~2-3k LUTs, ~100 FFs |
+| program memory, per wave | 4 BRAM18 (131 Kbit) if it infers; ~2,000 LUTs of LUTRAM if not |
+| `vregs`, `accs`, LDS, matrix unit | the vector side - **none of which cpu32 has** |
+
+A `cpu32` is the first row plus a register file plus the new units this plan
+adds. Predicted (P7), against 4.2's own numbers and in the same
+hand-derived spirit:
+
+| Piece | Prediction |
+|---|---|
+| S0 core as extracted (16 x 32 regs, ALU, decode, branch) | ~2-3k LUTs, ~600 FFs |
+| S2 load/store unit | +0.5-1k LUTs |
+| S3 trap architecture and CSR file | +1-2k LUTs, +400 FFs - CSRs are flip-flops, and there are a lot of them |
+| S4 timer | +0.3k LUTs, ~100 FFs |
+| S5 UART | +0.3k LUTs |
+| S7 privilege | negligible - a handful of bits and some decode |
+| S10 MMU with a 32-entry software-refill TLB | +1-2k LUTs, or 1 BRAM if the TLB infers as memory |
+| **Total, S0-S7** | **~5-8k LUTs, ~1.2k FFs** |
+| **Total with MMU** | **~7-10k LUTs** |
+
+The headline: **the CPU is small.** `fpga_bringup.md` 4.2's own conclusion
+for gpu16 was that "instruction storage and the vector/accumulator files are
+the fit risk, not the matrix unit"; for cpu32 there is no vector file and no
+matrix unit at all, and a Linux-capable 32-bit core in this style is in the
+same class as a small soft core. On any FPGA that can hold gpu16, the logic
+of cpu32 is not the problem.
+
+### 6.2 The memory requirement is the binding constraint
+
+This is where the plan actually collides with hardware.
+
+| What | Size | Source |
+|---|---|---|
+| cpu16's entire world today | 256 bytes data + 256 instructions | `cpu16.v` |
+| gpu16's global memory, on-chip default | 4 KiB (`DATA_INDEX_WIDTH = 10`) | `gpu16_cu.v` |
+| gpu16's simulation memory since 308421e | 1 MiB | `testgpu.v` |
+| A minimal nommu Linux kernel image | **2-4 MiB** | prediction, P8 |
+| Kernel + initramfs + working memory, to a shell | **8-16 MiB** | prediction, P8 |
+| Comfortable | 32-64 MiB | - |
+
+So the requirement is **four to five orders of magnitude** beyond what the
+design has ever addressed, and **three orders beyond the largest array any
+testbench has instantiated.** In simulation that is merely a big array and
+some patience. On a board it is DDR, and DDR is a component this project does
+not have.
+
+**Could it be done in on-chip BRAM?** Only on a large part. 8 MiB is 64 Mbit,
+which is far beyond a small Artix/Spartan (hundreds of Kbit to a few Mbit)
+and reaches into large Kintex/UltraScale territory. A realistic mid-size part
+has 2-8 Mbit total, i.e. **one tenth of the floor**. Two escapes exist and
+both are legitimate:
+
+1. **Shrink the kernel.** A stripped nommu kernel with almost everything
+   turned off can be well under 2 MiB, and an initramfs of a static BusyBox
+   is around 1 MiB. Under 4 MiB total is plausible but not comfortable.
+2. **Use the board's DDR** - which brings 6.3.
+
+### 6.3 The missing DDR controller, and the missing ready/valid
+
+Commit 308421e says it plainly, and this plan inherits the statement rather
+than softening it:
+
+> "Not in scope and not claimed: a DDR3 or MIG controller. The port was
+> shaped so one can go behind it, but it has no ready/valid, so a controller
+> cannot yet say 'not yet' and gpu16.v's memory unit cannot wait. That stall
+> is the next piece of RTL."
+
+For gpu16 that is a missing feature. **For cpu32 it is a prerequisite**, and
+it is why S1 of section 4 puts ready/valid in at the very start rather than
+retrofitting it: a CPU that talks to DRAM is stalled most of the time, and a
+memory unit with no way to wait is not a design that can be extended into one,
+it is a design that has to be replaced.
+
+The work behind the port, in order:
+
+1. **ready/valid on the memory interface**, and a core that stalls correctly
+   on it. S1. This also makes the existing `.expect`-style tests meaningful
+   under variable latency - a testbench that randomly deasserts `ready` and
+   must produce identical final state is one of the highest-value tests in the
+   whole plan.
+2. **A vendor memory controller.** Xilinx MIG or equivalent, which is an IP
+   instantiation rather than written RTL, but brings a clock-domain crossing
+   (the controller's user clock is not the board oscillator), an AXI
+   interface to adapt to, and a calibration sequence to wait for at reset.
+   `fpga_bringup.md` 4.4 notes the design today has "no MMCM, no PLL and no
+   clock-domain crossing"; this ends that, and CDC bugs are the kind that
+   pass in simulation.
+3. **A load path for megabytes.** The current loader is one word per cycle
+   over JTAG with reset held high. At a JTAG clock of a few MHz, 4 MiB is
+   minutes to tens of minutes per attempt - painful but survivable; it is
+   worth noting that once DDR exists, a JTAG-to-AXI master (already the
+   mechanism `fpga_bringup.md` 4.5 chose) can write it directly.
+
+**The blunt version: the board path for Linux does not exist yet, and the gap
+is not the CPU. It is a memory controller, a clock-domain crossing, and a
+stall protocol - none of which is research, all of which is work that has not
+started.** Until it does, S9's boot happens in simulation, which is fine:
+a kernel that boots under Verilator has been proved correct, and putting it
+on a board is then an engineering exercise with a known answer.
 
 ## 7. The RISC-V question
 
