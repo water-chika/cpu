@@ -1,5 +1,6 @@
 `include "memory.v"
 `include "gpu16_gmem.v"
+`include "gpu16_lds.v"
 `include "gpu16_vector.v"
 
 // gpu16: one wave of the machine in docs/gpu_isa.md.
@@ -23,12 +24,9 @@
 //
 // SCOPE.  Sections 4.3 (scalar ALU), 4.4 (scalar control flow, including the
 // two exec-mask branches), 4.5 (exec mask control), 4.6 (vector ALU, in
-// gpu16_vector.v) and the three wave control opcodes from 4.10 that a
-// program cannot do without, plus s_ld_g from 4.8 because it is the only
-// scalar memory instruction and it is what the 24 bit data address exists
-// for.  There is still no LDS (4.9), no matrix unit (4.7) and no per lane
-// memory access (the rest of 4.8), so every opcode belonging to those falls
-// through to the `unknown opcode` arm.  Nothing here guesses at their
+// gpu16_vector.v), 4.8 (global memory, whole), 4.9 (LDS, whole) and 4.10's
+// wave control.  There is still no matrix unit (4.7), so 0x70 to 0x74 fall
+// through to the `unknown opcode` arm rather than guessing at their
 // behaviour.
 //
 // SIMT, in one always block.  Section 1.1 gives the wave one PC, one fetch
@@ -192,6 +190,27 @@ wire [15:0] PC_next = PC + 16'b1;
 // for the port: only one instruction issues per cycle, so a `s_ld_g` issued
 // in cycle A reads in cycle A+1, while a per lane access issued no earlier
 // than A+1 takes its first transaction no earlier than A+2.
+//
+// LDS (sections 3.2 and 4.9) is the same unit with a different rule for what
+// one cycle can serve.  Global memory serves one aligned 64 byte *block* per
+// cycle; LDS has sixteen independently addressed banks, so one cycle serves
+// any set of lanes that hit sixteen *distinct banks*, whatever rows they are
+// in.  Section 3.2: "one wave-wide 4-byte access completes in one cycle if
+// the 16 lane addresses hit 16 distinct banks, otherwise it takes one cycle
+// per conflicting way."  The selection below is that sentence read literally
+// and greedily - each cycle, walk the unfinished lanes in order and take
+// every one whose bank is still free - which costs exactly as many cycles as
+// the most heavily hit bank has lanes, i.e. one per way.  So section 3.2's
+// 36 byte tile stride, whose `S/4 = 9` is coprime with 16, costs one cycle
+// and the natural 32 byte stride costs four, and `perf_lds_cycles` (system
+// register 12) counts them.
+//
+// Note what this deliberately does *not* do: two lanes reading the *same*
+// LDS address are two ways, not a broadcast.  Section 3.2 states its rule in
+// terms of distinct banks and says nothing about matching addresses, and a
+// broadcast path would make the machine faster than the document promises on
+// an access the document says is slow.  If a broadcast is wanted it should be
+// written into section 3.2 first.
 
 localparam MEM_IDLE    = 3'd0;
 localparam MEM_GATHER  = 3'd1;   // load:  one cycle per distinct block
@@ -217,14 +236,22 @@ reg [3:0] st_reg;
 // first being a taken branch's bubble.
 wire issue = (bubble == 2'b0) & ~halted_r & (mem_state == MEM_IDLE);
 
+// Which resource the access in flight is against, and how wide it is.  LDS
+// has no 1 byte sign extending load and no 16 byte access: section 4.9 is
+// four instructions, `v_ld_l`, `v_ld4_l`, `v_st_l` and `v_st4_l`.
+wire mem_lds = (mem_op[7:4] == 4'ha);
 wire mem_quad = (mem_op == 8'h86) | (mem_op == 8'h87);
-wire mem_word = (mem_op == 8'h82) | (mem_op == 8'h84);
+wire mem_word = (mem_op == 8'h82) | (mem_op == 8'h84)
+              | (mem_op == 8'ha1) | (mem_op == 8'ha3);
 wire mem_sext = (mem_op == 8'h81);
 
-// The same three facts about the instruction being issued this cycle.
-wire op_store = (opcode == 8'h83) | (opcode == 8'h84) | (opcode == 8'h87);
+// The same facts about the instruction being issued this cycle.
+wire op_lds = (opcode[7:4] == 4'ha);
+wire op_store = (opcode == 8'h83) | (opcode == 8'h84) | (opcode == 8'h87)
+              | (opcode == 8'ha2) | (opcode == 8'ha3);
 wire op_quad = (opcode == 8'h86) | (opcode == 8'h87);
-wire op_word = (opcode == 8'h82) | (opcode == 8'h84);
+wire op_word = (opcode == 8'h82) | (opcode == 8'h84)
+             | (opcode == 8'ha1) | (opcode == 8'ha3);
 wire [5:0] op_bytes = op_quad ? 6'd16 : op_word ? 6'd4 : 6'd1;
 // Section 4.8: the address is truncated *down* to a multiple of the access
 // width, rather than faulting or rotating.
@@ -234,10 +261,14 @@ wire [23:0] op_addr_mask = op_quad ? 24'hfffff0
 
 // ---- the transaction the unit would issue this cycle
 //
-// The lowest numbered unfinished lane names the block; every unfinished lane
-// in that block rides along.  Picking the lowest is arbitrary - section 3.1
-// fixes how many transactions there are and says nothing about their order -
-// but it is deterministic, which a test can be written against.
+// Global: the lowest numbered unfinished lane names the block; every
+// unfinished lane in that block rides along.  Picking the lowest is arbitrary
+// - section 3.1 fixes how many transactions there are and says nothing about
+// their order - but it is deterministic, which a test can be written against.
+//
+// LDS: every unfinished lane whose bank no lower numbered unfinished lane has
+// already claimed this cycle.  Same argument - the count is fixed by section
+// 3.2, the order is not - and the same determinism.
 
 wire [15:0] unserved = ~served;
 
@@ -260,17 +291,42 @@ end
 
 wire [17:0] cur_block = lane_addr[24*first_lane+6+:18];
 
-reg [15:0] match;
+reg [15:0] blk_match;
 always @* begin
     for (k = 0; k < 16; k = k + 1) begin
-        match[k] = unserved[k] & (lane_addr[24*k+6+:18] == cur_block);
+        blk_match[k] = unserved[k] & (lane_addr[24*k+6+:18] == cur_block);
     end
 end
+
+// The LDS half: a greedy one-lane-per-bank sweep.  `lds_bank` claims the
+// bank, `lds_row` records the row that lane wants out of it, and `lds_go`
+// is the set of lanes this cycle serves.
+reg [15:0] lds_go;
+reg [15:0] lds_claimed;
+reg [111:0] lds_row;        // sixteen 7 bit rows, bank 0 at the bottom
+reg [3:0] sel_bank;
+always @* begin
+    lds_go = 16'b0;
+    lds_claimed = 16'b0;
+    lds_row = 112'b0;
+    sel_bank = 4'b0;
+    for (k = 0; k < 16; k = k + 1) begin
+        sel_bank = lane_addr[24*k+2+:4];
+        if (unserved[k] & ~lds_claimed[sel_bank]) begin
+            lds_claimed[sel_bank] = 1'b1;
+            lds_row[7*sel_bank+:7] = lane_addr[24*k+6+:7];
+            lds_go[k] = 1'b1;
+        end
+    end
+end
+
+wire [15:0] match = mem_lds ? lds_go : blk_match;
 
 // ---- the port itself
 
 reg [5:0] gather_off;
 reg [7:0] gather_byte;
+reg [31:0] gather_word;
 reg [5:0] soff;
 reg [511:0] gmem_wdata;
 reg [63:0] gmem_be;
@@ -304,7 +360,7 @@ wire [511:0] gmem_out_block;
 
 wire mem_active = (mem_state == MEM_GATHER) | (mem_state == MEM_SCATTER);
 wire [17:0] port_block = mem_active ? cur_block : gmem_address[23:6];
-wire port_write = (mem_state == MEM_SCATTER) & any_unserved;
+wire port_write = (mem_state == MEM_SCATTER) & ~mem_lds & any_unserved;
 
 gpu16_gmem #(
     .WORD_INDEX_WIDTH(DATA_INDEX_WIDTH)
@@ -322,6 +378,49 @@ gpu16_gmem #(
 
 // `s_ld_g`'s word, selected out of the block its address lands in.
 wire [31:0] gmem_word = gmem_out_block[32*gmem_address[5:2]+:32];
+
+// ---- the LDS port
+//
+// One lane per bank by construction, so this is a straight scatter of the
+// serving lanes' data across the sixteen bank inputs.  `v_st_l` writes one
+// byte, which is the byte enable the bank word already has.
+
+reg [511:0] lds_wdata;
+reg [63:0] lds_be;
+reg [3:0] st_bank;
+reg [1:0] st_byte;
+always @* begin
+    lds_wdata = 512'b0;
+    lds_be = 64'b0;
+    st_bank = 4'b0;
+    st_byte = 2'b0;
+    for (k = 0; k < 16; k = k + 1) begin
+        if (match[k]) begin
+            st_bank = lane_addr[24*k+2+:4];
+            if (mem_word) begin
+                lds_wdata[32*st_bank+:32] = stage[128*k+:32];
+                lds_be[4*st_bank+:4] = 4'hf;
+            end
+            else begin
+                st_byte = lane_addr[24*k+:2];
+                lds_wdata[32*st_bank+8*st_byte+:8] = stage[128*k+:8];
+                lds_be[4*st_bank+st_byte] = 1'b1;
+            end
+        end
+    end
+end
+
+wire lds_write = (mem_state == MEM_SCATTER) & mem_lds & any_unserved;
+wire [511:0] lds_out;
+
+gpu16_lds lds (
+    .clk(clk),
+    .bank_row(lds_row),
+    .bank_write(lds_claimed & {16{lds_write}}),
+    .byte_enable(lds_be),
+    .in_data(lds_wdata),
+    .out_data(lds_out)
+);
 
 wire [23:0] gmem_effective = src1_value[23:0] + {16'b0, mod};
 
@@ -378,6 +477,7 @@ reg [31:0] perf_cycles;
 reg [31:0] perf_instrs;
 reg [31:0] perf_gmem_bytes;
 reg [31:0] perf_gmem_trans;
+reg [31:0] perf_lds_cycles;
 
 reg [31:0] sys_value;
 always @* begin
@@ -390,14 +490,19 @@ always @* begin
         8'd5: sys_value = LDS_SIZE;
         8'd8: sys_value = perf_cycles;
         8'd9: sys_value = perf_instrs;
-        // perf_mma_busy and perf_lds_cycles read zero because neither unit
-        // exists yet.  perf_gmem_bytes is real: it counts the bytes the
-        // program asked for, which is section 7.2's "Bytes" metric - four for
-        // an s_ld_g, and the access width times the number of enabled lanes
-        // for a per lane access.
+        // perf_mma_busy reads zero because the matrix unit does not exist
+        // yet.  perf_gmem_bytes counts the bytes the program asked for, which
+        // is section 7.2's "Bytes" metric - four for an s_ld_g, and the
+        // access width times the number of enabled lanes for a per lane
+        // access.  It counts *global* bytes only, which is what section 7.2
+        // says it is; LDS traffic is not memory traffic.
         8'd10: sys_value = 32'b0;
         8'd11: sys_value = perf_gmem_bytes;
-        8'd12: sys_value = 32'b0;
+        // Section 7.2's LDS cost is "1 issue cycle + 1 port cycle per
+        // conflict way", and this is the second half: one per cycle the LDS
+        // banks are busy, so a conflict-free wave-wide access adds one and a
+        // 4-way conflicting one adds four.
+        8'd12: sys_value = perf_lds_cycles;
         // Section 4.3, system register 13: global transactions issued, in
         // section 3.1's sense of the word - one per distinct aligned 64 byte
         // block per access.  Section 3.1 is the rule the whole memory system
@@ -429,6 +534,7 @@ always @(posedge clk or posedge reset) begin
         perf_instrs <= 32'b0;
         perf_gmem_bytes <= 32'b0;
         perf_gmem_trans <= 32'b0;
+        perf_lds_cycles <= 32'b0;
         mem_state <= MEM_IDLE;
         mem_op <= 8'b0;
         mem_reg <= 4'b0;
@@ -469,7 +575,23 @@ always @(posedge clk or posedge reset) begin
                     for (l = 0; l < 16; l = l + 1) begin
                         if (match[l]) begin
                             gather_off = lane_addr[24*l+:6];
-                            if (mem_quad) begin
+                            if (mem_lds) begin
+                                // The lane's own bank, which it holds alone
+                                // this cycle, so the row it asked for is the
+                                // row that came back.
+                                gather_word = lds_out[32*lane_addr[24*l+2+:4]+:32];
+                                if (mem_word) begin
+                                    stage[128*l+:32] <= gather_word;
+                                end
+                                else begin
+                                    // Section 4.9 has only the zero
+                                    // extending `v_ld_l`; there is no LDS
+                                    // equivalent of `v_ld_gs`.
+                                    gather_byte = gather_word[8*lane_addr[24*l+:2]+:8];
+                                    stage[128*l+:32] <= {24'b0, gather_byte};
+                                end
+                            end
+                            else if (mem_quad) begin
                                 for (j = 0; j < 4; j = j + 1) begin
                                     stage[128*l+32*j+:32] <=
                                         gmem_out_block[8*gather_off+32*j+:32];
@@ -489,7 +611,12 @@ always @(posedge clk or posedge reset) begin
                         end
                     end
                     served <= served | match;
-                    perf_gmem_trans <= perf_gmem_trans + 1;
+                    if (mem_lds) begin
+                        perf_lds_cycles <= perf_lds_cycles + 1;
+                    end
+                    else begin
+                        perf_gmem_trans <= perf_gmem_trans + 1;
+                    end
                     if ((served | match) == 16'hffff) begin
                         mem_state <= MEM_RETURN;
                         mem_j <= 2'b0;
@@ -529,7 +656,12 @@ always @(posedge clk or posedge reset) begin
                 // the block above drives; what is left is the bookkeeping.
                 if (any_unserved) begin
                     served <= served | match;
-                    perf_gmem_trans <= perf_gmem_trans + 1;
+                    if (mem_lds) begin
+                        perf_lds_cycles <= perf_lds_cycles + 1;
+                    end
+                    else begin
+                        perf_gmem_trans <= perf_gmem_trans + 1;
+                    end
                     if ((served | match) == 16'hffff) begin
                         mem_state <= MEM_IDLE;
                     end
@@ -687,7 +819,12 @@ always @(posedge clk or posedge reset) begin
                 // truncated to the access width, latch the exec mask, and
                 // hand the lot to the memory unit.  A load then gathers and
                 // returns; a store reads its source registers and scatters.
-                8'h80, 8'h81, 8'h82, 8'h83, 8'h84, 8'h86, 8'h87:
+                // Section 4.9's four LDS instructions take exactly the same
+                // path.  They differ only in which resource the memory unit
+                // serves them from and therefore in which rule decides how
+                // many cycles that takes.
+                8'h80, 8'h81, 8'h82, 8'h83, 8'h84, 8'h86, 8'h87,
+                8'ha0, 8'ha1, 8'ha2, 8'ha3:
                 begin
                     for (i = 0; i < 16; i = i + 1) begin
                         lane_addr[24*i+:24] <=
@@ -701,7 +838,9 @@ always @(posedge clk or posedge reset) begin
                     mem_j <= 2'b0;
                     st_reg <= arg0;
                     mem_state <= op_store ? MEM_READ : MEM_GATHER;
-                    perf_gmem_bytes <= perf_gmem_bytes + op_bytes_moved;
+                    if (~op_lds) begin
+                        perf_gmem_bytes <= perf_gmem_bytes + op_bytes_moved;
+                    end
                 end
 
                 8'h85:
@@ -713,11 +852,14 @@ always @(posedge clk or posedge reset) begin
                 end
 
                 // ------------------------------------ 4.10 wave control
-                // s_waitcnt_g: every global load this implementation issues
-                // has already completed, so there is never anything to wait
-                // for.  The instruction still has to exist, because a correct
-                // program is required to contain it.
-                8'hb1: ;
+                // The two waitcnts: every access this implementation issues
+                // has already completed by the time the next instruction
+                // issues, because the wave stalls for it, so there is never
+                // anything to wait for.  They still have to exist, because a
+                // correct program is required to contain them - and section
+                // 3.3 requires `s_waitcnt_l` before a barrier for exactly the
+                // reason that a machine with a real queue would need it.
+                8'hb1, 8'hb2: ;
                 8'hb3: halted_r <= 1'b1;
                 8'hbf: ;
 

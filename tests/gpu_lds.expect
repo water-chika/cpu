@@ -1,0 +1,20 @@
+// gpu_lds.s, the sixteen scalar registers.
+//
+// s3..s11 are the region bases, masks and the 36 byte stride the program set
+// up; s12..s15 are not used, so they are left as don't care.
+00000000 // s0
+00000000 // s1
+00000000 // s2
+00000000 // s3
+00000400 // s4
+00000800 // s5
+000000ff // s6
+0000ffff // s7
+00001000 // s8
+0000000f // s9
+00001fc0 // s10
+00000024 // s11
+xxxxxxxx // s12
+xxxxxxxx // s13
+xxxxxxxx // s14
+xxxxxxxx // s15

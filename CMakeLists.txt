@@ -292,6 +292,19 @@ if(IVERILOG_EXECUTABLE AND VVP_EXECUTABLE)
     add_gpu_test(gpu_coalesce tests/gpu_coalesce.s
                  tests/gpu_global.data32 gpu_coalesce.expect 300)
 
+    # The LDS, sections 3.2 and 4.9.  gpu_lds checks what the four access
+    # instructions move, including the byte enables inside a bank word and
+    # both halves of the exec rule; gpu_bank checks the thing values cannot
+    # see, which is how many port cycles an access of a given bank pattern
+    # costs - and in particular that section 3.2's 36 byte tile stride really
+    # is conflict-free while the natural 32 byte one really does cost eight
+    # times as much.  Neither needs a data file: the LDS has no initial
+    # contents, so every word they read is a word they wrote.
+    add_gpu_test(gpu_lds  tests/gpu_lds.s  - gpu_lds.expect  400
+                 +vexpect=${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_lds.vexpect)
+
+    add_gpu_test(gpu_bank tests/gpu_bank.s - gpu_bank.expect 400)
+
     # What the five tests above cannot reach.  gpu16.v is the scalar unit, so
     # simulation covers about a third of the ISA; the vector ALU, the matrix
     # unit, LDS and the exec mask are pinned by their encodings instead, which

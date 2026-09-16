@@ -611,8 +611,34 @@ needs no extra register file port.  The wave stalls for those cycles, so
 
 The whole of section 4.8 now runs: ```v_ld_g```, ```v_ld_gs```,
 ```v_ld4_g```, ```v_ld16_g```, ```v_st_g```, ```v_st4_g```, ```v_st16_g```
-and ```s_ld_g```.  The matrix unit (4.7) and LDS (4.9) are still absent, and
-their opcodes still report ```unknown opcode``` rather than guessing.
+and ```s_ld_g```.
+
+```gpu16_lds.v``` is the other memory, and the interesting thing about it is
+that it is *sixteen* memories.  Section 3.2 organises the 8 KiB scratchpad as
+sixteen banks of four bytes with ```bank = (address >> 2) & 15```, so the
+module is sixteen independently addressed 32 bit arrays and the address
+splits as row 12:6, bank 5:2, byte 1:0 - which makes the flat word index
+```{row, bank}```, i.e. just ```address >> 2```, so a plain array still
+underlies it.  The same memory unit drives it, with one rule swapped: global
+memory serves one aligned 64 byte block per cycle, LDS serves any set of
+lanes that hits sixteen distinct banks, whatever rows they are in.  Choosing
+that set is a greedy sweep - walk the unfinished lanes in order, take each
+one whose bank is still free - which costs exactly as many cycles as the most
+heavily hit bank has lanes, which is section 3.2's "one cycle per conflicting
+way".  ```perf_lds_cycles``` (system register 12) counts them.
+
+Two things there are deliberate.  Two lanes reading the *same* LDS address
+are two ways and not a broadcast, because section 3.2 states its rule in
+terms of distinct banks and says nothing about matching addresses, and a
+broadcast path would make the machine faster than the document promises on an
+access the document says is slow.  And an *n*-way conflict costs exactly *n*
+cycles, which section 6.4 lists as an open question - "much less confident
+that a real LDS implementation will actually resolve a 2-way conflict in
+exactly 2 cycles rather than 4" - so that question now has an answer in RTL.
+
+The matrix unit (4.7) is still absent, and so is ```s_barrier``` - a barrier
+needs more than one resident wave to mean anything, and this is one wave.
+Both still report ```unknown opcode``` rather than guessing.
 
 The one thing added to the ISA rather than implemented from it is system
 register 13, ```perf_gmem_trans```: the transaction count.  Section 4.3's
@@ -638,7 +664,7 @@ in for an address anywhere the ISA takes one, not only after ```la``` -
 ```s_addpc```, because unlike cpu8 this machine can add to its own PC.
 
 ```testgpu.v``` is its testbench, modelled on ```test16.v```, and the
-thirteen ```gpu_*``` CTests assemble a program with ```asm_gpu16```, run it on
+fifteen ```gpu_*``` CTests assemble a program with ```asm_gpu16```, run it on
 ```gpu16.v``` and check all sixteen scalar registers.  A gpu16 program must
 reach ```s_endpgm```: unlike cpu16, running off the end is a failure even if
 the registers look right.  The five scalar programs' ```.expect``` files were
@@ -670,6 +696,24 @@ lanes' *memory*, a masked load must not touch their *registers* - and
 is that the byte at address ```a``` holds ```a & 0xff```, so every expected
 word is a function of its address and a load that lands one byte or one lane
 out of place cannot accidentally match.
+
+```gpu_lds``` and ```gpu_bank``` are the same pair of jobs for the
+scratchpad.  ```gpu_lds``` writes and reads back seven regions - including
+sixteen lanes writing sixteen *consecutive bytes*, which is four lanes to a
+bank word and therefore a byte enable test, and section 3.2's own 36 byte row
+stride, which is the only access in the suite where a lane's bank is not its
+lane number - and finishes by re-reading the first region to show that 8 KiB
+really is 2048 distinct words.  ```gpu_bank``` checks the cost rather than
+the contents: it reads ```perf_lds_cycles``` either side of accesses at
+strides of 4, 36, 32 and 8 bytes and asserts 1, 1, 8 and 2 port cycles, which
+is section 3.2's argument for the 36 byte pad reduced to two numbers - one
+cycle against eight for the same sixteen lanes reading the same sixteen rows.
+Eleven mutations were run against the pair, including a three-bit bank index,
+the bank taken from the wrong address bits, the row taken from the wrong
+address bits, a bank array indexed ```{bank, row}```, no conflict resolution
+at all, one lane per cycle whatever the pattern, and a ```v_st_l``` that
+writes its whole bank word; every one fails at least one of the two, and the
+timing mutations fail only ```gpu_bank```.
 
 ```gpu_coalesce``` is the one that checks something values cannot see.  A
 machine that issues sixteen transactions for every access returns exactly the
@@ -739,9 +783,10 @@ compiles every ```*.v``` on its own with ```-Wall``` and fails on any message.
   ```unknown opcode``` for them.  Only ```cpu16.v``` has the second program
   memory port they need.
 * ```variables_to_registers``` is not implemented.
-* ```gpu16``` has no matrix unit and no LDS, and therefore none of section
-  7.4's kernels yet - a kernel that computes needs somewhere to stage what it
-  computes on.  ```asm_gpu16``` assembles the instructions they would need,
+* ```gpu16``` has no matrix unit, and one resident wave rather than a
+  workgroup of four, so ```s_barrier``` has nothing to synchronise and none of
+  section 7.4's kernels can run yet.  ```asm_gpu16``` assembles the
+  instructions they would need,
   but nothing can execute them, so those are held down by ```gpu_encoding```
   rather than by simulation.  Global accesses complete before the next
   instruction issues, so ```s_waitcnt_g``` is architecturally required but

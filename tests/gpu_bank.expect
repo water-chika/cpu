@@ -1,0 +1,21 @@
+// gpu_bank.s, the sixteen scalar registers.
+//
+// s4..s8 are the port cycles five accesses of known bank pattern cost, s9 and
+// s10 the total cycles the first and third of them took, and s11 the running
+// total over all eight accesses the program makes.
+00000000        // s0  kernel_arg_ptr
+00000000        // s1  group_id_x
+00000000        // s2  group_id_y
+00001000        // s3  the last region base, 4096
+00000001        // s4  stride 4:  16 banks, 1 lane each
+00000001        // s5  stride 36: 16 banks, 1 lane each - section 3.2's pad
+00000008        // s6  stride 32:  2 banks, 8 lanes each
+00000002        // s7  stride 8:   8 banks, 2 lanes each
+00000008        // s8  stride 32 stored: a write conflicts the same way
+00000007        // s9  cycles for the 1-way load:  6 + 1
+0000000e        // s10 cycles for the 8-way load:  6 + 8
+00000018        // s11 total LDS port cycles: 2 + 2 + 16 + 4 = 24
+xxxxxxxx        // s12 scratch
+00000024        // s13 36, the padded stride
+xxxxxxxx        // s14
+xxxxxxxx        // s15
