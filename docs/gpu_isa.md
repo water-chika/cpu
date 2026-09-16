@@ -344,7 +344,9 @@ The banking rule has a direct consequence for tile layout that the GEMM kernel
 has to respect.  A tile stored with row stride `S` bytes and read as "lane *m*
 reads row *m*" hits bank `(m * S/4 + c) & 15`, which is a bijection over
 *m* = 0..15 **iff `S/4` is odd**.  A natural stride of 32 bytes (`S/4 = 8`)
-gives a 4-way conflict and a 4x slowdown on the hottest access in the kernel.
+gives bank `(8m + c) & 15`, which takes only the two values `c` and `c + 8`
+over *m* = 0..15: sixteen lanes over two banks is eight lanes per bank, an
+**8-way conflict and an 8x slowdown** on the hottest access in the kernel.
 Padding the stride to **36 bytes** (`S/4 = 9`, coprime with 16) makes it
 conflict-free.  Section 5.3 pays 2304 B instead of 2048 B of LDS for the `A`
 tile to get this.
@@ -1298,10 +1300,17 @@ Where it runs out of road, in the order the limits bite:
    trivially inside the 64 B/cycle on-chip port, and both *outside* what a
    hobby tapeout's pin count can deliver.  Section 7.5 shows this, not the
    ISA, is what actually limits the silicon tier.
-5. **LDS bank conflicts, if the 36-byte pad is dropped.** A natural 32-byte
-   stride turns the 24 conflict-free mma operand reads per iteration into 96
-   port cycles, taking LDS from 19% to 56% utilised and adding ~7% to
-   runtime.
+5. **LDS bank conflicts, if the 36-byte pad is dropped.** The hot access is
+   lane *m* reading row *m*, which a natural 32-byte stride makes **8-way**
+   conflicting (section 3.2), so each of the 24 mma operand reads per wave
+   costs 8 port cycles instead of 1.  Per workgroup iteration that is
+   `24 x 4 waves = 96` port cycles becoming `768`, against the 1024 matrix
+   cycles the iteration has to hide them behind: the LDS port goes from
+   **9% to 75% busy**.  It still fits, so the matrix unit stays the
+   bottleneck and the predicted runtime barely moves - but the entire margin
+   is gone, and on any configuration with fewer resident waves to overlap
+   with, or any kernel with more LDS traffic than this one, the port becomes
+   the limit instead.  256 B of padding is a cheap price for that margin.
 
 Prologue and epilogue are the reason utilisation falls off at small sizes:
 the 32 `acc_rd` + `v_st4_g` pairs per wave are a fixed 384 issue slots per
