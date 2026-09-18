@@ -1,0 +1,19 @@
+// gemm64.s leaves the performance counters in s0..s4; their values are
+// measured, not predicted, so nothing here is checked.  The answer this
+// test is about is the C matrix, in tests/gemm64.mexpect.
+xxxxxxxx    // s0
+xxxxxxxx    // s1
+xxxxxxxx    // s2
+xxxxxxxx    // s3
+xxxxxxxx    // s4
+xxxxxxxx    // s5
+xxxxxxxx    // s6
+xxxxxxxx    // s7
+xxxxxxxx    // s8
+xxxxxxxx    // s9
+xxxxxxxx    // s10
+xxxxxxxx    // s11
+xxxxxxxx    // s12
+xxxxxxxx    // s13
+xxxxxxxx    // s14
+xxxxxxxx    // s15

@@ -17,8 +17,9 @@
 //
 //   vvp simgpu +program=<hex file> +expect=<hex file> [+vexpect=<hex file>]
 //              [+data=<hex file>]
+//              [+mexpect=<hex file> +mexpect_word=<n> +mexpect_words=<n>]
 //              [+cycles=<n>] [+arg_ptr=<n>] [+group_x=<n>] [+group_y=<n>]
-//              [+wave_id=<n>] [+waves=<n>] [+trace]
+//              [+wave_id=<n>] [+waves=<n>] [+trace] [+perf]
 //
 // The program file holds 32 bit instructions as 8 digit hex words and the
 // expect file holds the 16 expected scalar registers (s0 first) as 8 digit
@@ -31,6 +32,22 @@
 // per VGPR across the wave, which is the shape the answer is easiest to read
 // in.  A test that does not pass +vexpect checks no VGPR at all, which is why
 // the five scalar-era programs needed no new expectation file.
+//
+// +mexpect is the same idea for global memory, and it is what a kernel whose
+// answer is a matrix needs: the sixteen scalar registers cannot hold 4096
+// words of result, and a kernel that checksummed its own output into a
+// register would be marking its own homework.  The file holds the expected
+// 32 bit words of the region starting at word +mexpect_word, "xxxxxxxx" for
+// do not care, and a word the kernel never wrote is x in the memory and
+// therefore a mismatch against any real expectation.
+//
+// +perf prints the cycle count and the final scalar registers as "PERF"
+// lines, for a kernel that read its own counters with `s_rd_sys`.  It is
+// deliberately only a *print*: nothing here compares a performance number,
+// because the measurement is worthless unless the answer was right, and the
+// pass or fail of this simulation is about the answer.  The band check lives
+// in tests/run_gpu_perf.sh, which reads these lines only after the
+// correctness run has passed.
 //
 // The exec mask deliberately has no plusarg of its own.  A program that wants
 // its final mask checked ends with `s_rd_exec s15` and puts the answer in the
@@ -73,6 +90,11 @@ reg [1023:0] vexpect_file;
 reg [31:0] expected[0:15];
 reg [31:0] vexpected[0:255];
 integer has_vexpect;
+reg [1023:0] mexpect_file;
+integer has_mexpect;
+integer mexpect_word;
+integer mexpect_words;
+integer mismatches;
 integer lane;
 integer vreg;
 integer waves;
@@ -176,6 +198,7 @@ initial begin
     end
     has_data = $value$plusargs("data=%s", data_file);
     has_vexpect = $value$plusargs("vexpect=%s", vexpect_file);
+    has_mexpect = $value$plusargs("mexpect=%s", mexpect_file);
     // The word counts only exist so that $readmemh is not asked to fill more
     // of the memory than the file covers, which it warns about.
     if (!$value$plusargs("program_words=%d", program_words)) begin
@@ -201,6 +224,12 @@ initial begin
     end
     if (!$value$plusargs("waves=%d", waves)) begin
         waves = 1;
+    end
+    if (!$value$plusargs("mexpect_word=%d", mexpect_word)) begin
+        mexpect_word = 0;
+    end
+    if (!$value$plusargs("mexpect_words=%d", mexpect_words)) begin
+        mexpect_words = 0;
     end
 
     // Into the testbench's own array first; the clocking in happens below,
@@ -334,6 +363,43 @@ initial begin
                     end
                 end
             end
+        end
+    end
+
+    // The memory result.  datamem has done its job as the input image by
+    // now, so the expectation is read back into it rather than into a second
+    // array of a million words.  Only the first ten mismatches are printed:
+    // a kernel that got the tiling wrong misses thousands, and the first few
+    // say which corner of the tile moved just as well as all of them.
+    if (has_mexpect) begin
+        $readmemh(mexpect_file, datamem, 0, mexpect_words - 1);
+        mismatches = 0;
+        for (word = 0; word < mexpect_words; word = word + 1) begin
+            if (^datamem[word] !== 1'bx) begin
+                if (gmem.mem[mexpect_word + word] !== datamem[word]) begin
+                    if (mismatches < 10) begin
+                        $display("  MISMATCH: memory word %0d = %08h, expected %08h",
+                            mexpect_word + word, gmem.mem[mexpect_word + word],
+                            datamem[word]);
+                    end
+                    mismatches = mismatches + 1;
+                end
+            end
+        end
+        if (mismatches == 0) begin
+            $display("  ok:       %0d memory words from word %0d",
+                mexpect_words, mexpect_word);
+        end
+        else begin
+            $display("  %0d of %0d memory words differ", mismatches, mexpect_words);
+            errors = errors + mismatches;
+        end
+    end
+
+    if ($test$plusargs("perf")) begin
+        $display("PERF cycles %0d", ran);
+        for (i = 0; i < 16; i = i + 1) begin
+            $display("PERF s%0d %0d", i, U0.wg[0].w_inst.registers[i]);
         end
     end
 

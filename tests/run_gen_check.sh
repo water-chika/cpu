@@ -12,24 +12,25 @@
 # and its output compared byte for byte.
 #
 # usage:
-#   run_gen_check.sh <python> <tests-dir>
+#   run_gen_check.sh <python> <tests-dir> <generator.py>
 
 set -e
 
-if [ "$#" -ne 2 ]; then
-    echo "usage: $0 <python> <tests-dir>" >&2
+if [ "$#" -ne 3 ]; then
+    echo "usage: $0 <python> <tests-dir> <generator.py>" >&2
     exit 2
 fi
 
 PYTHON="$1"
 TESTS_DIR="$2"
+GENERATOR="$3"
 
 WORK_DIR=$(mktemp -d)
 trap 'rm -rf "$WORK_DIR"' EXIT
 
-echo "=== regenerating the matrix expectations from the ISA document"
-if ! "$PYTHON" "$TESTS_DIR/gen_mma_expect.py" "$WORK_DIR"; then
-    echo "TEST FAIL: gen_mma_expect.py did not run" >&2
+echo "=== regenerating $GENERATOR's files from the ISA document"
+if ! "$PYTHON" "$TESTS_DIR/$GENERATOR" "$WORK_DIR"; then
+    echo "TEST FAIL: $GENERATOR did not run" >&2
     exit 1
 fi
 
@@ -49,7 +50,7 @@ for f in "$WORK_DIR"/*; do
 done
 
 if [ "$status" -eq 0 ]; then
-    echo "TEST PASS: every matrix expectation is the generator's output"
+    echo "TEST PASS: every file is $GENERATOR's own output"
 fi
 
 exit $status

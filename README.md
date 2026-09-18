@@ -923,6 +923,21 @@ back-to-back ```mma``` costs 17 cycles (```gpu_mma_perf``` alone, since no
 value changes), and the array un-shared so all four waves are granted every
 cycle (```gpu_mma_wg``` alone, for the same reason).
 
+```gemm64``` is the first test here that runs a *workload* rather than a
+feature: section 7.1's 64x64x64 integer GEMM, four waves, two workgroups
+walked in software because the testbench launches one, written from section
+5.3's listing.  It is checked the only way a matrix can be - ```testgpu.v```
+compares 4,096 words of global memory against ```tests/gemm64.mexpect```,
+which ```tests/gen_gemm64.py``` computes with a plain triple loop that shares
+no tiling, no accumulator layout and no code with the kernel.  That mattered:
+four errors in section 5.3 and two in the first kernel survived until a
+matrix was compared, and every one of them made the kernel *faster*, which is
+why ```gemm64_perf``` is a second test that refuses to print a cycle count
+unless the same run passed the comparison first.  It reports 6,180 cycles and
+4,096 matrix-busy cycles - 16.00 per ```mma_i8```, exactly as section 4.7
+claims - and section 7.3's utilisation figure for ```gemm64``` fell from a
+predicted 76.1% to a measured 66.3% as a result.
+
 Simulation now reaches every instruction in the ISA, but ```gpu_encoding```
 still covers what no simulation can: it assembles all 97 instructions and
 compares the words against ```tests/gpu_encoding.expect32```, which needs no
@@ -1067,13 +1082,18 @@ compiles every ```*.v``` on its own with ```-Wall``` and fails on any message.
   ```docs/c16.md```, "Variables in registers".  ```variables_to_registers.cpp```
   remains as the standalone cpu8 experiment the idea started in; the compiler
   does not use it.
-* ```gpu16``` implements the whole ISA including section 4.7's matrix unit,
-  so nothing in it is held down by ```gpu_encoding``` alone any more.  What
-  has still never been run is section 7.4's GEMM kernels themselves: the
-  matrix unit's sixteen cycles and their sum across four waves are measured,
-  but the utilisation percentages in section 7.3 divide those by a cycle
-  count for a kernel no test here executes.  Global accesses complete before
-  the next instruction issues, so ```s_waitcnt_g``` is architecturally
-  required but does nothing; there is deliberately no forwarding from a load
-  into the next instruction, so a program that omits the wait does not
-  accidentally work.
+* Of section 7.4's six benchmark kernels, only **```gemm64``` has been run**.
+  It is a real 64x64x64 GEMM on ```gpu16.v``` (```tests/gemm64.s```, four
+  waves), its 4,096 output words are compared against an independent Python
+  GEMM, and section 7.3's numbers for it are now measurements: 6,180 cycles,
+  66.3% matrix utilisation, 2,684 instructions.  ```gemm128```, ```gemm256```,
+  ```axpy16k```, ```axpy16k_w``` and ```escape4k``` are **still predictions**,
+  and every number given for them in section 7.3 is unearned in exactly the
+  way ```gemm64```'s was.  Global accesses complete before the next
+  instruction issues, so ```s_waitcnt_g``` is architecturally required but
+  does nothing; there is deliberately no forwarding from a load into the next
+  instruction, so a program that omits the wait does not accidentally work.
+  Nothing in the RTL enforces section 5.3's fragment-lifetime rule either - an
+  ```mma_i8``` whose operand registers are overwritten while it walks
+  miscomputes silently, and finding that took a matrix comparison, which is
+  the argument for having one.

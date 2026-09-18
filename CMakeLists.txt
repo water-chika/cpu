@@ -524,6 +524,36 @@ if(IVERILOG_EXECUTABLE AND VVP_EXECUTABLE)
     add_gpu_test(gpu_mma_wg tests/gpu_mma_wg.s
                  tests/gpu_mma.data32 gpu_mma_wg.expect 2000 +waves=4)
 
+    # gemm64, docs/gpu_isa.md section 7.1's smallest benchmark kernel, run for
+    # real.  Everything above measures a piece of the machine; this is the
+    # workload the machine exists for, and its answer is 4096 words of C
+    # compared against a Python GEMM that shares no code with it.  The four
+    # waves are not optional here: each one fills a quarter of the LDS tile,
+    # so a single-wave run computes with three quarters of the tile undefined.
+    add_gpu_test(gemm64 tests/gemm64.s
+                 tests/gemm64.data32 gemm64.expect 30000 +waves=4
+                 +mexpect=${CMAKE_CURRENT_SOURCE_DIR}/tests/gemm64.mexpect
+                 +mexpect_word=2064 +mexpect_words=4096)
+
+    # And the same run again, this time reading the counters the kernel
+    # collected.  It is a separate test on purpose: the cycle count is only
+    # meaningful if the matrix came out right, and this script refuses to
+    # report one unless the same run passed the result comparison first.  The
+    # band is section 7.4's, re-centred on the measurement now that there is
+    # one; the tier-1 prediction it replaces is recorded in section 7.3.
+    add_test(
+        NAME gemm64_perf
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_gpu_perf.sh
+                $<TARGET_FILE:asm_gpu16>
+                ${CMAKE_CURRENT_SOURCE_DIR}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/gemm64.s
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/gemm64.data32
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/gemm64.expect
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/gemm64.mexpect
+                2064 4096 4 30000 5562 6798 4096
+    )
+    set_tests_properties(gemm64_perf PROPERTIES FAIL_REGULAR_EXPRESSION "TEST FAIL")
+
     # What the five tests above cannot reach.  gpu16.v is the scalar unit, so
     # simulation covers about a third of the ISA; the vector ALU, the matrix
     # unit, LDS and the exec mask are pinned by their encodings instead, which
@@ -563,8 +593,22 @@ if(IVERILOG_EXECUTABLE AND VVP_EXECUTABLE)
             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_gen_check.sh
                     ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests
+                    gen_mma_expect.py
         )
         set_tests_properties(gpu_mma_expect PROPERTIES FAIL_REGULAR_EXPRESSION "TEST FAIL")
+
+        # And the same for gemm64's input data and reference result, which are
+        # a plain triple loop over the same integers the GPU is given.  The
+        # kernel is checked against a multiply that shares no tiling, no
+        # accumulator layout and no code with it.
+        add_test(
+            NAME gpu_gemm64_data
+            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_gen_check.sh
+                    ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests
+                    gen_gemm64.py
+        )
+        set_tests_properties(gpu_gemm64_data PROPERTIES FAIL_REGULAR_EXPRESSION "TEST FAIL")
     else()
         message(WARNING "python3 not found, the matrix expectation check is disabled")
     endif()

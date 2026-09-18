@@ -948,9 +948,9 @@ Vector:
 | `v7` | `lane*36` - the mma read offset for rows `m_w + lane` and for `Bs` |
 | `v8` | `lane*36 + 576` - the mma read offset for rows `m_w + 16 + lane` |
 | `v9` | global fill lane offset, `(lane>>1)*K + (lane&1)*16` |
-| `v10` | LDS fill lane offset for `As`, and the C address in the epilogue |
+| `v10` | LDS fill lane offset for `As`, live for the whole kernel |
 | `v11` | LDS fill lane offset for `Bs` |
-| `v12`-`v15` | the `v_ld16_g` staging quad (4-aligned, as section 4.8 requires) |
+| `v12`-`v15` | the `v_ld16_g` staging quad (4-aligned, as section 4.8 requires); `v12` doubles as the C lane offset in the epilogue |
 
 All 16 scalar and all 16 vector registers are live in the main loop.  That is
 the intended calibration of both file sizes, and the staging quad is placed at
@@ -961,7 +961,9 @@ registers usable.
 
 ```
 # ------------------------------------------------------------------ gemm_i8
-# C[M][N] (int32) += A[M][K] (int8) * Bt[N][K] (int8)
+# C[M][N] (int32) = A[M][K] (int8) * Bt[N][K] (int8)
+# The epilogue stores, so this writes C rather than accumulating into it; the
+# accumulators are zeroed on entry.  The listing said `+=` until it was run.
 # Preconditions: M % 64 == 0, N % 32 == 0, K % 32 == 0, B pre-transposed,
 #                A, Bt, C 4-byte aligned, 4 waves per workgroup.
 # Launch: s0 = &args, s1 = group_id_x, s2 = group_id_y, exec = 0xffff.
@@ -1027,11 +1029,12 @@ gemm_i8:
         s_mov    s0,  s6               # k counter = K
 
         # ---------------- prologue: fill buffer 0 ----------------
+        acc_zero A0                    # nothing else writes the accumulators
+        acc_zero A1
         s_imm    s11, 0
         s_call   s15, fill_tile
         s_addi   s3,  s3,  32
         s_addi   s4,  s4,  32
-        s_addi   s0,  s0,  -32
         s_imm    s11, 4096
         s_waitcnt_l 0
         s_barrier
@@ -1044,61 +1047,29 @@ kloop:
         # ---------------- compute on the current buffer ----------------
         # 8 k steps of 4, fully unrolled; Mod carries k*4 so there is no
         # address arithmetic at all in this block.
+        # The loads for a k step are issued *after* the `mma` pair of the step
+        # before it, into the triple whose own walk finished a step ago.  See
+        # the fragment-lifetime note below: this ordering is required, not a
+        # scheduling preference.  The pipelining is still there - each triple
+        # of loads is in flight while the previous `mma` pair walks - it is
+        # just expressed by where the loads sit rather than by `s_waitcnt_l 3`.
         v_ld4_l  v1, v7, s9,  0
         v_ld4_l  v2, v8, s9,  0
         v_ld4_l  v3, v7, s10, 0
+        s_waitcnt_l 0
+        mma_i8   A0, v1, v3
+        mma_i8   A1, v2, v3
+
         v_ld4_l  v4, v7, s9,  4
         v_ld4_l  v5, v8, s9,  4
         v_ld4_l  v6, v7, s10, 4
-        s_waitcnt_l 3                  # wait for the first triple only
-        mma_i8   A0, v1, v3
-        mma_i8   A1, v2, v3
-
-        v_ld4_l  v1, v7, s9,  8
-        v_ld4_l  v2, v8, s9,  8
-        v_ld4_l  v3, v7, s10, 8
-        s_waitcnt_l 3
-        mma_i8   A0, v4, v6
-        mma_i8   A1, v5, v6
-
-        v_ld4_l  v4, v7, s9,  12
-        v_ld4_l  v5, v8, s9,  12
-        v_ld4_l  v6, v7, s10, 12
-        s_waitcnt_l 3
-        mma_i8   A0, v1, v3
-        mma_i8   A1, v2, v3
-
-        v_ld4_l  v1, v7, s9,  16
-        v_ld4_l  v2, v8, s9,  16
-        v_ld4_l  v3, v7, s10, 16
-        s_waitcnt_l 3
-        mma_i8   A0, v4, v6
-        mma_i8   A1, v5, v6
-
-        v_ld4_l  v4, v7, s9,  20
-        v_ld4_l  v5, v8, s9,  20
-        v_ld4_l  v6, v7, s10, 20
-        s_waitcnt_l 3
-        mma_i8   A0, v1, v3
-        mma_i8   A1, v2, v3
-
-        v_ld4_l  v1, v7, s9,  24
-        v_ld4_l  v2, v8, s9,  24
-        v_ld4_l  v3, v7, s10, 24
-        s_waitcnt_l 3
-        mma_i8   A0, v4, v6
-        mma_i8   A1, v5, v6
-
-        v_ld4_l  v4, v7, s9,  28
-        v_ld4_l  v5, v8, s9,  28
-        v_ld4_l  v6, v7, s10, 28
-        s_waitcnt_l 3
-        mma_i8   A0, v1, v3
-        mma_i8   A1, v2, v3
-
         s_waitcnt_l 0
         mma_i8   A0, v4, v6
         mma_i8   A1, v5, v6
+
+        ...                            # six more k steps, alternating the
+                                       # v1/v2/v3 and v4/v5/v6 triples, at
+                                       # Mod offsets 8, 12, 16, 20, 24, 28
 
         # ---------------- swap buffers and loop ----------------
         s_addi   s3,  s3,  32          # next k panel of A
@@ -1127,7 +1098,9 @@ kloop:
         s_add    s13, s15, s13         # N0 + n_w
         s_shli   s13, s13, 2
         s_add    s5,  s5,  s13         # &C[M0+m_w][N0+n_w]
-        v_shli   v10, v0,  2           # lane*4 (v10 is free after the last fill)
+        v_shli   v12, v0,  2           # lane*4 in the dead staging quad; v10
+                                       # is NOT free - a kernel that walks the
+                                       # grid fills again after this epilogue
         s_imm    s0,  32               # 32 accumulator rows
         s_imm    s13, 0                # acc index, incremented by the encoder
 wb_loop:
@@ -1194,6 +1167,15 @@ Notes on the listing:
   stall, and a second staging quad would cost a second live VGPR quad the
   file does not have.  This is the clearest place where the 16-entry VGPR file
   is too small.
+* **An `mma_i8`'s fragment registers must hold still while it walks.**  The
+  matrix unit reads its A fragment one lane per cycle across the sixteen
+  cycles of section 4.7's walk, so a `v_ld4_l` landing in `v1`-`v3` while the
+  pair issued from `v1`-`v3` is still walking rewrites the accumulator rows
+  the walk has not reached.  The failure is quiet and partial: the first two
+  of sixteen rows of the second accumulator block are right and the other
+  fourteen are wrong, which reads like an addressing bug and is not one.  This
+  is a property of the machine, not of this kernel, and section 1.4's list of
+  what the ISA does not interlock should be read as including it.
 * The epilogue cannot use `v_st16_g`.  Lane *n* holds `C[m][n]`, so `C` is
   contiguous *across* lanes and not *within* a lane; a wide store wants the
   opposite layout.  The 32 `acc_rd` / `v_st4_g` pairs stand.
@@ -1624,9 +1606,41 @@ store drain; prologue is ~24 per wave.
 
 | Kernel | Workgroups | Iterations each | Instructions | Cycles | Bytes | AI (MAC/B) | Matrix util |
 |--------|-----------|-----------------|--------------|--------|-------|------------|-------------|
-| `gemm64`  | 2  | 2 | **2,256**   | **5,384**   | 28,672    | 9.14 | **76.1%** |
+| `gemm64` *(predicted)* | 2 | 2 | 2,256 | 5,384 | 28,672 | 9.14 | 76.1% |
+| **`gemm64` (measured)** | **2** | **2** | **2,684** | **6,180** | **34,896** | **7.51** | **66.3%** |
 | `gemm128` | 8  | 4 | **14,208**  | **38,432**  | 163,840   | 12.8 | **85.3%** |
 | `gemm256` | 32 | 8 | **98,304**  | **288,896** | 1,048,576 | 16.0 | **90.7%** |
+
+**The `gemm64` row is the only measured one.**  `tests/gemm64.s` runs on
+`gpu16.v` through `add_gpu_test(gemm64 ...)`, its 4,096 output words are
+compared against a Python GEMM that shares no code with it, and the counters
+below are read from that same passing run by `tests/run_gpu_perf.sh`.  The
+other five kernels are still predictions and are marked as such; until one of
+them is written, nothing in this section's `gemm128`, `gemm256`, `axpy` or
+`escape` rows has been tested by anything.
+
+What the measurement changed, and why:
+
+* **Matrix utilisation 76.1% -> 66.3%.**  The matrix unit was busy 4,096
+  cycles out of 6,180.  4,096 is exactly 256 `mma_i8` x 16 cycles, so
+  requirement A1 of section 2.3 is met - the unit does accept a new `mma`
+  every 16 cycles with no drain between accumulator blocks.  The utilisation
+  fell because the denominator grew, not because the matrix unit stalled.
+* **Cycles 5,384 -> 6,180,** inside the +/- 15% band section 7.4 set, but at
+  99.8% of its upper edge.  Calling that a confirmed prediction would be
+  generous; it is closer to "not falsified".
+* **Instructions 2,256 -> 2,684 (671 per wave).**  Section 7.4 says
+  instruction counts carry no tolerance, so this one is simply a wrong
+  prediction, and the extra 428 are accounted for rather than excused: the
+  testbench launches one workgroup, so the kernel walks the 2-workgroup grid
+  in software (a second pass over setup, prologue fill and epilogue), and the
+  listing as priced omitted `acc_zero`, the counter reads, and the fact that
+  each pass stages K/32 + 1 panels rather than K/32.
+* **Bytes 28,672 -> 34,896 in 852 transactions,** so AI falls 9.14 -> 7.51.
+  The prediction counted the bytes the algorithm needs; the machine moves the
+  bytes the fill's `v_ld16_g` actually requests, which is one 64-byte block
+  per 32-byte panel row - the 50% transaction efficiency section 5.4's table
+  already predicts for `KT` = 32 - plus the second grid pass re-reading `Bt`.
 
 `gemm256` at **170.7 MACs per dynamic instruction** is the headline efficiency
 claim for the ISA.
@@ -1696,7 +1710,8 @@ Three findings worth stating loudly because they are the anti-GEMM results:
 
 | Kernel | cpu16w cycles | gpu16 cycles | **Speedup** | vs blocked cpu16w | Instruction ratio |
 |--------|---------------|--------------|-------------|--------------------|-------------------|
-| `gemm64`    | 2,883,584   | 5,384   | **535x** | 292x | 1162x |
+| `gemm64` *(predicted)* | 2,883,584 | 5,384 | 535x | 292x | 1162x |
+| **`gemm64` (measured)** | 2,883,584 | **6,180** | **467x** | **254x** | **977x** |
 | `gemm128`   | 23,068,672  | 38,432  | **600x** | 327x | 1476x |
 | `gemm256`   | 184,549,376 | 288,896 | **639x** | 348x | 1707x |
 | `axpy16k`   | 212,992     | 5,940   | **35.9x** | - | 38.4x |
@@ -1733,12 +1748,34 @@ What has to be added:
    missing hardware.  Labels work as sections 4.4 and 4.3
    allow them to: a word offset from `PC_next` for the `_i` branches and
    `s_call`, a plain word address for `s_imm`, and `la` as one `s_addpc`.
-2. `tests/gemm64.s`, `tests/gemm128.s`, `tests/gemm256.s`, `tests/axpy16k.s`,
-   `tests/axpy16k_w.s`, `tests/escape4k.s`, plus their `.data` inputs
-   generated by a small committed generator, and `tests/*.expect` holding the
-   reference results with `xx` for don't-care, exactly like
-   `tests/cpu16_sum.expect`.  `axpy16k.s` and `axpy16k_w.s` share
-   `tests/axpy16k.expect`.
+2. **`gemm64` is done; the other five are not.**  `tests/gemm64.s` runs on
+   the RTL as `add_gpu_test(gemm64 ...)` with `+waves=4`, its inputs and its
+   reference result come from `tests/gen_gemm64.py` (guarded against drift by
+   `gpu_gemm64_data`, which regenerates them and diffs), and
+   `tests/run_gpu_perf.sh` reads its counters.  `gemm128.s`, `gemm256.s`,
+   `axpy16k.s`, `axpy16k_w.s` and `escape4k.s` are still unwritten.
+
+   **This item was wrong as specified, and running it is what showed why.**
+   It says the results go in `tests/*.expect` "exactly like
+   `tests/cpu16_sum.expect`".  An `.expect` file holds the sixteen scalar
+   registers, and `gemm64`'s result is 4,096 int32 words in global memory;
+   there is no way to fold a 64x64 matrix into sixteen registers, and hashing
+   it would turn a located mismatch into a yes/no.  `testgpu.v` therefore
+   gained `+mexpect` / `+mexpect_word` / `+mexpect_words`, which compare a run
+   of global memory against a file and print the first ten mismatching words
+   with their addresses.  `gemm64.expect` still exists, and is sixteen
+   `xxxxxxxx` lines: the registers at `s_endpgm` hold performance counters,
+   which are measured, not predicted, and an `.expect` file is the wrong place
+   to assert them.
+
+   Four further errors in section 5.3's listing only appeared on the RTL, and
+   are fixed there: the k counter was decremented in both the prologue and the
+   loop tail so the last panel was staged and never multiplied; the
+   accumulators were never zeroed although the epilogue stores rather than
+   accumulates; `v10` was described as free in the epilogue, which holds only
+   for a kernel that stops after one tile; and the inner loop rewrote the
+   fragment registers of an `mma_i8` that was still walking.  The last is a
+   property of the machine and is now stated as a rule in section 5.3.
 3. `testgpu.v`, modelled on `test16.v`: `$readmemh` the program and data,
    run to `s_endpgm` or `+cycles`, dump the result region and compare.
 4. `tests/run_gpu_test.sh`, which assembles with `asm_gpu16` and simulates
@@ -1786,15 +1823,25 @@ What has to be added:
    cpu16w column depends on.
 
 **How tier 1 gets falsified.**  The kernels read their own performance
-counters (`s_rd_sys` 8-12, section 4.3) and store them to a known address, so
-the `.expect` file contains not just the result matrix but the cycle count,
-instruction count, matrix-busy count and byte count.  A new
-`tests/*.perf.expect` carries the tier-1 prediction with a tolerance band, and
-the CTest entry fails if the RTL lands outside it.  Predicted bands:
+counters (`s_rd_sys` 8-12, section 4.3) into scalar registers, and `testgpu.v`
+prints them under `+perf`.  Correctness and performance are deliberately two
+CTest entries over the same run: `gemm64` compares the result matrix, and
+`gemm64_perf` re-runs with `+mexpect` *and* `+perf` and refuses to report a
+cycle count unless that comparison passed first.  This is not ceremony - the
+bugs found while bringing this kernel up all made it *faster*, because a
+kernel that skips a k panel does less work.  A performance number from an
+unchecked run would have been an improvement every time.
+
+`gemm64_perf` checks two things: that the cycle count is inside a band, and
+that the matrix unit was busy exactly 4,096 cycles, since that number is
+fixed by the listing and section 4.7 rather than by timing.  Its band is
+5,562 - 6,798, the measurement +/- 10%, because a band is only a regression
+guard once there is something to regress from; the tier-1 band below is what
+the prediction was tested against, and `gemm64` passed it.  Predicted bands:
 
 | Kernel | Predicted cycles | Pass band | Falsified if |
 |--------|------------------|-----------|--------------|
-| `gemm64`   | 5,384   | +/- 15% | outside 4,576 - 6,192 |
+| `gemm64`   | 5,384   | +/- 15% | outside 4,576 - 6,192 - **measured 6,180, inside by 12 cycles** |
 | `gemm128`  | 38,432  | +/- 12% | outside 33,820 - 43,044 |
 | `gemm256`  | 288,896 | +/- 10% | outside 260,006 - 317,786 |
 | `axpy16k`  | 5,940   | +/- 15% | outside 5,049 - 6,831 |
@@ -1805,7 +1852,10 @@ the CTest entry fails if the RTL lands outside it.  Predicted bands:
 Instruction counts are predicted with no tolerance at all - they are a
 property of the listing, not the microarchitecture.  If the RTL retires a
 number of instructions different from the table in 7.3, either the assembler
-or the prediction is simply wrong.
+or the prediction is simply wrong.  For `gemm64` the prediction was wrong:
+671 instructions per wave against 564 predicted.  Section 7.3 lists where the
+extra ones come from; none of them is a surprise about the machine, and all of
+them are things the listing did not contain.
 
 The most likely way tier 1 is wrong, in order: the barrier bubble (guessed at
 32 cycles), the LDS 2-way conflict resolution, and whether the matrix unit
@@ -1814,6 +1864,11 @@ accumulator blocks - i.e. whether requirement A1 of section 2.3 was met.  If
 it was not, every GEMM cycle count above should come in at roughly 2x and
 every instruction count should be exactly right, which makes the two failure
 modes easy to tell apart from one test run.
+
+`gemm64` answered that: **A1 is met.**  4,096 matrix-busy cycles for 256
+`mma_i8` is 16.00 each, with nothing between accumulator blocks.  The 15%
+cycle overrun is all in the other two suspects plus the instructions the
+prediction did not count; it is not a matrix-unit drain.
 
 There is also one prediction here that is a genuine A/B experiment rather than
 a model check: **`axpy16k_w` must beat `axpy16k` by 1.5x or more**.  It is
