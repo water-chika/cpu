@@ -89,6 +89,9 @@ int main(int argc, const char* argv[]) {
             opt.text = false;
             opt.hex = false;
         }
+        else if (a == "--no-regalloc") {
+            opt.registers_for_variables = false;
+        }
         else if (a == "--sep_with_line") {
             opt.sep_with_line = true;
         }
@@ -99,6 +102,7 @@ int main(int argc, const char* argv[]) {
                        "  --hex             Emit machine words as hexadecimal text\n"
                        "  --bin             Emit machine words as raw little endian bytes\n"
                        "  --sep_with_line   With --hex, separate words with new lines\n"
+                       "  --no-regalloc     Keep every named variable in its frame byte\n"
                        "  --out-dir DIR     With file arguments, write the results into DIR\n"
                        "  --help            Show this help message\n"
                        "\nWith file arguments each file is compiled independently into\n"

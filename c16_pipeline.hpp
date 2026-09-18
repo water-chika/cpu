@@ -533,7 +533,8 @@ inline c16_result c16_compile(const std::vector<char>& source, const c16_options
     std::vector<c16_lowered> lowered(nfunctions);
     c16_parallel_dynamic(nfunctions, threads, [&](size_t i) {
         c16_lowerer lower(source, program.tokens, program.functions, program.function_index,
-                          program.globals, program.global_index, static_cast<uint32_t>(i));
+                          program.globals, program.global_index, static_cast<uint32_t>(i),
+                          opt.registers_for_variables);
         lowered[i] = lower.run();
     });
     // Report the failure that is earliest in the source, so that the message
@@ -560,7 +561,8 @@ inline c16_result c16_compile(const std::vector<char>& source, const c16_options
     }
     if (out_mask != lowered[0].out_mask) {
         c16_lowerer relower(source, program.tokens, program.functions, program.function_index,
-                            program.globals, program.global_index, 0);
+                            program.globals, program.global_index, 0,
+                            opt.registers_for_variables);
         lowered[0] = relower.run(out_mask);
     }
     double t4 = asm_now();

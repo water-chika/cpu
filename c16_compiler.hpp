@@ -98,6 +98,11 @@ struct c16_options {
     // words and the 96 bytes of frame space.  Every other byte of the work
     // is what the real compiler does.
     bool relaxed_limits = false;
+    // The variables-in-registers stage (docs/c16.md, "Variables in
+    // registers").  Off is the older behaviour - every named variable lives in
+    // its frame byte - and it stays reachable so that a test can compile a
+    // program both ways and compare what the two programs compute.
+    bool registers_for_variables = true;
 };
 
 struct c16_stats {
@@ -157,6 +162,18 @@ struct c16_lowered {
 
 // ------------------------------------------------------------- lowering
 
+// One variable's claim on a register.  The interval is in token positions,
+// which is a conservative superset of a real live range: it covers positions
+// between two uses whether or not the variable is live there, and that is the
+// direction in which it is safe to be wrong.  See docs/c16.md, "Variables in
+// registers".
+struct c16_var_use {
+    uint32_t address = 0;
+    uint32_t first = 0;
+    uint32_t last = 0;
+    uint64_t weight = 0;
+};
+
 // A recursive descent parser that emits cpu16 as it goes.  There is no AST:
 // the language has no construct that needs one, and a single pass keeps the
 // per function work a tight loop over its own token range, which is what
@@ -169,19 +186,56 @@ public:
                 const std::unordered_map<std::string_view, uint32_t>& function_index,
                 const std::vector<c16_global>& globals,
                 const std::unordered_map<std::string_view, uint32_t>& global_index,
-                uint32_t self)
+                uint32_t self,
+                bool allocate = true)
         : source_(source), tokens_(tokens), functions_(functions),
           function_index_(function_index), globals_(globals),
-          global_index_(global_index), self_(self) {}
+          global_index_(global_index), self_(self), allocate_(allocate) {}
 
     // forced_out_mask lets the driver re-run main once the union of every
     // function's out() slots is known: only main's epilogue depends on it.
+    //
+    // Lowering a function happens twice when the variables-in-registers stage
+    // is on: once with emission switched off, to find out which variables are
+    // worth a register and which registers the expression stack leaves free,
+    // and once for real with that map in hand.  Parsing twice rather than
+    // scanning once is what keeps the frame addresses and the scoping
+    // identical between the two - the same code hands them out.  A failure in
+    // the analysis pass is not reported from there: the real pass hits it
+    // again and reports it, with the allocation empty.
     c16_lowered run(uint32_t forced_out_mask = 0) {
+        if (allocate_) {
+            analysing_ = true;
+            lower_function(forced_out_mask);
+            analysing_ = false;
+            if (!out_.error.failed) {
+                allocate_registers();
+            }
+            out_ = c16_lowered{};
+        }
+        lower_function(forced_out_mask);
+        return std::move(out_);
+    }
+
+private:
+    void lower_function(uint32_t forced_out_mask) {
         const c16_function& f = functions_[self_];
         out_.out_mask = forced_out_mask;
         pos_ = f.body_begin + 1;
         end_ = f.body_end;
         next_local_ = f.frame + 1 + f.nparams;
+        bindings_.clear();
+        scope_mark_.clear();
+        loops_.clear();
+        loop_depth_ = 0;
+        addr_cache_ = -1;
+        if (analysing_) {
+            uses_.clear();
+            loop_spans_.clear();
+            max_slot_ = 0;
+            saw_call_ = false;
+            saw_raw_memory_ = false;
+        }
 
         label(C16_ENTRY_LABEL);     // every function's entry is its label 0
         out_.nlabels = self_ == 0 ? 2 : 1;   // main also reserves its exit label
@@ -189,6 +243,24 @@ public:
         push_scope();
         for (uint32_t i = 0; i < f.nparams; i++) {
             declare(text(tokens_[f.param_token[i]]), f.frame + 1 + i);
+        }
+        // A parameter is defined at entry, not where it is first read, so its
+        // interval has to start here.  Without this, "return a + b" gives both
+        // of them a one token interval, they look disjoint, and they are
+        // handed the same register.  Weight 0: only real references earn one.
+        if (analysing_) {
+            for (uint32_t i = 0; i < f.nparams; i++) {
+                uses_.push_back(c16_var_use{f.frame + 1 + i, pos_, pos_, 0});
+            }
+        }
+        // A promoted parameter is read out of its frame byte once, here: the
+        // caller had nowhere else to put it.
+        for (uint32_t i = 0; i < f.nparams; i++) {
+            int8_t home = var_register(f.frame + 1 + i);
+            if (home >= 0) {
+                constant(C16_REG_ADDR, static_cast<uint8_t>(f.frame + 1 + i));
+                insn(C16_OP_LD, 0, C16_REG_ADDR, home);
+            }
         }
         if (self_ == 0) {
             // Globals are initialised by main, before anything else runs.
@@ -209,13 +281,13 @@ public:
         if (self_ == 0 && !out_.error.failed) {
             epilogue();
         }
-        return std::move(out_);
     }
-
-private:
     // ---------------------------------------------------------- emitting
 
     void insn(uint8_t opcode, int8_t a0, int8_t a1, int8_t a2) {
+        if (analysing_) {
+            return;
+        }
         c16_item it{};
         it.kind = C16_ITEM_INSN;
         it.opcode = opcode;
@@ -230,6 +302,9 @@ private:
     }
 
     void la(int8_t dst, uint32_t label_id) {
+        if (analysing_) {
+            return;
+        }
         c16_item it{};
         it.kind = C16_ITEM_LA;
         it.arg[0] = dst;
@@ -242,6 +317,9 @@ private:
     }
 
     void label(uint32_t id) {
+        if (analysing_) {
+            return;
+        }
         c16_item it{};
         it.kind = C16_ITEM_LABEL;
         it.label = id;
@@ -250,6 +328,129 @@ private:
     }
 
     uint32_t new_label() { return out_.nlabels++; }
+
+    // ------------------------------------ variables in registers: analysis
+
+    // The deepest expression stack slot this function reaches.  Registers
+    // above it are provably free, which is the whole budget this stage has.
+    void note_slot(uint32_t slot) {
+        if (analysing_ && slot < static_cast<uint32_t>(C16_REG_SLOTS) && slot > max_slot_) {
+            max_slot_ = slot;
+        }
+    }
+
+    // A reference to a variable, at the position the parser has reached.
+    // Only this function's own frame counts: globals are shared with every
+    // other function and byte 0 of the frame is the return address.
+    void note_use(uint32_t address) {
+        if (!analysing_) {
+            return;
+        }
+        const c16_function& f = functions_[self_];
+        if (address <= f.frame || address >= f.frame + f.frame_size) {
+            return;
+        }
+        uint32_t d = loop_depth_ > 3 ? 3 : loop_depth_;
+        uint64_t weight = 1ull << (3 * d);
+        for (c16_var_use& u : uses_) {
+            if (u.address == address) {
+                u.first = std::min(u.first, pos_);
+                u.last = std::max(u.last, pos_);
+                u.weight += weight;
+                return;
+            }
+        }
+        uses_.push_back(c16_var_use{address, pos_, pos_, weight});
+    }
+
+    // Which register holds this variable, or -1 for "its frame byte does".
+    int8_t var_register(uint32_t address) const {
+        return allocated_.empty() ? -1 : allocated_[address];
+    }
+
+    // The allocation itself: linear scan over the intervals, into the
+    // registers the expression stack does not need.  docs/c16.md, "Variables
+    // in registers", is the argument for every line of this.
+    void allocate_registers() {
+        allocated_.clear();
+        if (saw_call_ || saw_raw_memory_ || uses_.empty()) {
+            return;
+        }
+        int8_t first_free = static_cast<int8_t>(max_slot_ + 1);
+        if (first_free < 1) {
+            first_free = 1;     // r0 is where a return value has to land
+        }
+        if (first_free >= C16_REG_SLOTS) {
+            return;
+        }
+
+        // Widen every interval over any loop it touches, to a fixed point.  A
+        // loop's back edge puts a later write ahead of an earlier read, so two
+        // intervals that merely look disjoint inside a loop are not.
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (c16_var_use& u : uses_) {
+                for (const std::pair<uint32_t, uint32_t>& l : loop_spans_) {
+                    if (u.first <= l.second && l.first <= u.last &&
+                        (l.first < u.first || l.second > u.last)) {
+                        u.first = std::min(u.first, l.first);
+                        u.last = std::max(u.last, l.second);
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        std::vector<uint32_t> order(uses_.size());
+        for (uint32_t i = 0; i < order.size(); i++) {
+            order[i] = i;
+        }
+        // Hottest first, and by address when two are equally hot, so that the
+        // result does not depend on declaration order alone or on anything a
+        // thread did.
+        std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+            if (uses_[a].weight != uses_[b].weight) {
+                return uses_[a].weight > uses_[b].weight;
+            }
+            return uses_[a].address < uses_[b].address;
+        });
+
+        std::vector<std::vector<uint32_t>> held(C16_REG_SLOTS);
+        std::vector<int8_t> map(256, -1);
+        bool any = false;
+        for (uint32_t i : order) {
+            // A parameter arrives in its frame byte, so promoting it costs a
+            // load in the prologue.  One reference does not pay for that.
+            const c16_function& f = functions_[self_];
+            bool is_param = uses_[i].address <= f.frame + f.nparams;
+            if (is_param && uses_[i].weight < 2) {
+                continue;
+            }
+            for (int8_t r = first_free; r < C16_REG_SLOTS; r++) {
+                bool clash = false;
+                for (uint32_t j : held[r]) {
+                    if (uses_[i].first <= uses_[j].last && uses_[j].first <= uses_[i].last) {
+                        clash = true;
+                        break;
+                    }
+                }
+                if (clash) {
+                    continue;
+                }
+                held[r].push_back(i);
+                map[uses_[i].address] = r;
+                any = true;
+                break;
+            }
+            // No register fits: the variable keeps its frame byte.  That is
+            // the old behaviour, and it is always correct, which is why this
+            // stage has no spilling of its own.
+        }
+        if (any) {
+            allocated_ = std::move(map);
+        }
+    }
 
     // Build an 8 bit constant in a register.  cpu16's "imm" writes
     // (value << shift) and "imm_s" ors it in, with three bits of each, so any
@@ -309,6 +510,7 @@ private:
     // Get slot's value into a register, using the given scratch if it is
     // spilled.  Costs nothing at all for the common shallow case.
     int8_t materialise(uint32_t slot, int8_t scratch) {
+        note_slot(slot);
         if (in_register(slot)) {
             return static_cast<int8_t>(slot);
         }
@@ -319,6 +521,7 @@ private:
 
     // Where the result of an operation writing slot should be computed.
     int8_t result_register(uint32_t slot) {
+        note_slot(slot);
         return in_register(slot) ? static_cast<int8_t>(slot) : C16_REG_SCRATCH_A;
     }
 
@@ -529,9 +732,18 @@ private:
             if (failed()) {
                 return;
             }
+            note_use(address);
             int8_t reg = materialise(0, C16_REG_SCRATCH_A);
-            constant(C16_REG_ADDR, static_cast<uint8_t>(address));
-            insn(C16_OP_ST, reg, C16_REG_ADDR, 0);
+            int8_t home = var_register(address);
+            if (home >= 0) {
+                if (reg != home) {
+                    insn(C16_OP_MOV, reg, 0, home);
+                }
+            }
+            else {
+                constant(C16_REG_ADDR, static_cast<uint8_t>(address));
+                insn(C16_OP_ST, reg, C16_REG_ADDR, 0);
+            }
             expect(C16_TOK_SEMI, "';'");
             return;
         }
@@ -548,14 +760,24 @@ private:
         std::string_view name = text(peek());
         pos_++;
         uint32_t address = next_local_++;
+        int8_t home = -1;
         if (accept(C16_TOK_ASSIGN)) {
             expression(0);
             if (failed()) {
                 return;
             }
+            note_use(address);
+            home = var_register(address);
             int8_t reg = materialise(0, C16_REG_SCRATCH_A);
-            constant(C16_REG_ADDR, static_cast<uint8_t>(address));
-            insn(C16_OP_ST, reg, C16_REG_ADDR, 0);
+            if (home >= 0) {
+                if (reg != home) {
+                    insn(C16_OP_MOV, reg, 0, home);
+                }
+            }
+            else {
+                constant(C16_REG_ADDR, static_cast<uint8_t>(address));
+                insn(C16_OP_ST, reg, C16_REG_ADDR, 0);
+            }
         }
         else {
             // Without an initialiser the slot would still hold whatever the
@@ -565,8 +787,15 @@ private:
             // impossible to check against a reference implementation, so
             // "int x;" means zero.  cpu16 clears a byte of memory in a single
             // instruction, so this costs one word beyond the address.
-            constant(C16_REG_ADDR, static_cast<uint8_t>(address));
-            insn(C16_OP_CL, 0, C16_REG_ADDR, 0);
+            note_use(address);
+            home = var_register(address);
+            if (home >= 0) {
+                constant(home, 0);
+            }
+            else {
+                constant(C16_REG_ADDR, static_cast<uint8_t>(address));
+                insn(C16_OP_CL, 0, C16_REG_ADDR, 0);
+            }
         }
         // A declaration only becomes visible after its own initialiser, so
         // "int x = x;" is an error rather than a read of itself.
@@ -608,7 +837,9 @@ private:
     }
 
     void while_statement() {
+        uint32_t span_begin = pos_;
         pos_++;
+        loop_depth_++;
         uint32_t top = new_label();
         uint32_t done = new_label();
         label(top);
@@ -624,6 +855,12 @@ private:
         loops_.push_back(loop{done, top});
         block();
         loops_.pop_back();
+        loop_depth_--;
+        // The span the analysis pass widens intervals over: the whole "while",
+        // condition included, because the back edge reaches both.
+        if (analysing_) {
+            loop_spans_.push_back(std::pair<uint32_t, uint32_t>(span_begin, pos_));
+        }
         if (failed()) {
             return;
         }
@@ -912,9 +1149,16 @@ private:
             return;
         }
         pos_++;
+        note_use(address);
         int8_t dst = result_register(slot);
-        constant(C16_REG_ADDR, static_cast<uint8_t>(address));
-        insn(C16_OP_LD, 0, C16_REG_ADDR, dst);
+        int8_t home = var_register(address);
+        if (home >= 0) {
+            insn(C16_OP_MOV, home, 0, dst);
+        }
+        else {
+            constant(C16_REG_ADDR, static_cast<uint8_t>(address));
+            insn(C16_OP_LD, 0, C16_REG_ADDR, dst);
+        }
         commit(slot, dst);
     }
 
@@ -949,9 +1193,19 @@ private:
 
     void call(uint32_t slot, std::string_view name) {
         if (name == "peek" || name == "poke" || name == "out") {
+            // peek and poke name an address computed at run time, and nothing
+            // stops it being a promoted variable's frame byte, which is stale
+            // by construction.  out() writes a fixed address of its own.
+            if (name != "out") {
+                saw_raw_memory_ = true;
+            }
             builtin(slot, name);
             return;
         }
+        // A call clobbers the callee's registers, and this stage has no
+        // caller-save, so a function that makes one keeps its variables in
+        // memory.
+        saw_call_ = true;
         auto found = function_index_.find(name);
         if (found == function_index_.end()) {
             fail(std::format("unknown function '{}'", std::string(name)));
@@ -1096,6 +1350,17 @@ private:
     std::vector<size_t> scope_mark_;
     std::vector<loop> loops_;
     int addr_cache_ = -1;   // the constant r7 is known to hold, or -1
+
+    // The variables-in-registers stage.  docs/c16.md, "Variables in registers".
+    bool allocate_ = true;          // is the stage enabled at all
+    bool analysing_ = false;        // pass 1: parse, record, emit nothing
+    uint32_t max_slot_ = 0;         // deepest expression stack slot reached
+    uint32_t loop_depth_ = 0;       // how many "while"s enclose the parser
+    bool saw_call_ = false;         // a call clobbers a promoted variable
+    bool saw_raw_memory_ = false;   // peek/poke can name a promoted frame byte
+    std::vector<c16_var_use> uses_;
+    std::vector<std::pair<uint32_t, uint32_t>> loop_spans_;
+    std::vector<int8_t> allocated_; // address -> register, or empty for none
     c16_lowered out_;
 };
 

@@ -242,7 +242,8 @@ set_tests_properties(c16_differential_flat PROPERTIES FAIL_REGULAR_EXPRESSION "T
 
 # And over the checked in programs, so that the hand written .expect files
 # are themselves confirmed by an implementation that never saw them.
-foreach(prog c16_arith c16_compare c16_control c16_functions c16_spill c16_collatz)
+foreach(prog c16_arith c16_compare c16_control c16_functions c16_spill c16_collatz
+             c16_regalloc)
     add_test(NAME oracle_${prog}
              COMMAND c16_verify ${CMAKE_CURRENT_SOURCE_DIR}/tests/${prog}.c16)
     set_tests_properties(oracle_${prog} PROPERTIES FAIL_REGULAR_EXPRESSION "TEST FAIL")
@@ -251,6 +252,36 @@ add_test(NAME oracle_c16_memory
          COMMAND c16_verify --data ${CMAKE_CURRENT_SOURCE_DIR}/tests/sum.data
                  ${CMAKE_CURRENT_SOURCE_DIR}/tests/c16_memory.c16)
 set_tests_properties(oracle_c16_memory PROPERTIES FAIL_REGULAR_EXPRESSION "TEST FAIL")
+
+# Keeping a variable in a register is an optimisation, and an optimisation is
+# only allowed to change the size of a program, never its answers.  The
+# compiler still has --no-regalloc, which leaves every variable in its frame
+# byte and is the code this suite trusted before the stage existed, so every
+# program can be compiled both ways and the two runs compared.  The word
+# counts printed by these tests are also the stage's only measurement.
+function(add_regalloc_equivalence name program cycles outs)
+    add_test(
+        NAME regalloc_${name}
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_regalloc_equivalence.sh
+                $<TARGET_FILE:c16>
+                $<TARGET_FILE:cpu16_sim>
+                ${CMAKE_CURRENT_SOURCE_DIR}/${program}
+                ${cycles}
+                ${outs}
+    )
+    set_tests_properties(regalloc_${name} PROPERTIES FAIL_REGULAR_EXPRESSION "TEST FAIL")
+endfunction()
+
+add_regalloc_equivalence(c16_arith     tests/c16_arith.c16       400 7)
+add_regalloc_equivalence(c16_control   tests/c16_control.c16    6000 4)
+add_regalloc_equivalence(c16_compare   tests/c16_compare.c16    2000 4)
+add_regalloc_equivalence(c16_functions tests/c16_functions.c16  2000 4)
+add_regalloc_equivalence(c16_spill     tests/c16_spill.c16      2000 2)
+add_regalloc_equivalence(c16_collatz   tests/c16_collatz.c16   40000 2)
+# tests/c16_regalloc.c16 is deliberately absent: it is 280 words with every
+# variable in memory and 247 with the allocator, so the unallocated half of
+# the comparison does not fit cpu16 at all.  Its answers are checked against
+# the interpreter by oracle_c16_regalloc and against the RTL by c16_regalloc.
 
 if(IVERILOG_EXECUTABLE AND VVP_EXECUTABLE)
     function(add_cpu_test name assembler testbench program data expect cycles)
@@ -570,6 +601,7 @@ if(IVERILOG_EXECUTABLE AND VVP_EXECUTABLE)
     add_c16_test(c16_spill     tests/c16_spill.c16     -              c16_spill.expect      2000)
     add_c16_test(c16_memory    tests/c16_memory.c16    tests/sum.data c16_memory.expect     4000)
     add_c16_test(c16_collatz   tests/c16_collatz.c16   -              c16_collatz.expect   40000)
+    add_c16_test(c16_regalloc  tests/c16_regalloc.c16  -              c16_regalloc.expect  14000)
 
     # Cross check the independent ISA simulator against the RTL.  Instead of
     # comparing the hardware with a number a human wrote down, this runs the
@@ -608,6 +640,7 @@ if(IVERILOG_EXECUTABLE AND VVP_EXECUTABLE)
     add_cross_check(c16_control tests/c16_control.c16   -               6000)
     add_cross_check(c16_memory  tests/c16_memory.c16    tests/sum.data  4000)
     add_cross_check(c16_collatz tests/c16_collatz.c16   -              40000)
+    add_cross_check(c16_regalloc tests/c16_regalloc.c16 -              14000)
 
     # The strongest check in the repository: random programs, compiled, run
     # on the actual verilog, and compared against what a reference

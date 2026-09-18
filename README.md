@@ -51,6 +51,13 @@ straight away.
 | c16_spill | tests/c16_spill.c16 | an expression ten deep, so the value stack spills out of the registers |
 | c16_memory | tests/c16_memory.c16 | peek and poke against the data memory the testbench loads |
 | c16_collatz | tests/c16_collatz.c16 | the longest Collatz chain below 16 - an answer you cannot read off the source |
+| c16_regalloc | tests/c16_regalloc.c16 | two of the compiler's own rules written in c16, with more live variables than the machine has registers |
+
+The ```regalloc_*``` tests compile each program twice, once with
+```--no-regalloc``` so that every variable stays in its frame byte, and
+require the two to report the same answers - an optimisation may change a
+program's size and nothing else.  They print both word counts, which is the
+allocator's only measurement.
 
 Each ```c16_*``` simulation test compiles its program down **both** of the
 compiler's output paths, assembles the text one with ```asm16```, and diffs
@@ -1052,7 +1059,14 @@ compiles every ```*.v``` on its own with ```-Wall``` and fails on any message.
 
 ## Known gaps
 
-* ```variables_to_registers``` is not implemented.
+* The c16 register allocator does not **save registers around a call** and
+  does not **evict** a variable that already holds one.  Both are the same
+  missing capability - writing a live variable back to its frame byte at a
+  point the single lowering pass has already gone past - and both are why the
+  stage switches itself off rather than getting them wrong; see
+  ```docs/c16.md```, "Variables in registers".  ```variables_to_registers.cpp```
+  remains as the standalone cpu8 experiment the idea started in; the compiler
+  does not use it.
 * ```gpu16``` implements the whole ISA including section 4.7's matrix unit,
   so nothing in it is held down by ```gpu_encoding``` alone any more.  What
   has still never been run is section 7.4's GEMM kernels themselves: the

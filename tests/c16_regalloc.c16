@@ -1,0 +1,55 @@
+// Pieces of this compiler's own register allocator, written in the language
+// it compiles and run on the CPU it compiles for.
+//
+// Two of the rules in docs/c16.md, "Variables in registers", are small enough
+// to state as c16 functions, so this program states them and checks them:
+//
+//   check_imm(n)  the constant() encoder: any byte is at most three 3 bit
+//                 groups at shifts 6, 3 and 0, zero groups are skipped, and
+//                 an all zero byte still costs the one assigning "imm".  It
+//                 is checked by taking every byte below n apart and putting
+//                 it back together again, and it returns the total number of
+//                 words the encoder would emit for all of them.
+//   overlaps(..)  two live intervals clash when each starts before the other
+//                 ends - the test the linear scan runs for every candidate.
+//
+// It is also the test that exercises the allocator itself, in both of the
+// ways a variable can earn a register.  check_imm has six locals and a
+// parameter against at most four registers, so the stage has to choose; its
+// parameter is read on every iteration, which is what pays for the prologue
+// load a promoted parameter costs; and overlaps' four parameters are each
+// read once, which does not, so they stay in their frame bytes.
+
+int bad = 0;
+
+int check_imm(int limit) {
+    int i = 1;
+    int words = 1;    // the zero byte still costs its one assigning "imm"
+    int g6 = 0;
+    int g3 = 0;
+    int g0 = 0;
+    while (i < limit) {
+        g6 = (i >> 6) & 3;
+        g3 = (i >> 3) & 7;
+        g0 = i & 7;
+        if (((g6 << 6) | (g3 << 3) | g0) != i) { bad = bad + 1; }
+        words = words + (g6 != 0) + (g3 != 0) + (g0 != 0);
+        i = i + 1;
+    }
+    return words;
+}
+
+// Both sides are always evaluated in this language, so this is "&" on two 0/1
+// values rather than "&&", which is what the compiler would have emitted for
+// "&&" anyway.
+int overlaps(int a0, int a1, int b0, int b1) {
+    return (a0 <= b1) & (b0 <= a1);
+}
+
+int main() {
+    out(0, check_imm(128));
+    out(1, bad);
+    // [1,4] and [3,7] overlap.
+    out(2, overlaps(1, 4, 3, 7));
+    return 0;
+}
