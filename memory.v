@@ -19,9 +19,10 @@
 // cycle returns the value being written, which is what cpu16's read modify
 // write opcode relies on.
 //
-// `memory` and `program_memory` below are both asynchronous-read and stay
-// that way.  That is a deliberate choice and not an oversight: they are the
-// two CPUs' memories, 256 entries each, which is 2 Kbit and 4 Kbit - far
+// `memory`, `program_memory` and `program_memory8` below are all
+// asynchronous-read and stay that way.  That is a deliberate choice and not an
+// oversight: they are the two CPUs' memories, 256 entries each, which is
+// 2 Kbit and 4 Kbit - far
 // below the 18 Kbit granularity of a block RAM, so distributed RAM is the
 // right primitive for them anyway.  Converting them would also change cpu8's
 // and cpu16's timing, which the nine RTL-vs-C++ cross-check tests pin down
@@ -134,6 +135,65 @@ wire [15:0] a_bypassed = b_half ? {b_in_data, a_word[7:0]}
 assign a_out_data = !a_enable ? 16'b0
                   : (b_write && b_address == a_address) ? a_bypassed
                                                         : a_word;
+
+endmodule
+
+// Program memory with two ports, 8 bits wide: cpu8's.
+//
+// The same shape as `program_memory` above and for the same reason - port A
+// is the instruction fetch and port B is what ld_p and st_p run on - with one
+// simplification that falls out of the width.  cpu8's instruction word is 8
+// bits and so is its register, so a program word is exactly one register and
+// there is no half to select: `b_half` has no counterpart here, and cpu8's
+// ld_p and st_p take one operand where cpu16's take a half as well.
+//
+// Everything else is identical, including the two things that are easy to get
+// wrong: the loader is a mux in front of port B rather than a third port and
+// takes priority over it, and a byte written on port B is bypassed into port
+// A in the same cycle, so an instruction a program stores over itself takes
+// effect the next time it is fetched.
+module program_memory8 #(
+   parameter ADDR_WIDTH = 8,
+   parameter RAM_DEPTH = 1 << ADDR_WIDTH
+) (
+   input clk,
+
+   input a_enable,
+   input [ADDR_WIDTH-1:0] a_address,
+   output [7:0] a_out_data,
+
+   input b_enable,
+   input b_write_enable,
+   input [ADDR_WIDTH-1:0] b_address,
+   input [7:0] b_in_data,
+   output [7:0] b_out_data,
+
+   // The loader.  One 8 bit word per cycle, write only, priority over B.
+   input load_enable,
+   input [ADDR_WIDTH-1:0] load_address,
+   input [7:0] load_data
+);
+
+reg [7:0] mem[0:RAM_DEPTH-1];
+
+wire b_write = b_enable & b_write_enable;
+
+always @(posedge clk) begin
+    if (load_enable) begin
+        mem[load_address] <= load_data;
+    end
+    else if (b_write) begin
+        mem[b_address] <= b_in_data;
+    end
+end
+
+assign b_out_data = !b_enable ? 8'b0
+                  : b_write   ? b_in_data
+                              : mem[b_address];
+
+assign a_out_data = !a_enable ? 8'b0
+                  : (b_write && b_address == a_address) ? b_in_data
+                                                        : mem[a_address];
 
 endmodule
 

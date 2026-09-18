@@ -37,6 +37,7 @@ straight away.
 | cpu8_sum | tests/cpu8_sum.s | 8 bit CPU sums 1..8 out of data memory into r2 |
 | cpu8_sum_list | cpu8_asm/sum.s | 8 bit CPU sums the whole of data.list (1..16) into r2 |
 | cpu8_label | tests/cpu8_label.s | 8 bit assembler resolves a label at address 75 and the CPU branches there |
+| cpu8_ldp | tests/cpu8_ldp.s | 8 bit CPU reads one of its own instructions with ld_p, ors a bit into it, writes it back with st_p and runs it |
 | cpu16_sum | tests/cpu16_sum.s | 16 bit CPU sums 1..8 out of data memory into r2 |
 | cpu16_count | cpu16_asm/test.s | 16 bit CPU counts to 4 and branches |
 | cpu16_label | tests/cpu16_label.s | 16 bit assembler resolves a label at address 75 and the CPU branches there |
@@ -152,6 +153,15 @@ Instruction field arg encodes register containing memory address.
 | swap|   27   | swap register and data memory |
 | ld_p|   28   | load from program memory |
 | st_p|   29   | store to program memory  |
+
+The address comes from the one address register that ```set_data_address```
+loads; the opcode says which of the two memories it applies to.  A program
+word here is 8 bits, which is exactly one register, so - unlike ```cpu16.v```,
+whose 16 bit word makes ```ld_p```/```st_p``` take a half select as well -
+```ld_p``` and ```st_p``` move a whole instruction at a time and take only the
+register.  The instruction memory has a second port for them, so the fetch
+never has to give its own port up, and a byte stored over an instruction is
+seen by the fetch in the same cycle.
 
 #### State control
 
@@ -1042,9 +1052,6 @@ compiles every ```*.v``` on its own with ```-Wall``` and fails on any message.
 
 ## Known gaps
 
-* ```cpu8.v``` does not implement ```ld_p```/```st_p```; it reports
-  ```unknown opcode``` for them.  Only ```cpu16.v``` has the second program
-  memory port they need.
 * ```variables_to_registers``` is not implemented.
 * ```gpu16``` implements the whole ISA including section 4.7's matrix unit,
   so nothing in it is held down by ```gpu_encoding``` alone any more.  What
